@@ -22,6 +22,7 @@
         "dev_config.h": "c",
         "lcd_driver.h": "c",
         "watchdog.h": "c",
-        "stdlib.h": "c"
+        "stdlib.h": "c",
+        "lcd_gui.h": "c"
     }
 }
