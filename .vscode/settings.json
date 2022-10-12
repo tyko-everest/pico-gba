@@ -21,6 +21,7 @@
     "files.associations": {
         "dev_config.h": "c",
         "lcd_driver.h": "c",
-        "watchdog.h": "c"
+        "watchdog.h": "c",
+        "stdlib.h": "c"
     }
 }
