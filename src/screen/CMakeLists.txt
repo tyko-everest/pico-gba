@@ -1,0 +1,11 @@
+add_subdirectory(config)
+add_subdirectory(lcd)
+add_subdirectory(font)
+add_subdirectory(fatfs)
+add_subdirectory(sdcard)
+
+include_directories(./screen/config)
+include_directories(./screen/lcd)
+include_directories(./screen/font)
+include_directories(./screen/fatfs)
+include_directories(./screen/sdcard)
