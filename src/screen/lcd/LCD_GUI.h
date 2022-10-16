@@ -19,7 +19,6 @@
 #define __LCD_GUI_H
 
 #include "LCD_Driver.h"
-#include "fonts.h"
 
 #define LOW_Speed_Show 0
 #define HIGH_Speed_Show 1
@@ -119,23 +118,5 @@ void GUI_DrawRectangle(POINT Xstart, POINT Ystart, POINT Xend, POINT Yend,
                        COLOR Color, DRAW_FILL Filled, DOT_PIXEL Dot_Pixel);
 void GUI_DrawCircle(POINT X_Center, POINT Y_Center, LENGTH Radius, COLOR Color,
                     DRAW_FILL Draw_Fill, DOT_PIXEL Dot_Pixel);
-
-// pic
-void GUI_Disbitmap(POINT Xpoint, POINT Ypoint, const unsigned char *pMap,
-                   POINT Width, POINT Height);
-void GUI_DisGrayMap(POINT Xpoint, POINT Ypoint, const unsigned char *pBmp);
-
-// Display string
-void GUI_DisChar(POINT Xstart, POINT Ystart, const char Acsii_Char, sFONT *Font,
-                 COLOR Color_Background, COLOR Color_Foreground);
-void GUI_DisString_EN(POINT Xstart, POINT Ystart, const char *pString,
-                      sFONT *Font, COLOR Color_Background,
-                      COLOR Color_Foreground);
-void GUI_DisNum(POINT Xpoint, POINT Ypoint, int32_t Nummber, sFONT *Font,
-                COLOR Color_Background, COLOR Color_Foreground);
-void GUI_Showtime(POINT Xstart, POINT Ystart, POINT Xend, POINT Yend,
-                  DEV_TIME *pTime, COLOR Color);
-// show
-void GUI_Show(void);
 
 #endif

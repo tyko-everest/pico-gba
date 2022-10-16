@@ -5,22 +5,20 @@
  */
 
 #include "DEV_Config.h"
-#include "LCD_Bmp.h"
 #include "LCD_Driver.h"
 #include "LCD_GUI.h"
-#include "LCD_Touch.h"
-#include "hardware/watchdog.h"
-#include "pico/stdlib.h"
-#include <stdio.h>
+
+void paint_screen(uint16_t colour) {
+    LCD_SetWindow(0, 0, 240, 320);
+    LCD_SetColor(colour, 240, 320);
+}
 
 int main() {
     System_Init();
     LCD_Init(SCAN_DIR_DFT, 800);
 
-    LCD_SetWindow(0, 0, 240, 320);
-    LCD_SetColor(0x0000, 240, 320);
-    LCD_SetWindow(0, 0, 160, 240);
-    LCD_SetColor(0x07e0, 160, 240);
+    paint_screen(0x0000);
+    paint_screen(0x07e0);
 
     for (;;)
         ;
