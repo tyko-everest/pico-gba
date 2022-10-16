@@ -92,22 +92,22 @@
 /   2: Enable LFN with dynamic working buffer on the STACK.
 /   3: Enable LFN with dynamic working buffer on the HEAP.
 /
-/  To enable LFN feature, Unicode handling functions ff_convert() and ff_wtoupper()
-/  function must be added to the project.
-/  The LFN working buffer occupies (_MAX_LFN + 1) * 2 bytes. When use stack for the
-/  working buffer, take care on stack overflow. When use heap memory for the working
-/  buffer, memory management functions, ff_memalloc() and ff_memfree(), must be added
-/  to the project. */
+/  To enable LFN feature, Unicode handling functions ff_convert() and
+ff_wtoupper() /  function must be added to the project. /  The LFN working
+buffer occupies (_MAX_LFN + 1) * 2 bytes. When use stack for the /  working
+buffer, take care on stack overflow. When use heap memory for the working /
+buffer, memory management functions, ff_memalloc() and ff_memfree(), must be
+added /  to the project. */
 
 #define _LFN_UNICODE 0 /* 0:ANSI/OEM or 1:Unicode */
-/* To switch the character encoding on the FatFs API to Unicode, enable LFN feature
-/  and set _LFN_UNICODE to 1. */
+/* To switch the character encoding on the FatFs API to Unicode, enable LFN
+feature /  and set _LFN_UNICODE to 1. */
 
 #define _STRF_ENCODE 3 /* 0:ANSI/OEM, 1:UTF-16LE, 2:UTF-16BE, 3:UTF-8 */
-/* When Unicode API is enabled, character encoding on the all FatFs API is switched
-/  to Unicode. This option selects the character encoding on the file to be read/written
-/  via string functions, f_gets(), f_putc(), f_puts and f_printf().
-/  This option has no effect when _LFN_UNICODE is 0. */
+/* When Unicode API is enabled, character encoding on the all FatFs API is
+switched /  to Unicode. This option selects the character encoding on the file
+to be read/written /  via string functions, f_gets(), f_putc(), f_puts and
+f_printf(). /  This option has no effect when _LFN_UNICODE is 0. */
 
 #define _FS_RPATH 0 /* 0 to 2 */
 /* The _FS_RPATH option configures relative path feature.
@@ -125,7 +125,8 @@
 #define _VOLUMES 1
 /* Number of volumes (logical drives) to be used. */
 
-#define _MULTI_PARTITION 0 /* 0:Single partition, 1:Enable multiple partition */
+#define _MULTI_PARTITION 0 /* 0:Single partition, 1:Enable multiple partition  \
+                            */
 /* When set to 0, each volume is bound to the same physical drive number and
 / it can mount only first primaly partition. When it is set to 1, each volume
 / is tied to the partitions listed in VolToPart[]. */
@@ -135,11 +136,12 @@
 /  Always set 512 for memory card and hard disk but a larger value may be
 /  required for on-board flash memory, floppy disk and optical disk.
 /  When _MAX_SS is larger than 512, it configures FatFs to variable sector size
-/  and GET_SECTOR_SIZE command must be implemented to the disk_ioctl() function. */
+/  and GET_SECTOR_SIZE command must be implemented to the disk_ioctl() function.
+*/
 
 #define _USE_ERASE 0 /* 0:Disable or 1:Enable */
-/* To enable sector erase feature, set _USE_ERASE to 1. Also CTRL_ERASE_SECTOR command
-/  should be added to the disk_ioctl() function. */
+/* To enable sector erase feature, set _USE_ERASE to 1. Also CTRL_ERASE_SECTOR
+command /  should be added to the disk_ioctl() function. */
 
 #define _FS_NOFSINFO 0 /* 0 or 1 */
 /* If you need to know the correct free space on the FAT32 volume, set this
@@ -159,7 +161,8 @@
 /  which access method is used to the word data on the FAT volume.
 /
 /   0: Byte-by-byte access. Always compatible with all platforms.
-/   1: Word access. Do not choose this unless under both the following conditions.
+/   1: Word access. Do not choose this unless under both the following
+conditions.
 /
 /  * Byte order on the memory is little-endian.
 /  * Address miss-aligned word access is always allowed for all instructions.
@@ -173,9 +176,12 @@
 
 #define _FS_REENTRANT 0  /* 0:Disable or 1:Enable */
 #define _FS_TIMEOUT 1000 /* Timeout period in unit of time ticks */
-#define _SYNC_t 0        /* O/S dependent type of sync object. e.g. HANDLE, OS_EVENT*, ID and etc.. */
+#define _SYNC_t                                                                \
+    0 /* O/S dependent type of sync object. e.g. HANDLE, OS_EVENT*, ID and     \
+         etc.. */
 
-/* The _FS_REENTRANT option switches the re-entrancy (thread safe) of the FatFs module.
+/* The _FS_REENTRANT option switches the re-entrancy (thread safe) of the FatFs
+module.
 /
 /   0: Disable re-entrancy. _SYNC_t and _FS_TIMEOUT have no effect.
 /   1: Enable re-entrancy. Also user provided synchronization handlers,

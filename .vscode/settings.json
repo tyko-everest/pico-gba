@@ -23,6 +23,8 @@
         "lcd_driver.h": "c",
         "watchdog.h": "c",
         "stdlib.h": "c",
-        "lcd_gui.h": "c"
+        "lcd_gui.h": "c",
+        "lcd_bmp.h": "c",
+        "stdio.h": "c"
     }
 }

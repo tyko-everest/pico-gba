@@ -13,8 +13,8 @@
 #ifndef _DEV_CONFIG_H_
 #define _DEV_CONFIG_H_
 
-#include "pico/stdlib.h"
 #include "hardware/spi.h"
+#include "pico/stdlib.h"
 #include "stdio.h"
 
 #define UBYTE uint8_t

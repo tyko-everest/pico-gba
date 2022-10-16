@@ -30,11 +30,14 @@
 #ifndef __FATFS_STORAGE_H
 #define __FATFS_STORAGE_H
 
-extern uint32_t Storage_OpenReadFile(uint8_t Xpoz, uint16_t Ypoz, const char *BmpName);
+extern uint32_t Storage_OpenReadFile(uint8_t Xpoz, uint16_t Ypoz,
+                                     const char *BmpName);
 extern uint32_t Storage_CopyFile(const char *BmpName1, const char *BmpName2);
-extern uint32_t Storage_GetDirectoryBitmapFiles(const char *DirName, char *Files[]);
+extern uint32_t Storage_GetDirectoryBitmapFiles(const char *DirName,
+                                                char *Files[]);
 extern uint32_t Storage_CheckBitmapFile(const char *BmpName, uint32_t *FileLen);
-extern uint8_t Buffercmp(uint8_t *pBuffer1, uint8_t *pBuffer2, uint16_t BufferLength);
+extern uint8_t Buffercmp(uint8_t *pBuffer1, uint8_t *pBuffer2,
+                         uint16_t BufferLength);
 
 #endif /* __FATFS_STORAGE_H */
 

@@ -45,9 +45,9 @@ function:
 function:
             scanning method
 ********************************************************************************/
-typedef enum
-{
-    L2R_U2D = 0, // The display interface is displayed , left to right, up to down
+typedef enum {
+    L2R_U2D =
+        0, // The display interface is displayed , left to right, up to down
     L2R_D2U,
     R2L_U2D,
     R2L_D2U,
@@ -63,8 +63,7 @@ typedef enum
 function:
     Defines the total number of rows in the display area
 ********************************************************************************/
-typedef struct
-{
+typedef struct {
     LENGTH LCD_Dis_Column; // COLUMN
     LENGTH LCD_Dis_Page;   // PAGE
     LCD_SCAN_DIR LCD_Scan_Dir;
@@ -86,7 +85,8 @@ void LCD_SetWindow(POINT Xstart, POINT Ystart, POINT Xend, POINT Yend);
 void LCD_SetCursor(POINT Xpoint, POINT Ypoint);
 void LCD_SetColor(COLOR Color, POINT Xpoint, POINT Ypoint);
 void LCD_SetPointlColor(POINT Xpoint, POINT Ypoint, COLOR Color);
-void LCD_SetArealColor(POINT Xstart, POINT Ystart, POINT Xend, POINT Yend, COLOR Color);
+void LCD_SetArealColor(POINT Xstart, POINT Ystart, POINT Xend, POINT Yend,
+                       COLOR Color);
 void LCD_Clear(COLOR Color);
 uint8_t LCD_Read_Id(void);
 #endif
