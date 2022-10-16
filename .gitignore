@@ -1,4 +1,5 @@
 build/
+zig-cache/
 *.gba
 *.sav
 pokemon_emerald.s
