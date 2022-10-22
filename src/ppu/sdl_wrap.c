@@ -1,19 +1,11 @@
-#include "ppu.h"
+#include <SDL2/SDL.h>
+#include <stdbool.h>
+#include <stdio.h>
 
-static ppu_registers_t regs;
+#define DISP_WIDTH 240
+#define DISP_HEIGHT 160
 
-screen_colour_t get_bg_pixel(int x, int y) {}
-
-int get_pixel_from_tile_4bit(tile_4bit_t *tile, int x, int y) {
-    return (tile->data[x / 2 + y * (TILE_WIDTH / 2)] >> ((x & 1) * 4)) & 0xF;
-}
-
-int get_pixel_from_tile_8bit(tile_8bit_t *tile, int x, int y) {
-    return tile->data[x + y * TILE_WIDTH] & 0xFF;
-}
-
-int main(int argc, char **argv) {
-
+void setup() {
     int scale = 2;
     int width = DISP_WIDTH * scale;
     int height = DISP_HEIGHT * scale;
@@ -37,8 +29,6 @@ int main(int argc, char **argv) {
             break;
         }
 
-        // SDL_FillRect(pixels, NULL, 0);
-
         unsigned char byte = 0xFF;
         ((char *)(pixels->pixels))[i] = byte;
         i++;
@@ -52,5 +42,6 @@ int main(int argc, char **argv) {
 
     SDL_DestroyWindow(window);
     SDL_Quit();
-    return 0;
 }
+
+// int main() { setup(); }

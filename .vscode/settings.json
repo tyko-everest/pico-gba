@@ -25,6 +25,7 @@
         "stdlib.h": "c",
         "lcd_gui.h": "c",
         "lcd_bmp.h": "c",
-        "stdio.h": "c"
+        "stdio.h": "c",
+        "stdint.h": "c"
     }
 }

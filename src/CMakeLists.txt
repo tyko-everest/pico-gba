@@ -6,6 +6,7 @@ include_directories(./screen/lcd)
 
 add_executable(main
         main.c
+        ppu.c
         )
 
 # pull in common dependencies
