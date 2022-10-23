@@ -4,3 +4,8 @@ zig-out/
 *.gba
 *.sav
 pokemon_emerald.s
+
+
+# Added by cargo
+
+/target
