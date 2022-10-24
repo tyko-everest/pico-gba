@@ -20,8 +20,19 @@ pub fn main() !void {
         std.debug.print("{}", .{err});
     }
 
+    var frame: u64 = 0;
     while (true) {
-        var colour: u16 = 0xF000;
-        _ = try std.os.write(write_pipe, @ptrCast(*[2]u8, &colour));
+        var y: usize = 0;
+        while (y < DISP_HEIGHT) : (y += 1) {
+            var x: usize = 0;
+            while (x < DISP_WIDTH) : (x += 1) {
+                var colour: u16 = 0xF000;
+                if (y == x) {
+                    colour = 0x800F;
+                }
+                _ = try std.os.write(write_pipe, @ptrCast(*[2]u8, &colour));
+            }
+        }
+        frame += 1;
     }
 }
