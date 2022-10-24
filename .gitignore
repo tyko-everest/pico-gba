@@ -4,3 +4,4 @@ zig-out/
 *.gba
 *.sav
 pokemon_emerald.s
+display

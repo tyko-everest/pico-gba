@@ -27,5 +27,8 @@
         "lcd_bmp.h": "c",
         "stdio.h": "c",
         "stdint.h": "c"
+    },
+    "[zig]": {
+        "editor.defaultFormatter": "tiehuis.zig"
     }
 }
