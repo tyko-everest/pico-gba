@@ -1,5 +1,5 @@
 // Launched by the main zig program to open sdl and display pixels
-// Workaround since zig won't like properly to sdl currently and fails to start
+// Workaround since zig currently won't link properly to sdl and fails to start
 //
 // Build with: gcc -lSDL2 display.c -o display
 
