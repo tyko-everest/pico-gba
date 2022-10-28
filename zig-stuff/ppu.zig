@@ -70,13 +70,13 @@ const Registers = packed struct {
     },
     bg_control: [4]packed struct {
         bg_prio: u2,
-        tile_base: u2,
+        tileset_base: u2,
         unused1: u2 = 0,
         mosaic: u1,
         palette_mode: u1,
-        screen_base: u5,
+        tilemap_base: u5,
         disp_area_overflow: u1,
-        screen_size: u2,
+        tilemap_size: u2,
     },
     bg_offset: [4]packed struct {
         horiz: u9,
@@ -95,9 +95,29 @@ const Tile8 = struct {
     data: [64]u8,
 };
 
-const TileBlock = union {
+const TileSet = packed union {
     tile4: [512]Tile4,
     tile8: [256]Tile8,
+};
+
+const TileMapEntry = packed struct {
+    index: u10,
+    horiz_flip: u1,
+    vert_flip: u1,
+    palette_bank: u4,
+};
+
+const VideoMem = packed union {
+    raw: [96 * 1024]u8,
+    data: packed struct {
+        bg: packed union {
+            tilesets: [4]TileSet,
+            tilemaps: [32][32]TileMapEntry,
+        },
+        obj: packed union {
+            temp: u8,
+        },
+    },
 };
 
 const Colour = packed struct {
@@ -107,18 +127,45 @@ const Colour = packed struct {
     x: u1 = 1,
 };
 
-const Palette = struct {
-    colours: [256]Colour,
+const PaletteMem = packed struct {
+    bg: [256]Colour,
+    sprite: [256]Colour,
+};
+
+const ObjAttr = packed struct {
+    y_coord: u8,
+};
+
+const ObjAttrMem = packed struct {
+    temp: ObjAttr,
 };
 
 const PPU = struct {
     display: Display,
     registers: Registers,
-    tile_blocks: [6]TileBlock,
-    bg_palette: [256]Colour,
-    sprite_palette: [256]Colour,
+    video_mem: VideoMem,
+    palette_mem: PaletteMem,
+    obj_attr_mem: ObjAttrMem,
 
-    // pub fn get_pixel(self: PPU, x: usize, y: usize) Colour {}
+    pub fn get_reg_bg_pixel(self: PPU, x: usize, y: usize, num: usize) Colour {
+        const bg_control = self.registers.bg_control[num];
+        const tileset = self.video_mem.data.bg.tilesets[bg_control.tileset_base];
+        const tilemap = self.video_mem.data.bg.tilemaps[bg_control.tileset_base];
+
+        const bg_offset = self.registers.bg_offset[num];
+        const x_bg = x + bg_offset.horiz;
+        const y_bg = y + bg_offset.vert;
+
+        const tile_entry = tilemap[x_bg / 32][y_bg / 32];
+        const tile_val = tileset[tile_entry];
+
+        if (bg_control.palette_mode == 0) {
+            // 4 bit palette
+        } else {
+            // 8 bit palette
+            return self.palette_mem.bg[tile_val];
+        }
+    }
 };
 
 pub fn main() void {
