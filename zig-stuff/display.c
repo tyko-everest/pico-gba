@@ -36,7 +36,7 @@ int main(int argc, char *argv[]) {
                                           height, SDL_WINDOW_SHOWN);
     SDL_Surface *screen = SDL_GetWindowSurface(window);
     SDL_Surface *pixels = SDL_CreateRGBSurfaceWithFormat(
-        0, width, height, 16, SDL_PIXELFORMAT_ARGB1555);
+        0, width, height, 16, SDL_PIXELFORMAT_ABGR1555);
     SDL_TimerID timer = SDL_AddTimer(30, timer_callback, NULL);
 
     bool quit = false;
