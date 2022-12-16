@@ -3,5 +3,6 @@ zig-cache/
 zig-out/
 *.gba
 *.sav
+*.bin
 pokemon_emerald.s
 display
