@@ -168,6 +168,36 @@ const ObjAttrMem = packed struct {
     temp: ObjAttr,
 };
 
+const BgSortType = struct {
+    enabled: usize = 0,
+    num: usize = 0,
+    prio: usize = 0,
+
+    pub fn init() BgSortType {
+        return BgSortType{
+            .enabled = 0,
+            .num = 0,
+            .prio = 0,
+        };
+    }
+};
+
+fn cmp(_: void, lhs: BgSortType, rhs: BgSortType) bool {
+    if (lhs.enabled >= rhs.enabled) {
+        if (lhs.prio <= rhs.prio) {
+            if (lhs.num <= rhs.num) {
+                return true;
+            } else {
+                return false;
+            }
+        } else {
+            return false;
+        }
+    } else {
+        return false;
+    }
+}
+
 const PPU = struct {
     display: Display,
     registers: Registers,
@@ -241,18 +271,46 @@ const PPU = struct {
 
     // Given screen coordinates, return what colour the background pixel should be
     // Used in the main loop as x goes 0 -> 240 and y goes 0 -> 160 each frame
-    pub fn get_bg_pixel(self: PPU, _: usize, _: usize) Colour {
+    pub fn get_bg_pixel(self: PPU, x: usize, y: usize) Colour {
         const disp_ctrl = self.registers.disp_ctrl;
-        switch (disp_ctrl.mode) {
+        switch (disp_ctrl.bg_mode) {
             0 => {
                 // this needs to go through each of the four backgrounds,
                 // don't bother with ones that are disabled,
                 // go through them based on priority,
                 // call get_reg_bg_pixel on each,
                 // stop and return the first non-transparent pixel
+                var bgs_sorted: BgSortType[4] = [_]BgSortType{.{}} ** 4;
                 if (disp_ctrl.screen_disp_bg0 == 1) {
-                    // const colour =
+                    bgs_sorted[0].enabled = 1;
                 }
+                if (disp_ctrl.screen_disp_bg1 == 1) {
+                    bgs_sorted[1].enabled = 1;
+                }
+                if (disp_ctrl.screen_disp_bg2 == 1) {
+                    bgs_sorted[2].enabled = 1;
+                }
+                if (disp_ctrl.screen_disp_bg3 == 1) {
+                    bgs_sorted[3].enabled = 1;
+                }
+                var bg_index = 0;
+                while (bg_index < 4) : (bg_index += 1) {
+                    bgs_sorted[bg_index].num = bg_index;
+                    bgs_sorted[bg_index].prio = self.registers.bg_control[bg_index].bg_prio;
+                }
+
+                std.sort.sort(BgSortType, bgs_sorted);
+                for (bgs_sorted) |bg| {
+                    const colour = self.get_reg_bg_pixel(x, y, bg.num);
+                    if (!colour.is_transparent()) {
+                        return colour;
+                    }
+                }
+                return Colour{ .channels = .{
+                    .r = 0,
+                    .g = 0,
+                    .b = 0,
+                } };
             },
             1 => {},
             2 => {},
@@ -286,24 +344,29 @@ pub fn main() void {
     // ppu.registers.bg_control[2].tilemap_size = 1;
     // const colour_test = ppu.get_reg_bg_pixel(16, 64, 2);
 
-    var frame: u64 = 0;
+    var frame: usize = 0;
+    var scroll: u9 = 0;
     while (true) {
+        ppu.registers.bg_offset[0].horiz = scroll;
+        ppu.registers.bg_offset[0].vert = scroll;
+
         const start_time = std.time.milliTimestamp();
         var y: usize = 0;
         while (y < DISP_HEIGHT) : (y += 1) {
             var x: usize = 0;
             while (x < DISP_WIDTH) : (x += 1) {
-                var colour = ppu.get_reg_bg_pixel(x, y, 0);
+                var colour = ppu.get_bg_pixel(x, y);
                 colour.channels.x = 1;
                 ppu.display.push_pixel(colour.raw);
-                std.debug.print("colour raw: {}\n", .{colour.raw});
-                std.debug.print("15 bit colour: r: {}, g: {}, b: {}\n", .{ colour.channels.r, colour.channels.g, colour.channels.b });
-                // std.debug.print("24 bit colour: r: {}, g: {}, b: {}\n", .{ @as(usize, colour.channels.r) * 8, @as(usize, colour.channels.g) * 8, @as(usize, colour.channels.b) * 8 });
             }
         }
         frame += 1;
         const end_time = std.time.milliTimestamp();
 
+        scroll += 1;
+        if (scroll == 10) {
+            scroll = 0;
+        }
         std.debug.print("frame time: {} ms\n", .{end_time - start_time});
     }
 }
