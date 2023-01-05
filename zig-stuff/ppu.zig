@@ -140,19 +140,16 @@ const VideoMem = packed struct {
 const Colour = packed union {
     raw: u16,
     channels: packed struct {
-        r: u5,
-        g: u5,
-        b: u5,
+        r: u5 = 0,
+        g: u5 = 0,
+        b: u5 = 0,
         x: u1 = 1,
     },
+};
 
-    pub fn is_transparent(self: Colour) bool {
-        if (self.channels.r == 0 and self.channels.g == 0 and self.channels.b == 0) {
-            return true;
-        } else {
-            return false;
-        }
-    }
+const Pixel = struct {
+    transparent: bool,
+    colour: Colour,
 };
 
 const PaletteMem = packed struct {
@@ -183,18 +180,20 @@ const BgSortType = struct {
 };
 
 fn cmp(_: void, lhs: BgSortType, rhs: BgSortType) bool {
-    if (lhs.enabled >= rhs.enabled) {
-        if (lhs.prio <= rhs.prio) {
-            if (lhs.num <= rhs.num) {
+    if (lhs.enabled < rhs.enabled) {
+        return false;
+    } else {
+        if (lhs.prio < rhs.prio) {
+            return true;
+        } else if (lhs.prio > rhs.prio) {
+            return false;
+        } else {
+            if (lhs.num < rhs.num) {
                 return true;
             } else {
                 return false;
             }
-        } else {
-            return false;
         }
-    } else {
-        return false;
     }
 }
 
@@ -235,7 +234,7 @@ const PPU = struct {
     }
 
     // Given coordinates and a background that we know is drawing in regular tiled mode, return the pixel colour
-    fn get_reg_bg_pixel(self: PPU, x_screen: usize, y_screen: usize, bg_num: usize) Colour {
+    fn get_reg_bg_pixel(self: PPU, x_screen: usize, y_screen: usize, bg_num: usize) Pixel {
         const bg_control = self.registers.bg_control[bg_num];
         const bg_offset = self.registers.bg_offset[bg_num];
 
@@ -255,13 +254,31 @@ const PPU = struct {
         if (bg_control.palette_mode == 0) {
             // 4-bit tiles
             const tile = self.video_mem.bg.tile4s[@as(usize, bg_control.tileset_base) * 512 + tilemap_entry.index];
-            palette_index = @as(u8, tilemap_entry.palette_bank) << 4 | tile.get(x_tile, y_tile);
+            // TODO, if this value is 0 (not the full index below), then the pixel should be transparent
+            // need to get this info out to the upper layers somehow
+            const pixel_value = tile.get(x_tile, y_tile);
+            if (pixel_value == 0) {
+                return Pixel{
+                    .transparent = true,
+                    .colour = Colour{
+                        .channels = .{
+                            .r = 0,
+                            .g = 0,
+                            .b = 0,
+                        },
+                    },
+                };
+            }
+            palette_index = @as(u8, tilemap_entry.palette_bank) << 4 | pixel_value;
         } else {
             // 8-bit tiles
             const tile = self.video_mem.bg.tile8s[@as(usize, bg_control.tileset_base) * 256 + tilemap_entry.index];
             palette_index = tile.get(x_tile, y_tile);
         }
-        return self.palette_mem.bg[palette_index];
+        return Pixel{
+            .transparent = false,
+            .colour = self.palette_mem.bg[palette_index],
+        };
     }
 
     // Given coordinates and a background that we know is drawing in regular affline mode, return the pixel colour
@@ -271,7 +288,7 @@ const PPU = struct {
 
     // Given screen coordinates, return what colour the background pixel should be
     // Used in the main loop as x goes 0 -> 240 and y goes 0 -> 160 each frame
-    pub fn get_bg_pixel(self: PPU, x: usize, y: usize) Colour {
+    pub fn get_bg_pixel(self: PPU, x: usize, y: usize) Pixel {
         const disp_ctrl = self.registers.disp_ctrl;
         switch (disp_ctrl.bg_mode) {
             0 => {
@@ -280,7 +297,12 @@ const PPU = struct {
                 // go through them based on priority,
                 // call get_reg_bg_pixel on each,
                 // stop and return the first non-transparent pixel
-                var bgs_sorted: BgSortType[4] = [_]BgSortType{.{}} ** 4;
+                var bgs_sorted: [4]BgSortType = .{
+                    BgSortType.init(),
+                    BgSortType.init(),
+                    BgSortType.init(),
+                    BgSortType.init(),
+                };
                 if (disp_ctrl.screen_disp_bg0 == 1) {
                     bgs_sorted[0].enabled = 1;
                 }
@@ -293,24 +315,19 @@ const PPU = struct {
                 if (disp_ctrl.screen_disp_bg3 == 1) {
                     bgs_sorted[3].enabled = 1;
                 }
-                var bg_index = 0;
+                var bg_index: usize = 0;
                 while (bg_index < 4) : (bg_index += 1) {
                     bgs_sorted[bg_index].num = bg_index;
                     bgs_sorted[bg_index].prio = self.registers.bg_control[bg_index].bg_prio;
                 }
 
-                std.sort.sort(BgSortType, bgs_sorted);
+                std.sort.sort(BgSortType, &bgs_sorted, {}, cmp);
                 for (bgs_sorted) |bg| {
-                    const colour = self.get_reg_bg_pixel(x, y, bg.num);
-                    if (!colour.is_transparent()) {
-                        return colour;
+                    const pixel = self.get_reg_bg_pixel(x, y, bg.num);
+                    if (!pixel.transparent) {
+                        return pixel;
                     }
                 }
-                return Colour{ .channels = .{
-                    .r = 0,
-                    .g = 0,
-                    .b = 0,
-                } };
             },
             1 => {},
             2 => {},
@@ -319,6 +336,16 @@ const PPU = struct {
             5 => {},
             6, 7 => {},
         }
+        return Pixel{
+            .transparent = true,
+            .colour = Colour{
+                .channels = .{
+                    .r = 0,
+                    .g = 0,
+                    .b = 0,
+                },
+            },
+        };
     }
 
     // Given screen coordinates, return what colour the pixel should be
@@ -331,17 +358,26 @@ pub fn main() void {
     var ppu = PPU.new();
 
     // test setup based on pokemon emerald start screen
+    ppu.registers.disp_ctrl.obj_char_mapping = 1;
+    ppu.registers.disp_ctrl.screen_disp_bg0 = 1;
+    ppu.registers.disp_ctrl.screen_disp_bg1 = 1;
+    ppu.registers.disp_ctrl.screen_disp_bg2 = 0;
+    ppu.registers.disp_ctrl.screen_disp_obj = 1;
+
+    ppu.registers.bg_control[0].bg_prio = 3;
     ppu.registers.bg_control[0].tileset_base = 2;
     ppu.registers.bg_control[0].tilemap_base = 26;
 
+    ppu.registers.bg_control[1].bg_prio = 2;
     ppu.registers.bg_control[1].tileset_base = 3;
     ppu.registers.bg_control[1].tilemap_base = 27;
     ppu.registers.bg_control[1].tilemap_size = 0;
 
-    // ppu.registers.bg_control[2].palette_mode = 1;
-    // ppu.registers.bg_control[2].tileset_base = 0;
-    // ppu.registers.bg_control[2].tilemap_base = 9;
-    // ppu.registers.bg_control[2].tilemap_size = 1;
+    ppu.registers.bg_control[2].bg_prio = 1;
+    ppu.registers.bg_control[2].palette_mode = 1;
+    ppu.registers.bg_control[2].tileset_base = 0;
+    ppu.registers.bg_control[2].tilemap_base = 9;
+    ppu.registers.bg_control[2].tilemap_size = 1;
     // const colour_test = ppu.get_reg_bg_pixel(16, 64, 2);
 
     var frame: usize = 0;
@@ -355,15 +391,15 @@ pub fn main() void {
         while (y < DISP_HEIGHT) : (y += 1) {
             var x: usize = 0;
             while (x < DISP_WIDTH) : (x += 1) {
-                var colour = ppu.get_bg_pixel(x, y);
-                colour.channels.x = 1;
-                ppu.display.push_pixel(colour.raw);
+                var pixel = ppu.get_bg_pixel(x, y);
+                pixel.colour.channels.x = 1;
+                ppu.display.push_pixel(pixel.colour.raw);
             }
         }
         frame += 1;
         const end_time = std.time.milliTimestamp();
 
-        scroll += 1;
+        // scroll += 1;
         if (scroll == 10) {
             scroll = 0;
         }
