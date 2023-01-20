@@ -6,3 +6,8 @@ zig-out/
 *.bin
 pokemon_emerald.s
 display
+
+
+# Added by cargo
+
+/target
