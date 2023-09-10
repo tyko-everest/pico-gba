@@ -1,13 +1,6 @@
-build/
-zig-cache/
-zig-out/
+/target
 *.gba
 *.sav
 *.bin
+*.o
 pokemon_emerald.s
-display
-
-
-# Added by cargo
-
-/target
