@@ -24,17 +24,6 @@
                 "break main",
                 "continue"
             ]
-        },
-        {
-            "type": "lldb",
-            "request": "launch",
-            "name": "Debug",
-            "program": "${workspaceFolder}/zig-stuff/zig-out/bin/ppu",
-            "args": [
-                "/usr/local/bin/zig"
-            ],
-            "cwd": "${workspaceFolder}/zig-stuff",
-            "preLaunchTask": "zig build"
         }
     ]
 }

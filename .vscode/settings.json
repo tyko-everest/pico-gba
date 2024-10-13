@@ -30,5 +30,6 @@
     },
     "[zig]": {
         "editor.defaultFormatter": "tiehuis.zig"
-    }
+    },
+    "nixEnvSelector.nixFile": "${workspaceFolder}/shell.nix"
 }
