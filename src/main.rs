@@ -1,81 +1,13 @@
+mod registers;
+mod video;
+
+use crate::{registers::DisplayRegisters, video::*};
+use arbitrary_int::*;
 use minifb::{Key, Window, WindowOptions};
-use modular_bitfield::prelude::*;
+use std::{fs::File, io::Read};
 
 const WIDTH: usize = 240;
 const HEIGHT: usize = 160;
-
-#[bitfield]
-#[derive(Debug, Clone, Copy)]
-pub struct DisplayControl {
-    bg_mode: B3,
-    cgb_mode: B1,
-    disp_frame: B1,
-    hblank_interval_free: B1,
-    obj_char_mapping: B1,
-    forced_blank: B1,
-    screen_disp_bg0: B1,
-    screen_disp_bg1: B1,
-    screen_disp_bg2: B1,
-    screen_disp_bg3: B1,
-    screen_disp_obj: B1,
-    disp_win0: B1,
-    disp_win1: B1,
-    disp_obj_win: B1,
-}
-
-#[bitfield]
-#[derive(Debug, Clone, Copy)]
-pub struct DisplayStatus {
-    vblank_flag: B1,
-    hblank_flag: B1,
-    vcounter_flag: B1,
-    vblank_irq_en: B1,
-    hblank_irq_en: B1,
-    vcounter_irq_en: B1,
-    unused: B2,
-    vcounter_setting: B8,
-}
-
-#[bitfield]
-#[derive(Debug, Clone, Copy)]
-pub struct VertCounter {
-    curr_scanline: B8,
-    unused: B8,
-}
-
-#[bitfield]
-#[derive(Debug, Clone, Copy)]
-pub struct BgControl {
-    bg_prio: B2,
-    tileset_base: B2,
-    unused1: B2,
-    mosaic: B1,
-    palette_mode: B1,
-    tilemap_base: B5,
-    disp_area_overflow: B1,
-    tilemap_size: B2,
-}
-
-#[bitfield]
-#[derive(Debug, Clone, Copy)]
-pub struct BgOffset {
-    horiz: B9,
-    unused1: B7,
-    vert: B9,
-    unused2: B7,
-}
-
-// https://problemkaputt.de/gbatek.htm#lcdiodisplaycontrol
-#[repr(C)]
-pub struct Registers {
-    disp_ctrl: DisplayControl,
-    green_swap: u16,
-    disp_status: DisplayStatus,
-    vert_counter: VertCounter,
-    bg_control: [BgControl; 4],
-    bg_offset: [BgOffset; 4],
-    res: [u8; 8],
-}
 
 fn main() {
     let mut buffer: Vec<u32> = vec![0; WIDTH * HEIGHT];
@@ -87,24 +19,49 @@ fn main() {
         resize: false,
         topmost: true,
         transparency: false,
-        none: true
+        none: true,
     };
-    let mut window = Window::new(
-        "Test - ESC to exit",
-        WIDTH,
-        HEIGHT,
-        opts,
-    )
-    .unwrap_or_else(|e| {
+    let mut window = Window::new("Test - ESC to exit", WIDTH, HEIGHT, opts).unwrap_or_else(|e| {
         panic!("{}", e);
     });
 
     // Limit to max ~60 fps update rate
-    window.limit_update_rate(Some(std::time::Duration::from_micros(16600)));
+    window.set_target_fps(60);
+
+    let mut raw_vram = File::open("src/vram.bin").unwrap();
+    let mut vram = [0; 64 * 1024];
+    raw_vram.read_exact(&mut vram).unwrap();
+
+    let mut video = Video {
+        registers: DisplayRegisters::new(),
+        palette: Palette {
+            bg: [DisplayColour::from(0); 256],
+            obj: [DisplayColour::from(0); 256],
+        },
+        vram: VRAM::init(vram.as_mut_ptr()),
+    };
+
+    video.registers.bg_control[0].set_tileset_base(u2::new(2));
+    video.registers.bg_control[0].set_tilemap_base(u5::new(30));
+
+    video.palette.bg[13 * 16 + 0] = DisplayColour::init(0, 20, 29);
+    video.palette.bg[13 * 16 + 1] = DisplayColour::init(30, 24, 28);
+    video.palette.bg[13 * 16 + 2] = DisplayColour::init(27, 21, 30);
+    video.palette.bg[13 * 16 + 3] = DisplayColour::init(15, 05, 20);
 
     while window.is_open() && !window.is_key_down(Key::Escape) {
+        let mut x = 0;
+        let mut y = 0;
         for i in buffer.iter_mut() {
-            *i = 0; // write something more funny here!
+            *i = video.get_pixel(x, y).to_minifb_format();
+            x += 1;
+            if x == 240 {
+                y += 1;
+                x = 0;
+            }
+            if y == 160 {
+                y = 0;
+            }
         }
 
         // We unwrap here as we want this code to exit if it fails. Real applications may want to handle this in a different way

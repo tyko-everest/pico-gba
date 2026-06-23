@@ -1,13 +1,11 @@
 [package]
 name = "pico-gba"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-pixels = "0.11.0"
-minifb = "0.23.0"
-winit = "0.27.5"
-wgpu = "0.14.2"
-modular-bitfield = "=0.11.2"
+minifb = "0.28.0"
+arbitrary-int = "2.1.1"
+bilge = "0.3.0"
