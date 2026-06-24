@@ -61,7 +61,7 @@ pub struct BgOffset {
 }
 
 // https://problemkaputt.de/gbatek.htm#lcdiodisplaycontrol
-#[repr(C)]
+#[repr(C, packed)]
 pub struct DisplayRegisters {
     pub disp_ctrl: DisplayControl,
     pub green_swap: u16,

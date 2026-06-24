@@ -105,10 +105,11 @@ impl Video<'_> {
     // Get the base address of a tile set given the current status of the control registers
     fn get_tileset_base_addr(&self, bg: usize) -> *const u8 {
         const TILESET_OFFSET: usize = 16 * 1024;
+        let register = self.registers.bg_control[bg];
         unsafe {
             self.vram
                 .data
-                .add(self.registers.bg_control[bg].tileset_base().as_usize() * TILESET_OFFSET)
+                .add(register.tileset_base().as_usize() * TILESET_OFFSET)
         }
     }
 
@@ -129,10 +130,11 @@ impl Video<'_> {
     // Get the base address of a tile map given the current status of the control registers
     fn get_map_base_addr(&self, bg: usize) -> *const u8 {
         const MAP_OFFSET: usize = 2 * 1024;
+        let register = self.registers.bg_control[bg];
         unsafe {
             self.vram
                 .data
-                .add(self.registers.bg_control[bg].tilemap_base().as_usize() * MAP_OFFSET)
+                .add(register.tilemap_base().as_usize() * MAP_OFFSET)
         }
     }
 
@@ -140,9 +142,10 @@ impl Video<'_> {
     fn get_map_text_entry(&self, bg: usize, x: usize, y: usize) -> MapTextEntry {
         // tiles are 8x8 pixels
         const TILE_SIZE_LOG: usize = 3;
+        let register = self.registers.bg_control[bg];
 
         // get the width in tiles of this bg's map
-        let is_wide = self.registers.bg_control[bg].tilemap_size().value() & 0b1 == 0b1;
+        let is_wide = register.tilemap_size().value() & 0b1 == 0b1;
         let map_width = if is_wide {
             512 >> TILE_SIZE_LOG // pixels to num of tiles conversion
         } else {
