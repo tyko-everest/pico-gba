@@ -1,9 +1,8 @@
-use std::usize;
+use std::{cmp::Reverse, usize};
 
 use crate::registers::*;
 use arbitrary_int::prelude::*;
 use bilge::*;
-use minifb::Key::B;
 
 // Final colour generated for the display
 #[bitsize(16)]
@@ -54,7 +53,7 @@ struct Tile8 {
 
 impl Tile8 {
     pub fn get_colour(&self, x: usize, y: usize) -> u8 {
-        self.data[x][y]
+        self.data[y][x]
     }
 }
 
@@ -93,6 +92,12 @@ impl Palette {
     fn get_bg_colour_16(&self, palette: usize, colour: usize) -> DisplayColour {
         self.bg[palette * 16 + colour]
     }
+}
+
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
+struct PrioNum {
+    prio: usize,
+    num: usize,
 }
 
 pub struct Video<'a> {
@@ -162,20 +167,75 @@ impl Video<'_> {
         unsafe { *ptr }
     }
 
-    fn get_bg0_pixel(&self, bg: usize, x: usize, y: usize) -> DisplayColour {
-        // assume BG0 mode
+    fn get_bg_pixel_mode_0(&self, bg: usize, x: usize, y: usize) -> Option<DisplayColour> {
+        let register = self.registers.bg_control[bg];
         let map_entry = self.get_map_text_entry(bg, x, y);
-        // assume 4-bit colour
-        let tile = self.get_tile4(bg, map_entry.tile().as_usize());
-        let tile_colour = tile.get_colour(x & 0b111, y & 0b111).as_usize();
-        let colour = self
-            .palette
-            .get_bg_colour_16(map_entry.palette().as_usize(), tile_colour);
-        colour
+        if register.palette_mode() {
+            let tile = self.get_tile8(bg, map_entry.tile().as_usize());
+            let tile_colour = tile.get_colour(x & 0b111, y & 0b111).as_usize();
+            if tile_colour == 0 {
+                None
+            } else {
+                Some(self.palette.get_bg_colour_256(tile_colour))
+            }
+        } else {
+            let tile = self.get_tile4(bg, map_entry.tile().as_usize());
+            let tile_colour = tile.get_colour(x & 0b111, y & 0b111).as_usize();
+            if tile_colour == 0 {
+                None
+            } else {
+                Some(
+                    self.palette
+                        .get_bg_colour_16(map_entry.palette().as_usize(), tile_colour),
+                )
+            }
+        }
+    }
+
+    fn get_bg_pixel(&self, bg: usize, x: usize, y: usize) -> Option<DisplayColour> {
+        let register = self.registers.disp_ctrl;
+        match register.bg_mode().as_u8() {
+            0 => self.get_bg_pixel_mode_0(bg, x, y),
+            1 => todo!(),
+            2 => todo!(),
+            3 => todo!(),
+            4 => todo!(),
+            5 => todo!(),
+            val => panic!("Undefined BG Mode {val}"),
+        }
     }
 
     pub fn get_pixel(&self, x: usize, y: usize) -> DisplayColour {
-        // assume BG0 mode and it's offset is 0
-        self.get_bg0_pixel(0, x, y)
+        let display_control = self.registers.disp_ctrl;
+        let bg_regs = self.registers.bg_control;
+
+        // figure out the display order, prio first, then if tie go to number
+        let mut prio_num_pairs: Vec<PrioNum> = (0..=3)
+            .map(|num| PrioNum {
+                prio: bg_regs[num].bg_prio().as_usize(),
+                num: num,
+            })
+            .collect();
+        prio_num_pairs.sort();
+
+        // go through in prio order and if enabled continue until we find a non-transparent pixel
+        let mut colour: Option<DisplayColour> = None;
+        for num in prio_num_pairs.iter().map(|pn| pn.num) {
+            if let Some(bg_colour) = self.get_bg_pixel(num, x, y)
+                && display_control.screen_disp_bg_at(num)
+            {
+                colour = Some(bg_colour);
+                break;
+            }
+        }
+
+        let final_colour: DisplayColour;
+        if let Some(c) = colour {
+            final_colour = c;
+        } else {
+            // colour 0 of palette 0 is the default colour if nothing else is opaque
+            final_colour = self.palette.get_bg_colour_16(0, 0);
+        }
+        final_colour
     }
 }

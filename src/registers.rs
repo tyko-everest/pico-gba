@@ -4,40 +4,37 @@ use bilge::*;
 #[bitsize(16)]
 #[derive(FromBits, Clone, Copy)]
 pub struct DisplayControl {
-    bg_mode: u3,
-    cgb_mode: bool,
-    disp_frame: bool,
-    hblank_interval_free: bool,
-    obj_char_mapping: bool,
-    forced_blank: bool,
-    screen_disp_bg0: bool,
-    screen_disp_bg1: bool,
-    screen_disp_bg2: bool,
-    screen_disp_bg3: bool,
-    screen_disp_obj: bool,
-    disp_win0: bool,
-    disp_win1: bool,
-    disp_obj_win: bool,
+    pub bg_mode: u3,
+    pub cgb_mode: bool,
+    pub disp_frame: bool,
+    pub hblank_interval_free: bool,
+    pub obj_char_mapping: bool,
+    pub forced_blank: bool,
+    pub screen_disp_bg: [bool; 4],
+    pub screen_disp_obj: bool,
+    pub disp_win0: bool,
+    pub disp_win1: bool,
+    pub disp_obj_win: bool,
 }
 
 #[bitsize(16)]
 #[derive(FromBits, Clone, Copy)]
 pub struct DisplayStatus {
-    vblank_flag: bool,
-    hblank_flag: bool,
-    vcounter_flag: bool,
-    vblank_irq_en: bool,
-    hblank_irq_en: bool,
-    vcounter_irq_en: bool,
-    unused: u2,
-    vcounter_setting: u8,
+    pub vblank_flag: bool,
+    pub hblank_flag: bool,
+    pub vcounter_flag: bool,
+    pub vblank_irq_en: bool,
+    pub hblank_irq_en: bool,
+    pub vcounter_irq_en: bool,
+    pub unused: u2,
+    pub vcounter_setting: u8,
 }
 
 #[bitsize(16)]
 #[derive(FromBits, Clone, Copy)]
 pub struct VertCounter {
-    curr_scanline: u8,
-    unused: u8,
+    pub curr_scanline: u8,
+    pub unused: u8,
 }
 
 #[bitsize(16)]
