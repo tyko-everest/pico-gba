@@ -79,6 +79,7 @@ impl VRAM {
     }
 }
 
+#[repr(C, packed)]
 pub struct Palette {
     pub bg: [DisplayColour; 256],
     pub obj: [DisplayColour; 256],
@@ -94,13 +95,13 @@ impl Palette {
     }
 }
 
-pub struct Video {
-    pub registers: DisplayRegisters,
-    pub palette: Palette,
-    pub vram: VRAM,
+pub struct Video<'a> {
+    pub registers: &'a mut DisplayRegisters,
+    pub palette: &'a mut Palette,
+    pub vram: &'a mut VRAM,
 }
 
-impl Video {
+impl Video<'_> {
     // Get the base address of a tile set given the current status of the control registers
     fn get_tileset_base_addr(&self, bg: usize) -> *const u8 {
         const TILESET_OFFSET: usize = 16 * 1024;

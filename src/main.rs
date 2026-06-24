@@ -28,17 +28,23 @@ fn main() {
     // Limit to max ~60 fps update rate
     window.set_target_fps(60);
 
-    let mut raw_vram = File::open("src/vram.bin").unwrap();
-    let mut vram = [0; 64 * 1024];
-    raw_vram.read_exact(&mut vram).unwrap();
+    let mut registers = DisplayRegisters::new();
 
-    let mut video = Video {
-        registers: DisplayRegisters::new(),
-        palette: Palette {
-            bg: [DisplayColour::from(0); 256],
-            obj: [DisplayColour::from(0); 256],
-        },
-        vram: VRAM::init(vram.as_mut_ptr()),
+    let mut vram_file = File::open("rom_dumps/vram.bin").unwrap();
+    let mut vram_mem = [0; 64 * 1024];
+    vram_file.read_exact(&mut vram_mem).unwrap();
+    let mut vram = VRAM::init(vram_mem.as_mut_ptr());
+
+    let mut palette_file = File::open("rom_dumps/palette.bin").unwrap();
+    let mut palette_mem = [0; 1024];
+    palette_file.read_exact(&mut palette_mem).unwrap();
+    let palette_ptr = palette_mem.as_mut_ptr() as *mut Palette;
+    let mut palette = unsafe { &mut *palette_ptr };
+
+    let video = Video {
+        registers: &mut registers,
+        palette: &mut palette,
+        vram: &mut vram,
     };
 
     video.registers.bg_control[0].set_tileset_base(u2::new(2));
