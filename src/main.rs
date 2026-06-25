@@ -27,7 +27,7 @@ fn main() {
 
     // load in values from dump from real ram
     let mut registers_file = File::open("ram_dumps/display_registers.bin").unwrap();
-    let mut registers_mem = [0; 16];
+    let mut registers_mem = [0; 32];
     registers_file.read_exact(&mut registers_mem).unwrap();
     let registers_ptr = registers_mem.as_mut_ptr() as *mut DisplayRegisters;
     let mut registers = unsafe { &mut *registers_ptr };

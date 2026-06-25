@@ -50,11 +50,30 @@ pub struct BgControl {
     pub tilemap_size: u2,
 }
 
+impl BgControl {
+    pub fn width_in_tiles(&self) -> usize {
+        let is_wide = self.tilemap_size().value() & 0b1 == 0b1;
+        if is_wide { 64 } else { 32 }
+    }
+
+    pub fn height_in_tiles(&self) -> usize {
+        let is_tall = self.tilemap_size().value() & 0b10 == 0b10;
+        if is_tall { 64 } else { 32 }
+    }
+}
+
 #[bitsize(16)]
 #[derive(FromBits, Clone, Copy)]
 pub struct BgOffset {
-    offset: u9,
-    unused: u7,
+    pub offset: u9,
+    pub unused: u7,
+}
+
+#[repr(C, packed)]
+#[derive(Clone, Copy)]
+pub struct BgOffsetPair {
+    pub x: BgOffset,
+    pub y: BgOffset,
 }
 
 // https://problemkaputt.de/gbatek.htm#lcdiodisplaycontrol
@@ -65,7 +84,7 @@ pub struct DisplayRegisters {
     pub disp_status: DisplayStatus,
     pub vert_counter: VertCounter,
     pub bg_control: [BgControl; 4],
-    // bg_offset: [BgOffset; 8],
+    pub bg_offset: [BgOffsetPair; 4],
     // and the rest at some point...
 }
 
@@ -77,6 +96,10 @@ impl DisplayRegisters {
             disp_status: DisplayStatus::from(0),
             vert_counter: VertCounter::from(0),
             bg_control: [BgControl::from(0); 4],
+            bg_offset: [BgOffsetPair {
+                x: BgOffset::from(0),
+                y: BgOffset::from(0),
+            }; 4],
         }
     }
 }

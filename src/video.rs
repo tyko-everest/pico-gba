@@ -1,8 +1,10 @@
-use std::{cmp::Reverse, usize};
-
 use crate::registers::*;
 use arbitrary_int::prelude::*;
 use bilge::*;
+use std::usize;
+
+// tiles are 8x8 pixels
+const TILE_SIZE_LOG: usize = 3;
 
 // Final colour generated for the display
 #[bitsize(16)]
@@ -94,6 +96,88 @@ impl Palette {
     }
 }
 
+#[bitsize(16)]
+#[derive(FromBits, Clone, Copy)]
+struct ObjAttr0Normal {
+    y: u8,
+    rot_scale: bool,
+    disable: bool,
+    mode: u2,
+    mosaic: bool,
+    enable_256_colour: bool,
+    shape: u2,
+}
+
+#[bitsize(16)]
+#[derive(FromBits, Clone, Copy)]
+struct ObjAttr0RotScale {
+    y: u8,
+    rot_scale: bool,
+    double_size: bool,
+    mode: u2,
+    mosaic: bool,
+    enable_256_colour: bool,
+    shape: u2,
+}
+
+#[repr(C, packed)]
+#[derive(Clone, Copy)]
+union ObjAttr0 {
+    normal: ObjAttr0Normal,
+    rot_scale: ObjAttr0RotScale,
+}
+
+#[bitsize(16)]
+#[derive(FromBits, Clone, Copy)]
+struct ObjAttr1Normal {
+    x: u9,
+    unused: u3,
+    horiz_flip: bool,
+    vert_flip: bool,
+    size: u2,
+}
+
+#[bitsize(16)]
+#[derive(FromBits, Clone, Copy)]
+struct ObjAttr1RotScale {
+    x: u9,
+    param_sel: u5,
+    size: u2,
+}
+
+#[repr(C, packed)]
+#[derive(Clone, Copy)]
+union ObjAttr1 {
+    normal: ObjAttr1Normal,
+    rot_scale: ObjAttr1RotScale,
+}
+
+#[bitsize(16)]
+#[derive(Clone, Copy)]
+struct ObjAttr2 {
+    tile: u10,
+    prio: u2,
+    palette: u4,
+}
+
+#[repr(C, packed)]
+#[derive(Clone, Copy)]
+struct ObjAttr {
+    attr0: ObjAttr0,
+    attr1: ObjAttr1,
+    attr2: ObjAttr2,
+    rot_scale: u16,
+}
+
+#[repr(C, packed)]
+pub struct OAM([ObjAttr; 128]);
+
+impl OAM {
+    fn get(&self, index: usize) -> ObjAttr {
+        self.0[index]
+    }
+}
+
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
 struct PrioNum {
     prio: usize,
@@ -145,17 +229,7 @@ impl Video<'_> {
 
     // Get info about a tile map entry assuming this BG is in text mode
     fn get_map_text_entry(&self, bg: usize, x: usize, y: usize) -> MapTextEntry {
-        // tiles are 8x8 pixels
-        const TILE_SIZE_LOG: usize = 3;
         let register = self.registers.bg_control[bg];
-
-        // get the width in tiles of this bg's map
-        let is_wide = register.tilemap_size().value() & 0b1 == 0b1;
-        let map_width = if is_wide {
-            512 >> TILE_SIZE_LOG // pixels to num of tiles conversion
-        } else {
-            256 >> TILE_SIZE_LOG
-        };
 
         // get the location of the tile entry in this map
         let tile_x = x >> TILE_SIZE_LOG;
@@ -163,7 +237,7 @@ impl Video<'_> {
 
         // finally get the value of the tile entry
         let base_ptr = self.get_map_base_addr(bg) as *const MapTextEntry;
-        let ptr = unsafe { base_ptr.add(tile_y * map_width + tile_x) };
+        let ptr = unsafe { base_ptr.add(tile_y * register.width_in_tiles() + tile_x) };
         unsafe { *ptr }
     }
 
@@ -208,6 +282,7 @@ impl Video<'_> {
     pub fn get_pixel(&self, x: usize, y: usize) -> DisplayColour {
         let display_control = self.registers.disp_ctrl;
         let bg_regs = self.registers.bg_control;
+        let bg_offsets = self.registers.bg_offset;
 
         // figure out the display order, prio first, then if tie go to number
         let mut prio_num_pairs: Vec<PrioNum> = (0..=3)
@@ -221,7 +296,41 @@ impl Video<'_> {
         // go through in prio order and if enabled continue until we find a non-transparent pixel
         let mut colour: Option<DisplayColour> = None;
         for num in prio_num_pairs.iter().map(|pn| pn.num) {
-            if let Some(bg_colour) = self.get_bg_pixel(num, x, y)
+            // get the x offset register
+            let mut offset_x = {
+                let reg = bg_offsets[num].x;
+                reg.offset().as_usize()
+            };
+            // get the current map's width
+            let width = bg_regs[num].width_in_tiles() << TILE_SIZE_LOG;
+            // wrap the offset to within range if needed
+            if offset_x >= width {
+                offset_x -= width;
+            }
+            // get the x coordinate in that background map
+            let mut bg_x = x + offset_x;
+            if bg_x >= width {
+                bg_x -= width;
+            }
+
+            // get the y offset register
+            let mut offset_y = {
+                let reg = bg_offsets[num].y;
+                reg.offset().as_usize()
+            };
+            // get the current map's height
+            let height = bg_regs[num].height_in_tiles() << TILE_SIZE_LOG;
+            // wrap the offset to within range if needed
+            if offset_y >= height {
+                offset_y -= height;
+            }
+            // get the y coordinate in that background map
+            let mut bg_y = y + offset_y;
+            if bg_y >= height {
+                bg_y -= height;
+            }
+
+            if let Some(bg_colour) = self.get_bg_pixel(num, bg_x, bg_y)
                 && display_control.screen_disp_bg_at(num)
             {
                 colour = Some(bg_colour);
