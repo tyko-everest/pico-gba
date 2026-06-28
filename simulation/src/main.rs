@@ -1,7 +1,4 @@
-mod registers;
-mod video;
-
-use crate::{registers::*, video::*};
+use common::{registers::*, video::*};
 use minifb::{Key, Window, WindowOptions};
 use std::{fs::File, io::Read};
 
@@ -26,18 +23,18 @@ fn main() {
     window.set_target_fps(60);
 
     // load in values from dump from real ram
-    let mut registers_file = File::open("ram_dumps/display_registers.bin").unwrap();
+    let mut registers_file = File::open("simulation/ram_dumps/display_registers.bin").unwrap();
     let mut registers_mem = [0; 32];
     registers_file.read_exact(&mut registers_mem).unwrap();
     let registers_ptr = registers_mem.as_mut_ptr() as *mut DisplayRegisters;
     let mut registers = unsafe { &mut *registers_ptr };
 
-    let mut vram_file = File::open("ram_dumps/vram.bin").unwrap();
+    let mut vram_file = File::open("simulation/ram_dumps/vram.bin").unwrap();
     let mut vram_mem = [0; 64 * 1024];
     vram_file.read_exact(&mut vram_mem).unwrap();
     let mut vram = VRAM::init(vram_mem.as_mut_ptr());
 
-    let mut palette_file = File::open("ram_dumps/palette.bin").unwrap();
+    let mut palette_file = File::open("simulation/ram_dumps/palette.bin").unwrap();
     let mut palette_mem = [0; 1024];
     palette_file.read_exact(&mut palette_mem).unwrap();
     let palette_ptr = palette_mem.as_mut_ptr() as *mut Palette;

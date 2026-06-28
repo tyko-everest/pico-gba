@@ -3,4 +3,5 @@
 *.sav
 *.bin
 *.o
+*.objdump
 pokemon_emerald.s
