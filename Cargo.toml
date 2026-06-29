@@ -1,3 +1,4 @@
 [workspace]
 resolver = "3"
-members = ["common", "simulation"]
+members = ["common", "firmware", "simulation"]
+default-members = ["simulation"]

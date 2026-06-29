@@ -1,7 +1,7 @@
 use crate::registers::*;
 use arbitrary_int::prelude::*;
 use bilge::*;
-use std::usize;
+use core::usize;
 
 // tiles are 8x8 pixels
 const TILE_SIZE_LOG: usize = 3;
@@ -285,13 +285,14 @@ impl Video<'_> {
         let bg_offsets = self.registers.bg_offset;
 
         // figure out the display order, prio first, then if tie go to number
-        let mut prio_num_pairs: Vec<PrioNum> = (0..=3)
-            .map(|num| PrioNum {
+        let mut prio_num_pairs = [PrioNum { prio: 0, num: 0 }; 4];
+        for num in 0..=3 {
+            prio_num_pairs[num] = PrioNum {
                 prio: bg_regs[num].bg_prio().as_usize(),
                 num: num,
-            })
-            .collect();
-        prio_num_pairs.sort();
+            }
+        }
+        prio_num_pairs.sort_unstable();
 
         // go through in prio order and if enabled continue until we find a non-transparent pixel
         let mut colour: Option<DisplayColour> = None;

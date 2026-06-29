@@ -3,26 +3,17 @@
     "configurations": [
         {
             "name": "Pico Debug",
-            "cwd": "${workspaceRoot}",
-            "executable": "${command:cmake.launchTargetPath}",
-            // "executable": "${workspaceRoot}/build/src/main.elf",
+            "type": "probe-rs-debug",
             "request": "launch",
-            "type": "cortex-debug",
-            "servertype": "openocd",
-            // This may need to be arm-none-eabi-gdb depending on your system
-            "gdbPath": "arm-none-eabi-gdb",
-            "device": "RP2040",
-            "configFiles": [
-                "interface/picoprobe.cfg",
-                "target/rp2040.cfg"
-            ],
-            // "svdFile": "${env:PICO_SDK_PATH}/src/rp2040/hardware_regs/rp2040.svd",
-            "svdFile": "/home/tyko/Development/pico/pico-sdk/src/rp2040/hardware_regs/rp2040.svd",
-            "runToEntryPoint": "main",
-            // Work around for stopping at main on restart
-            "postRestartCommands": [
-                "break main",
-                "continue"
+            "preLaunchTask": "rust: cargo build",
+            "flashingConfig": {
+                "flashingEnabled": true,
+            },
+            "chip": "rp2040",
+            "coreConfigs": [
+                {
+                    "programBinary": "${workspaceFolder}/target/thumbv6m-none-eabi/debug/firmware"
+                }
             ]
         }
     ]
