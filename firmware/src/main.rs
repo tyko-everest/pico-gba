@@ -15,38 +15,17 @@ fn panic_handler(info: &PanicInfo) -> ! {
     loop {}
 }
 
-#[unsafe(naked)]
 #[unsafe(no_mangle)]
-pub extern "C" fn test() -> ! {
-    naked_asm!("b {}", sym test);
+#[unsafe(naked)]
+extern "C" fn HardFault() {
+    naked_asm!("mov r0, sp", "push {{lr}}", "bl {func}", "pop {{pc}}", func = sym hard_fault);
 }
-#[exception(trampoline = false)]
-unsafe fn HardFault() -> ! {
-    let mut sp_ptr: u32;
-    unsafe { asm!("mov {}, sp", out(reg) sp_ptr) };
-    let frame_ptr = sp_ptr - size_of::<ExceptionFrame>() as u32;
 
-    let frame: &mut ExceptionFrame = unsafe { &mut *(frame_ptr as *mut ExceptionFrame) };
-    let test_ptr = test as extern "C" fn() -> ! as u32;
+#[unsafe(no_mangle)]
+fn hard_fault(frame: &mut ExceptionFrame) {
     unsafe {
-        frame.set_pc(test_ptr);
+        frame.set_pc(frame.pc() + 2);
     }
-
-    loop {}
-
-    unsafe {
-        asm!(
-            "mov sp, r7",
-            "pop {{r0, r7}}",
-            "eors r0, r0, r7",
-            "eors r7, r0, r7",
-            "eors r0, r0, r7",
-            "adds r0, #2",
-            "bx r0"
-        )
-    }
-
-    loop {}
 }
 
 #[entry]
