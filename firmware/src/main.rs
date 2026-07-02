@@ -33,11 +33,20 @@ static mut NEW_VRAM: [u8; VRAM_LEN as usize] = [0; VRAM_LEN as usize];
 static mut NEW_OAM: [u8; OAM_LEN as usize] = [0; OAM_LEN as usize];
 
 // part of the rom loaded in
-const ROM_CODE: &[u8] = include_bytes!("rom_partial_10K.gba");
+const ROM_CODE: &[u8] = include_bytes!("pong.gba");
 
 #[panic_handler]
 fn panic_handler(_info: &PanicInfo) -> ! {
     loop {}
+}
+
+#[repr(C, packed)]
+struct Reg4_7 {
+    r4: u32,
+    r5: u32,
+    r6: u32,
+    r7: u32,
+    lr: u32,
 }
 
 // Override the HardFault provided by the cortex-m-rt crate
@@ -47,8 +56,15 @@ fn panic_handler(_info: &PanicInfo) -> ! {
 extern "C" fn HardFault() {
     // Moving the value of the stack pointer into r0 makes it the arg for the rust function below
     // Also need to save the lr so it does not get clobbered when we call the next function
-    // Finally popping the saved value in lr directly to pc is a return
-    naked_asm!("mov r0, sp", "push {{lr}}", "bl {func}", "pop {{pc}}", func = sym hard_fault);
+    // Finally popping the saved value in lr directdly to pc is a return
+    naked_asm!(
+        "mov r0, sp",
+        "push {{r4, r5, r6, r7, lr}}",
+        "mov r1, sp",
+        "bl {func}",
+        "pop {{r4, r5, r6, r7, pc}}",
+        func = sym hard_fault
+    );
 }
 
 #[allow(static_mut_refs)]
@@ -70,24 +86,40 @@ fn fix_addr(gba_addr: u32) -> Option<u32> {
     }
 }
 
-static mut HF_COUNT: usize = 0;
-
 #[unsafe(no_mangle)]
-extern "C" fn hard_fault(frame: &mut ExceptionFrame) {
-    // get the instruction we were trying to execute
-    let instr = unsafe { *(frame.pc() as *const u16) };
+extern "C" fn hard_fault(frame: &mut ExceptionFrame, other_regs: &mut Reg4_7) {
+    static mut HF_COUNT: usize = 0;
+    let hf_count: usize;
+    unsafe {
+        HF_COUNT += 1;
+        hf_count = HF_COUNT;
+    }
 
     // for debug purposes
     let rom_start = ROM_CODE.as_ptr() as u32;
+    let diff = frame.pc() - rom_start;
 
-    // ensure this is a str* instruction
-    if !(instr >> 11 == 0b01100
-        || instr >> 9 == 0b0101000
-        || instr >> 11 == 0b01110
-        || instr >> 9 == 0b0101010
-        || instr >> 11 == 0b10000
-        || instr >> 9 == 0b0101001)
-    {
+    // get the instruction we were trying to execute
+    let instr = unsafe { *((frame.pc() & !1) as *const u16) };
+
+    // ensure this is a str* or ldr* instruction that could be problematic
+    if !(
+        instr >> 11 == 0b01100     // STR imm5
+        || instr >> 9 == 0b0101000  // STR reg
+        || instr >> 11 == 0b01110   // STRB imm
+        || instr >> 9 == 0b0101010  // STRB reg
+        || instr >> 11 == 0b10000   // STRH imm
+        || instr >> 9 == 0b0101001  // STRH reg
+        || instr >> 11 == 0b01101   // LDR imm5
+        || instr >> 9 == 0b0101100  // LDR reg
+        || instr >> 11 == 0b01111   // LDRB imm
+        || instr >> 9 == 0b0101110  // LDRB reg
+        || instr >> 11 == 0b10001   // LDRH imm
+        || instr >> 9 == 0b0101101  // LDRH reg
+        || instr >> 9 == 0b0101011  // LDRSB reg
+        || instr >> 9 == 0b0101111
+        // LDRSH reg
+    ) {
         // nothing else handled currently
         panic!()
     }
@@ -101,8 +133,11 @@ extern "C" fn hard_fault(frame: &mut ExceptionFrame) {
         1 => base_addr = frame.r1(),
         2 => base_addr = frame.r2(),
         3 => base_addr = frame.r3(),
-        // figure out how to handle r4-r7 cleanly
-        _ => todo!(),
+        4 => base_addr = other_regs.r4,
+        5 => base_addr = other_regs.r5,
+        6 => base_addr = other_regs.r6,
+        7 => base_addr = other_regs.r7,
+        _ => panic!(),
     };
 
     let Some(new_base_addr) = fix_addr(base_addr) else {
@@ -116,24 +151,20 @@ extern "C" fn hard_fault(frame: &mut ExceptionFrame) {
             1 => frame.set_r1(new_base_addr),
             2 => frame.set_r2(new_base_addr),
             3 => frame.set_r3(new_base_addr),
-            // figure out how to handle r4-r7 cleanly
-            _ => todo!(),
+            4 => other_regs.r4 = base_addr,
+            5 => other_regs.r5 = base_addr,
+            6 => other_regs.r6 = base_addr,
+            7 => other_regs.r7 = base_addr,
+            _ => panic!(),
         }
     }
-
-    // unsafe {
-    //     HF_COUNT += 1;
-    //     if HF_COUNT == 1 {
-    //         panic!()
-    //     }
-    // }
 }
 
 #[entry]
 fn main() -> ! {
-    let rom_addr = ROM_CODE.as_ptr() as u32 + 1; // last bit needs to be 1 for thumb mode
-
-    unsafe { asm!("bx {}", in(reg) rom_addr) };
+    let rom_addr = ROM_CODE.as_ptr() as u32;
+    let thumb_start = rom_addr + 0xdc + 1; // last bit needs to be 1 for thumb mode
+    unsafe { asm!("bx {}", in(reg) thumb_start) };
 
     loop {}
 }
