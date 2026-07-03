@@ -1,15 +1,31 @@
 #![no_std]
 #![no_main]
+#![allow(static_mut_refs)]
+use common::{registers::*, video::*};
 use core::{
     arch::{asm, naked_asm},
+    f32::consts,
     panic::PanicInfo,
 };
 use cortex_m_rt::{ExceptionFrame, entry};
-use embedded_graphics::{pixelcolor, prelude::*};
+use embedded_graphics::{
+    pixelcolor::{self, BinaryColor, Rgb565},
+    prelude::*,
+};
 use embedded_hal::digital::OutputPin;
 use embedded_hal_bus::spi::ExclusiveDevice;
-use mipidsi::{Builder, interface::SpiInterface, models, options::ColorInversion};
-use rp2040_hal::{Clock, Spi, Timer, Watchdog, fugit::HertzU32, pac};
+use mipidsi::{
+    Builder, Display,
+    interface::{Interface, InterfacePixelFormat, SpiInterface},
+    models::{self, Model, ST7789},
+    options::ColorInversion,
+};
+use rp2040_hal::{
+    Clock, Spi, Timer, Watchdog,
+    fugit::HertzU32,
+    multicore::{self, Stack, StackAllocation},
+    pac,
+};
 
 #[unsafe(link_section = ".boot_loader")]
 #[used]
@@ -35,10 +51,10 @@ const VRAM_LEN: u32 = KB(96);
 const OAM_START: u32 = 0x0700_0000;
 const OAM_LEN: u32 = KB(1);
 
-static mut NEW_REG: [u8; REG_LEN as usize] = [0; REG_LEN as usize];
-static mut NEW_PALETTE: [u8; PALETTE_LEN as usize] = [0; PALETTE_LEN as usize];
-static mut NEW_VRAM: [u8; VRAM_LEN as usize] = [0; VRAM_LEN as usize];
-static mut NEW_OAM: [u8; OAM_LEN as usize] = [0; OAM_LEN as usize];
+static mut NEW_REG: DisplayRegisters = DisplayRegisters::zeroed();
+static mut NEW_PALETTE: Palette = Palette::zeroed();
+static mut NEW_VRAM: VRAM = VRAM::zeroed();
+static mut NEW_OAM: OAM = OAM::zeroed();
 
 // part of the rom loaded in
 const ROM_CODE: &[u8] = include_bytes!("pong.gba");
@@ -78,16 +94,16 @@ extern "C" fn HardFault() {
 #[allow(static_mut_refs)]
 fn fix_addr(gba_addr: u32) -> Option<u32> {
     if gba_addr >= REG_START && gba_addr < REG_START + REG_LEN {
-        let new_reg_start = unsafe { NEW_REG.as_ptr() as u32 };
+        let new_reg_start = unsafe { &NEW_REG as *const DisplayRegisters as u32 };
         Some(gba_addr + new_reg_start - REG_START)
     } else if gba_addr >= PALETTE_START && gba_addr < PALETTE_START + PALETTE_LEN {
-        let new_palette_start = unsafe { NEW_PALETTE.as_ptr() as u32 };
+        let new_palette_start = unsafe { &NEW_PALETTE as *const Palette as u32 };
         Some(gba_addr + new_palette_start - PALETTE_START)
     } else if gba_addr >= VRAM_START && gba_addr < VRAM_START + VRAM_LEN {
-        let new_vram_start = unsafe { NEW_VRAM.as_ptr() as u32 };
+        let new_vram_start = unsafe { &NEW_VRAM as *const VRAM as u32 };
         Some(gba_addr + new_vram_start - VRAM_START)
     } else if gba_addr >= OAM_START && gba_addr < OAM_START + OAM_LEN {
-        let new_oam_start = unsafe { NEW_OAM.as_ptr() as u32 };
+        let new_oam_start = unsafe { &NEW_OAM as *const OAM as u32 };
         Some(gba_addr + new_oam_start - OAM_START)
     } else {
         None
@@ -168,10 +184,38 @@ extern "C" fn hard_fault(frame: &mut ExceptionFrame, other_regs: &mut Reg4_7) {
     }
 }
 
+fn video_loop<DI, MODEL, RST>(mut display: Display<DI, MODEL, RST>, video: Video) -> !
+where
+    DI: Interface,
+    MODEL: Model<ColorFormat = Rgb565>,
+    RST: OutputPin,
+    MODEL::ColorFormat: InterfacePixelFormat<DI::Word>,
+{
+    loop {
+        let mut x = 0;
+        let mut y = 0;
+        let (r, g, b) = video.get_pixel(x, y).to_rgb565_format();
+
+        // We unwrap here as we want this code to exit if it fails. Real applications may want to handle this in a different way
+        let colour = Rgb565::new(r, g, b);
+        display.set_pixel(x as u16, y as u16, colour);
+
+        x += 1;
+        if x == 240 {
+            y += 1;
+            x = 0;
+        }
+        if y == 160 {
+            y = 0;
+        }
+    }
+}
+
+static mut CORE1_STACK: Stack<4096> = Stack::new();
+
 #[entry]
 fn main() -> ! {
     let mut pac = pac::Peripherals::take().unwrap();
-    let mut core = pac::CorePeripherals::take().unwrap();
     let mut watchdog = Watchdog::new(pac.WATCHDOG);
 
     let clocks = rp2040_hal::clocks::init_clocks_and_plls(
@@ -188,7 +232,7 @@ fn main() -> ! {
 
     let mut timer = Timer::new(pac.TIMER, &mut pac.RESETS, &clocks);
 
-    let sio = rp2040_hal::Sio::new(pac.SIO);
+    let mut sio = rp2040_hal::Sio::new(pac.SIO);
     let pins = rp2040_hal::gpio::Pins::new(
         pac.IO_BANK0,
         pac.PADS_BANK0,
@@ -215,19 +259,35 @@ fn main() -> ! {
 
     let spi_device = ExclusiveDevice::new(spi_bus, spi_cs, timer).unwrap();
 
-    let mut buffer = [0u8; 512];
-    let di = SpiInterface::new(spi_device, dc_pin, &mut buffer);
-    let mut display = Builder::new(models::ST7789, di)
+    static mut buffer: [u8; 512] = [0; 512];
+    let di = unsafe { SpiInterface::new(spi_device, dc_pin, &mut buffer) };
+    let display = Builder::new(models::ST7789, di)
         .reset_pin(reset_pin)
         .display_size(SCREEN_WIDTH as u16, SCREEN_HEIGHT as u16)
         .invert_colors(ColorInversion::Inverted)
         .init(&mut timer)
         .unwrap();
 
-    // display.set_pixel(50, 50, pixelcolor::Rgb565::WHITE);
-    display.clear(pixelcolor::Rgb565::GREEN);
+    let video = unsafe {
+        Video {
+            registers: &mut NEW_REG,
+            palette: &mut NEW_PALETTE,
+            vram: &mut NEW_VRAM,
+            oam: &mut NEW_OAM,
+        }
+    };
 
-    loop {}
+    let mut mc = multicore::Multicore::new(&mut pac.PSM, &mut pac.PPB, &mut sio.fifo);
+    let cores = mc.cores();
+    let core1 = &mut cores[1];
+
+    unsafe {
+        core1
+            .spawn(CORE1_STACK.take().unwrap(), move || {
+                video_loop(display, video);
+            })
+            .unwrap();
+    };
 
     let rom_addr = ROM_CODE.as_ptr() as u32;
     let thumb_start = rom_addr + 0xdc + 1; // last bit needs to be 1 for thumb mode

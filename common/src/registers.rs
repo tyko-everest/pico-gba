@@ -2,7 +2,7 @@ use arbitrary_int::prelude::*;
 use bilge::*;
 
 #[bitsize(16)]
-#[derive(FromBits, Clone, Copy)]
+#[derive(FromBits, Clone, Copy, Default)]
 pub struct DisplayControl {
     pub bg_mode: u3,
     pub cgb_mode: bool,
@@ -18,7 +18,7 @@ pub struct DisplayControl {
 }
 
 #[bitsize(16)]
-#[derive(FromBits, Clone, Copy)]
+#[derive(FromBits, Clone, Copy, Default)]
 pub struct DisplayStatus {
     pub vblank_flag: bool,
     pub hblank_flag: bool,
@@ -31,14 +31,14 @@ pub struct DisplayStatus {
 }
 
 #[bitsize(16)]
-#[derive(FromBits, Clone, Copy)]
+#[derive(FromBits, Clone, Copy, Default)]
 pub struct VertCounter {
     pub curr_scanline: u8,
     pub unused: u8,
 }
 
 #[bitsize(16)]
-#[derive(FromBits, Clone, Copy)]
+#[derive(FromBits, Clone, Copy, Default)]
 pub struct BgControl {
     pub bg_prio: u2,
     pub tileset_base: u2,
@@ -63,14 +63,14 @@ impl BgControl {
 }
 
 #[bitsize(16)]
-#[derive(FromBits, Clone, Copy)]
+#[derive(FromBits, Clone, Copy, Default)]
 pub struct BgOffset {
     pub offset: u9,
     pub unused: u7,
 }
 
 #[repr(C, packed)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 pub struct BgOffsetPair {
     pub x: BgOffset,
     pub y: BgOffset,
@@ -101,5 +101,9 @@ impl DisplayRegisters {
                 y: BgOffset::from(0),
             }; 4],
         }
+    }
+
+    pub const fn zeroed() -> Self {
+        unsafe { core::mem::zeroed() }
     }
 }

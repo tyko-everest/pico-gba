@@ -26,6 +26,14 @@ impl DisplayColour {
             | self.green().as_u32() << (8 + 3)
             | self.blue().as_u32() << 3
     }
+
+    pub fn to_rgb565_format(&self) -> (u8, u8, u8) {
+        (
+            self.red().as_u8(),
+            self.green().as_u8() << 1,
+            self.blue().as_u8(),
+        )
+    }
 }
 
 // Used to pack two 4-bit colour values into a type that can be packed properly
@@ -71,12 +79,16 @@ struct MapTextEntry {
 struct MapRotScaleEntry(u8);
 
 pub struct VRAM {
-    data: *mut u8,
+    _data: [u8; 96 * 1024],
 }
 
 impl VRAM {
-    pub fn init(addr: *mut u8) -> Self {
-        Self { data: addr }
+    pub const fn zeroed() -> Self {
+        unsafe { core::mem::zeroed() }
+    }
+
+    pub fn data(&self) -> *mut u8 {
+        self._data.as_ptr().cast_mut()
     }
 }
 
@@ -87,6 +99,9 @@ pub struct Palette {
 }
 
 impl Palette {
+    pub const fn zeroed() -> Self {
+        unsafe { core::mem::zeroed() }
+    }
     fn get_bg_colour_256(&self, colour: usize) -> DisplayColour {
         self.bg[colour]
     }
@@ -220,6 +235,10 @@ impl ObjAttr {
 pub struct OAM([ObjAttr; 128]);
 
 impl OAM {
+    pub const fn zeroed() -> Self {
+        unsafe { core::mem::zeroed() }
+    }
+
     fn get(&self, index: usize) -> &ObjAttr {
         &self.0[index]
     }
@@ -246,7 +265,7 @@ impl Video<'_> {
         let register = self.registers.bg_control[bg];
         unsafe {
             self.vram
-                .data
+                .data()
                 .add(register.tileset_base().as_usize() * TILESET_OFFSET)
         }
     }
@@ -271,7 +290,7 @@ impl Video<'_> {
         let register = self.registers.bg_control[bg];
         unsafe {
             self.vram
-                .data
+                .data()
                 .add(register.tilemap_base().as_usize() * MAP_OFFSET)
         }
     }
@@ -455,7 +474,7 @@ impl Video<'_> {
         } else {
             // TODO refactor out
             const TILESET_OFFSET: usize = 64 * 1024;
-            let tile_base = unsafe { self.vram.data.add(TILESET_OFFSET) };
+            let tile_base = unsafe { self.vram.data().add(TILESET_OFFSET) };
             let base_ptr = tile_base as *const Tile4;
             let ptr = unsafe { base_ptr.add(tile_index) };
             let tile4 = unsafe { *ptr };

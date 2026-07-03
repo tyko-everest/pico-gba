@@ -2,10 +2,10 @@
     "version": "0.2.0",
     "configurations": [
         {
-            "name": "Pico Debug",
+            "name": "pico core 0",
             "type": "probe-rs-debug",
             "request": "launch",
-            "preLaunchTask": "rust: cargo build",
+            //"preLaunchTask": "rust: cargo build",
             "flashingConfig": {
                 "flashingEnabled": true,
                 "haltAfterReset": false
@@ -13,7 +13,20 @@
             "chip": "rp2040",
             "coreConfigs": [
                 {
-                    "programBinary": "${workspaceFolder}/target/thumbv6m-none-eabi/debug/firmware"
+                    "coreIndex": 0,
+                    "programBinary": "${workspaceFolder}/target/thumbv6m-none-eabi/debug/firmware",
+                }
+            ]
+        },
+        {
+            "name": "pico core 1",
+            "type": "probe-rs-debug",
+            "request": "launch",
+            "chip": "rp2040",
+            "coreConfigs": [
+                {
+                    "coreIndex": 1,
+                    "programBinary": "${workspaceFolder}/target/thumbv6m-none-eabi/debug/firmware",
                 }
             ]
         }
