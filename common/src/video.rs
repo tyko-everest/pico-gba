@@ -1,7 +1,7 @@
 use crate::registers::*;
 use arbitrary_int::prelude::*;
 use bilge::*;
-use core::{mem::uninitialized, usize};
+use core::usize;
 
 // tiles are 8x8 pixels
 const TILE_SIZE_LOG: usize = 3;
@@ -128,13 +128,6 @@ struct ObjAttr0RotScale {
     shape: u2,
 }
 
-#[repr(C, packed)]
-#[derive(Clone, Copy)]
-union ObjAttr0 {
-    normal: ObjAttr0Normal,
-    rot_scale: ObjAttr0RotScale,
-}
-
 #[bitsize(16)]
 #[derive(FromBits, Clone, Copy)]
 struct ObjAttr1Normal {
@@ -153,13 +146,6 @@ struct ObjAttr1RotScale {
     size: u2,
 }
 
-#[repr(C, packed)]
-#[derive(Clone, Copy)]
-union ObjAttr1 {
-    normal: ObjAttr1Normal,
-    rot_scale: ObjAttr1RotScale,
-}
-
 #[bitsize(16)]
 #[derive(Clone, Copy)]
 struct ObjAttr2 {
@@ -170,19 +156,72 @@ struct ObjAttr2 {
 
 #[repr(C, packed)]
 #[derive(Clone, Copy)]
-struct ObjAttr {
-    attr0: ObjAttr0,
-    attr1: ObjAttr1,
+struct ObjAttrNormal {
+    attr0: ObjAttr0Normal,
+    attr1: ObjAttr1Normal,
+    attr2: ObjAttr2,
+    unused: u16,
+}
+
+impl ObjAttrNormal {
+    fn is_disabled(&self) -> bool {
+        let attr0 = self.attr0;
+        attr0.disable()
+    }
+}
+
+#[repr(C, packed)]
+#[derive(Clone, Copy)]
+struct ObjAttrRotScale {
+    attr0: ObjAttr0RotScale,
+    attr1: ObjAttr1RotScale,
     attr2: ObjAttr2,
     rot_scale: u16,
+}
+
+#[repr(C, packed)]
+#[derive(Clone, Copy)]
+union ObjAttr {
+    normal: ObjAttrNormal,
+    rot_scale: ObjAttrRotScale,
+}
+
+impl ObjAttr {
+    fn is_rot_scale(&self) -> bool {
+        unsafe {
+            let attr0 = self.normal.attr0;
+            attr0.rot_scale()
+        }
+    }
+
+    fn get_prio(&self) -> u2 {
+        let attr2 = unsafe { self.normal.attr2 };
+        attr2.prio()
+    }
+
+    fn get_normal(&self) -> Option<&ObjAttrNormal> {
+        if self.is_rot_scale() {
+            None
+        } else {
+            unsafe { Some(&self.normal) }
+        }
+    }
+
+    fn get_rot_scale(&self) -> Option<&ObjAttrRotScale> {
+        if self.is_rot_scale() {
+            unsafe { Some(&self.rot_scale) }
+        } else {
+            None
+        }
+    }
 }
 
 #[repr(C, packed)]
 pub struct OAM([ObjAttr; 128]);
 
 impl OAM {
-    fn get(&self, index: usize) -> ObjAttr {
-        self.0[index]
+    fn get(&self, index: usize) -> &ObjAttr {
+        &self.0[index]
     }
 }
 
@@ -295,9 +334,9 @@ impl Video<'_> {
         screen_x: usize,
         screen_y: usize,
     ) -> Option<DisplayColour> {
-        let oam = self.oam.get(sprite);
-        let attr0 = unsafe { oam.attr0.normal };
-        let attr1 = unsafe { oam.attr1.normal };
+        let oam = self.oam.get(sprite).get_normal().unwrap();
+        let attr0 = oam.attr0;
+        let attr1 = oam.attr1;
         let attr2 = oam.attr2;
 
         let sprite_base_x = attr1.x().as_usize();
@@ -407,7 +446,8 @@ impl Video<'_> {
             // the linear mapping
             tile_index += tile_x + tile_y * (sprite_width >> 3);
         } else {
-            todo!()
+            // the 2D mapping, 32x32 tiles
+            tile_index += tile_x + tile_y * 32;
         };
 
         if attr0.enable_256_colour() {
@@ -438,8 +478,7 @@ impl Video<'_> {
         screen_x: usize,
         screen_y: usize,
     ) -> Option<DisplayColour> {
-        let attr0normal = unsafe { self.oam.get(sprite).attr0.normal };
-        if attr0normal.rot_scale() {
+        if self.oam.get(sprite).is_rot_scale() {
             todo!();
         } else {
             self.get_sprite_pixel_normal(sprite, screen_x, screen_y)
@@ -465,9 +504,9 @@ impl Video<'_> {
             }
         }
         for num in 0..=127 {
-            let attr2 = self.oam.get(num).attr2;
+            let prio = self.oam.get(num).get_prio();
             prio_num_pairs[4 + num] = PrioNum {
-                prio: attr2.prio().as_usize(),
+                prio: prio.as_usize(),
                 is_bg: false,
                 num: num,
             }
@@ -521,8 +560,7 @@ impl Video<'_> {
                 }
             } else {
                 // todo not handling rot scale mode
-                let attr0 = unsafe { self.oam.get(num).attr0.normal };
-                if attr0.disable() {
+                if self.oam.get(num).get_normal().unwrap().is_disabled() {
                     continue;
                 }
                 if let Some(c) = self.get_sprite_pixel(num, x, y) {
