@@ -1,6 +1,6 @@
 use common::{registers::*, video::*};
 use minifb::{Key, Window, WindowOptions};
-use std::{fs::File, io::Read};
+use std::{fmt::format, fs::File, io::Read};
 
 const WIDTH: usize = 240;
 const HEIGHT: usize = 160;
@@ -22,29 +22,38 @@ fn main() {
     });
     window.set_target_fps(60);
 
+    let dump_base = "ram_dumps";
+
     // load in values from dump from real ram
-    let mut registers_file = File::open("simulation/ram_dumps/display_registers.bin").unwrap();
+    let mut registers_file = File::open(format!("simulation/{dump_base}/registers")).unwrap();
     let mut registers_mem = [0; 32];
     registers_file.read_exact(&mut registers_mem).unwrap();
     let registers_ptr = registers_mem.as_mut_ptr() as *mut DisplayRegisters;
     let mut registers = unsafe { &mut *registers_ptr };
 
-    let mut vram_file = File::open("simulation/ram_dumps/vram.bin").unwrap();
-    let mut vram_mem = [0; 64 * 1024];
+    let mut vram_file = File::open(format!("simulation/{dump_base}/vram")).unwrap();
+    let mut vram_mem = [0; 96 * 1024];
     vram_file.read_exact(&mut vram_mem).unwrap();
     let mut vram = VRAM::init(vram_mem.as_mut_ptr());
 
-    let mut palette_file = File::open("simulation/ram_dumps/palette.bin").unwrap();
+    let mut palette_file = File::open(format!("simulation/{dump_base}/palette")).unwrap();
     let mut palette_mem = [0; 1024];
     palette_file.read_exact(&mut palette_mem).unwrap();
     let palette_ptr = palette_mem.as_mut_ptr() as *mut Palette;
     let mut palette = unsafe { &mut *palette_ptr };
+
+    let mut oam_file = File::open(format!("simulation/{dump_base}/oam")).unwrap();
+    let mut oam_mem = [0; 1024];
+    oam_file.read_exact(&mut oam_mem).unwrap();
+    let oam_ptr = oam_mem.as_mut_ptr() as *mut OAM;
+    let mut oam = unsafe { &mut *oam_ptr };
 
     // create the control struct with the setup mock ram contents
     let video = Video {
         registers: &mut registers,
         palette: &mut palette,
         vram: &mut vram,
+        oam: &mut oam,
     };
 
     while window.is_open() && !window.is_key_down(Key::Escape) {

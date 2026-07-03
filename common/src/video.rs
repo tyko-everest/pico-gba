@@ -1,7 +1,7 @@
 use crate::registers::*;
 use arbitrary_int::prelude::*;
 use bilge::*;
-use core::usize;
+use core::{mem::uninitialized, usize};
 
 // tiles are 8x8 pixels
 const TILE_SIZE_LOG: usize = 3;
@@ -94,6 +94,14 @@ impl Palette {
     fn get_bg_colour_16(&self, palette: usize, colour: usize) -> DisplayColour {
         self.bg[palette * 16 + colour]
     }
+
+    fn get_obj_colour_256(&self, colour: usize) -> DisplayColour {
+        self.obj[colour]
+    }
+
+    fn get_obj_colour_16(&self, palette: usize, colour: usize) -> DisplayColour {
+        self.obj[palette * 16 + colour]
+    }
 }
 
 #[bitsize(16)]
@@ -181,6 +189,7 @@ impl OAM {
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
 struct PrioNum {
     prio: usize,
+    is_bg: bool,
     num: usize,
 }
 
@@ -188,6 +197,7 @@ pub struct Video<'a> {
     pub registers: &'a mut DisplayRegisters,
     pub palette: &'a mut Palette,
     pub vram: &'a mut VRAM,
+    pub oam: &'a mut OAM,
 }
 
 impl Video<'_> {
@@ -279,16 +289,186 @@ impl Video<'_> {
         }
     }
 
+    fn get_sprite_pixel_normal(
+        &self,
+        sprite: usize,
+        screen_x: usize,
+        screen_y: usize,
+    ) -> Option<DisplayColour> {
+        let oam = self.oam.get(sprite);
+        let attr0 = unsafe { oam.attr0.normal };
+        let attr1 = unsafe { oam.attr1.normal };
+        let attr2 = oam.attr2;
+
+        let sprite_base_x = attr1.x().as_usize();
+        let sprite_base_y = attr0.y() as usize;
+
+        let sprite_width: usize;
+        let sprite_height: usize;
+        match attr0.shape().value() {
+            0 => match attr1.size().value() {
+                0 => {
+                    sprite_width = 8;
+                    sprite_height = 8;
+                }
+                1 => {
+                    sprite_width = 16;
+                    sprite_height = 16;
+                }
+                2 => {
+                    sprite_width = 32;
+                    sprite_height = 32;
+                }
+                3 => {
+                    sprite_width = 64;
+                    sprite_height = 64;
+                }
+                _ => {
+                    unreachable!()
+                }
+            },
+            1 => match attr1.size().value() {
+                0 => {
+                    sprite_width = 16;
+                    sprite_height = 8;
+                }
+                1 => {
+                    sprite_width = 32;
+                    sprite_height = 8;
+                }
+                2 => {
+                    sprite_width = 32;
+                    sprite_height = 16;
+                }
+                3 => {
+                    sprite_width = 64;
+                    sprite_height = 32;
+                }
+                _ => {
+                    unreachable!()
+                }
+            },
+            2 => match attr1.size().value() {
+                0 => {
+                    sprite_width = 8;
+                    sprite_height = 16;
+                }
+                1 => {
+                    sprite_width = 8;
+                    sprite_height = 32;
+                }
+                2 => {
+                    sprite_width = 16;
+                    sprite_height = 32;
+                }
+                3 => {
+                    sprite_width = 32;
+                    sprite_height = 64;
+                }
+                _ => {
+                    unreachable!()
+                }
+            },
+            _ => panic!(),
+        };
+
+        if screen_x < sprite_base_x
+            || screen_y < sprite_base_y
+            || screen_x >= sprite_base_x + sprite_width
+            || screen_y >= sprite_base_y + sprite_height
+        {
+            // no part of this sprite could overlap with this pixel
+            return None;
+        }
+
+        let sprite_x = {
+            let offset = if attr1.horiz_flip() {
+                sprite_width - sprite_base_x
+            } else {
+                sprite_base_x
+            };
+            screen_x - offset
+        };
+        let sprite_y = {
+            let offset = if attr1.vert_flip() {
+                sprite_height - sprite_base_y
+            } else {
+                sprite_base_y
+            };
+            screen_y - offset
+        };
+
+        let tile_x = sprite_x >> 3;
+        let tile_y = sprite_y >> 3;
+
+        let mut tile_index = attr2.tile().as_usize();
+        let disp_ctrl = self.registers.disp_ctrl;
+        if disp_ctrl.obj_char_mapping() {
+            // the linear mapping
+            tile_index += tile_x + tile_y * (sprite_width >> 3);
+        } else {
+            todo!()
+        };
+
+        if attr0.enable_256_colour() {
+            todo!()
+        } else {
+            // TODO refactor out
+            const TILESET_OFFSET: usize = 64 * 1024;
+            let tile_base = unsafe { self.vram.data.add(TILESET_OFFSET) };
+            let base_ptr = tile_base as *const Tile4;
+            let ptr = unsafe { base_ptr.add(tile_index) };
+            let tile4 = unsafe { *ptr };
+
+            let colour_index = tile4.get_colour(sprite_x & 0x7, sprite_y & 0x7).as_usize();
+            if colour_index > 0 {
+                Some(
+                    self.palette
+                        .get_obj_colour_16(attr2.palette().as_usize(), colour_index),
+                )
+            } else {
+                None
+            }
+        }
+    }
+
+    fn get_sprite_pixel(
+        &self,
+        sprite: usize,
+        screen_x: usize,
+        screen_y: usize,
+    ) -> Option<DisplayColour> {
+        let attr0normal = unsafe { self.oam.get(sprite).attr0.normal };
+        if attr0normal.rot_scale() {
+            todo!();
+        } else {
+            self.get_sprite_pixel_normal(sprite, screen_x, screen_y)
+        }
+    }
+
     pub fn get_pixel(&self, x: usize, y: usize) -> DisplayColour {
         let display_control = self.registers.disp_ctrl;
         let bg_regs = self.registers.bg_control;
         let bg_offsets = self.registers.bg_offset;
 
         // figure out the display order, prio first, then if tie go to number
-        let mut prio_num_pairs = [PrioNum { prio: 0, num: 0 }; 4];
+        let mut prio_num_pairs = [PrioNum {
+            prio: 0,
+            is_bg: false,
+            num: 0,
+        }; 4 + 128];
         for num in 0..=3 {
             prio_num_pairs[num] = PrioNum {
                 prio: bg_regs[num].bg_prio().as_usize(),
+                is_bg: true,
+                num: num,
+            }
+        }
+        for num in 0..=127 {
+            let attr2 = self.oam.get(num).attr2;
+            prio_num_pairs[4 + num] = PrioNum {
+                prio: attr2.prio().as_usize(),
+                is_bg: false,
                 num: num,
             }
         }
@@ -296,46 +476,59 @@ impl Video<'_> {
 
         // go through in prio order and if enabled continue until we find a non-transparent pixel
         let mut colour: Option<DisplayColour> = None;
-        for num in prio_num_pairs.iter().map(|pn| pn.num) {
-            // get the x offset register
-            let mut offset_x = {
-                let reg = bg_offsets[num].x;
-                reg.offset().as_usize()
-            };
-            // get the current map's width
-            let width = bg_regs[num].width_in_tiles() << TILE_SIZE_LOG;
-            // wrap the offset to within range if needed
-            if offset_x >= width {
-                offset_x -= width;
-            }
-            // get the x coordinate in that background map
-            let mut bg_x = x + offset_x;
-            if bg_x >= width {
-                bg_x -= width;
-            }
+        for prio_num in prio_num_pairs {
+            let num = prio_num.num;
+            if prio_num.is_bg {
+                // get the x offset register
+                let mut offset_x = {
+                    let reg = bg_offsets[num].x;
+                    reg.offset().as_usize()
+                };
+                // get the current map's width
+                let width = bg_regs[num].width_in_tiles() << TILE_SIZE_LOG;
+                // wrap the offset to within range if needed
+                if offset_x >= width {
+                    offset_x -= width;
+                }
+                // get the x coordinate in that background map
+                let mut bg_x = x + offset_x;
+                if bg_x >= width {
+                    bg_x -= width;
+                }
 
-            // get the y offset register
-            let mut offset_y = {
-                let reg = bg_offsets[num].y;
-                reg.offset().as_usize()
-            };
-            // get the current map's height
-            let height = bg_regs[num].height_in_tiles() << TILE_SIZE_LOG;
-            // wrap the offset to within range if needed
-            if offset_y >= height {
-                offset_y -= height;
-            }
-            // get the y coordinate in that background map
-            let mut bg_y = y + offset_y;
-            if bg_y >= height {
-                bg_y -= height;
-            }
+                // get the y offset register
+                let mut offset_y = {
+                    let reg = bg_offsets[num].y;
+                    reg.offset().as_usize()
+                };
+                // get the current map's height
+                let height = bg_regs[num].height_in_tiles() << TILE_SIZE_LOG;
+                // wrap the offset to within range if needed
+                if offset_y >= height {
+                    offset_y -= height;
+                }
+                // get the y coordinate in that background map
+                let mut bg_y = y + offset_y;
+                if bg_y >= height {
+                    bg_y -= height;
+                }
 
-            if let Some(bg_colour) = self.get_bg_pixel(num, bg_x, bg_y)
-                && display_control.screen_disp_bg_at(num)
-            {
-                colour = Some(bg_colour);
-                break;
+                if let Some(bg_colour) = self.get_bg_pixel(num, bg_x, bg_y)
+                    && display_control.screen_disp_bg_at(num)
+                {
+                    colour = Some(bg_colour);
+                    break;
+                }
+            } else {
+                // todo not handling rot scale mode
+                let attr0 = unsafe { self.oam.get(num).attr0.normal };
+                if attr0.disable() {
+                    continue;
+                }
+                if let Some(c) = self.get_sprite_pixel(num, x, y) {
+                    colour = Some(c);
+                    break;
+                }
             }
         }
 

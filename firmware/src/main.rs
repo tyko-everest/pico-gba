@@ -104,7 +104,7 @@ extern "C" fn hard_fault(frame: &mut ExceptionFrame, other_regs: &mut Reg4_7) {
 
     // ensure this is a str* or ldr* instruction that could be problematic
     if !(
-        instr >> 11 == 0b01100     // STR imm5
+        instr >> 11 == 0b01100      // STR imm5
         || instr >> 9 == 0b0101000  // STR reg
         || instr >> 11 == 0b01110   // STRB imm
         || instr >> 9 == 0b0101010  // STRB reg
@@ -137,7 +137,7 @@ extern "C" fn hard_fault(frame: &mut ExceptionFrame, other_regs: &mut Reg4_7) {
         5 => base_addr = other_regs.r5,
         6 => base_addr = other_regs.r6,
         7 => base_addr = other_regs.r7,
-        _ => panic!(),
+        _ => unreachable!(),
     };
 
     let Some(new_base_addr) = fix_addr(base_addr) else {
@@ -155,7 +155,7 @@ extern "C" fn hard_fault(frame: &mut ExceptionFrame, other_regs: &mut Reg4_7) {
             5 => other_regs.r5 = base_addr,
             6 => other_regs.r6 = base_addr,
             7 => other_regs.r7 = base_addr,
-            _ => panic!(),
+            _ => unreachable!(),
         }
     }
 }
