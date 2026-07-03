@@ -5,10 +5,18 @@ use core::{
     panic::PanicInfo,
 };
 use cortex_m_rt::{ExceptionFrame, entry};
+use embedded_graphics::{pixelcolor, prelude::*};
+use embedded_hal::digital::OutputPin;
+use embedded_hal_bus::spi::ExclusiveDevice;
+use mipidsi::{Builder, interface::SpiInterface, models, options::ColorInversion};
+use rp2040_hal::{Clock, Spi, Timer, Watchdog, fugit::HertzU32, pac};
 
 #[unsafe(link_section = ".boot_loader")]
 #[used]
 pub static BOOT_LOADER: [u8; 256] = rp2040_boot2::BOOT_LOADER_W25Q080;
+
+const SCREEN_WIDTH: usize = 240;
+const SCREEN_HEIGHT: usize = 160;
 
 const fn KB(num: u32) -> u32 {
     num << 10
@@ -162,6 +170,65 @@ extern "C" fn hard_fault(frame: &mut ExceptionFrame, other_regs: &mut Reg4_7) {
 
 #[entry]
 fn main() -> ! {
+    let mut pac = pac::Peripherals::take().unwrap();
+    let mut core = pac::CorePeripherals::take().unwrap();
+    let mut watchdog = Watchdog::new(pac.WATCHDOG);
+
+    let clocks = rp2040_hal::clocks::init_clocks_and_plls(
+        12_000_000,
+        pac.XOSC,
+        pac.CLOCKS,
+        pac.PLL_SYS,
+        pac.PLL_USB,
+        &mut pac.RESETS,
+        &mut watchdog,
+    )
+    .ok()
+    .unwrap();
+
+    let mut timer = Timer::new(pac.TIMER, &mut pac.RESETS, &clocks);
+
+    let sio = rp2040_hal::Sio::new(pac.SIO);
+    let pins = rp2040_hal::gpio::Pins::new(
+        pac.IO_BANK0,
+        pac.PADS_BANK0,
+        sio.gpio_bank0,
+        &mut pac.RESETS,
+    );
+
+    let spi_sclk = pins.gpio10.into_function::<rp2040_hal::gpio::FunctionSpi>();
+    let spi_mosi = pins.gpio11.into_function::<rp2040_hal::gpio::FunctionSpi>();
+    let spi_miso = pins.gpio12.into_function::<rp2040_hal::gpio::FunctionSpi>();
+    let spi_cs = pins.gpio9.into_push_pull_output();
+    let dc_pin = pins.gpio8.into_push_pull_output();
+    let reset_pin = pins.gpio15.into_push_pull_output();
+    let mut bk_light_pin = pins.gpio13.into_push_pull_output();
+
+    bk_light_pin.set_high();
+
+    let spi_bus = Spi::<_, _, _, 8>::new(pac.SPI1, (spi_mosi, spi_miso, spi_sclk)).init(
+        &mut pac.RESETS,
+        clocks.peripheral_clock.freq(),
+        HertzU32::Hz(60_000_000),  // Set SPI bus speed (e.g., 1 MHz)
+        embedded_hal::spi::MODE_0, // SPI Mode (0, 1, 2, or 3)
+    );
+
+    let spi_device = ExclusiveDevice::new(spi_bus, spi_cs, timer).unwrap();
+
+    let mut buffer = [0u8; 512];
+    let di = SpiInterface::new(spi_device, dc_pin, &mut buffer);
+    let mut display = Builder::new(models::ST7789, di)
+        .reset_pin(reset_pin)
+        .display_size(SCREEN_WIDTH as u16, SCREEN_HEIGHT as u16)
+        .invert_colors(ColorInversion::Inverted)
+        .init(&mut timer)
+        .unwrap();
+
+    // display.set_pixel(50, 50, pixelcolor::Rgb565::WHITE);
+    display.clear(pixelcolor::Rgb565::GREEN);
+
+    loop {}
+
     let rom_addr = ROM_CODE.as_ptr() as u32;
     let thumb_start = rom_addr + 0xdc + 1; // last bit needs to be 1 for thumb mode
     unsafe { asm!("bx {}", in(reg) thumb_start) };

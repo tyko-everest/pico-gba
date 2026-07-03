@@ -5,6 +5,11 @@ edition = "2024"
 
 [dependencies]
 common = { path = "../common" }
+cortex-m = "0.7.5"
 cortex-m-rt = "0.7.5"
+embedded-graphics = "0.8.2"
+embedded-hal = "1.0.0"
+embedded-hal-bus = "0.3.0"
+mipidsi = "0.10.0"
 rp2040-boot2 = "0.3"
-# rp2040-hal = { version = "0.11", features = ["rt", "critical-section-impl"] }
+rp2040-hal = { version = "0.12.0", features = ["critical-section-impl"] }
