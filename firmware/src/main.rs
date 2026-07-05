@@ -5,6 +5,7 @@ use common::{registers::*, video::*};
 use core::{
     arch::{asm, naked_asm},
     f32::consts,
+    mem::transmute,
     panic::PanicInfo,
 };
 use cortex_m_rt::{ExceptionFrame, entry};
@@ -38,6 +39,10 @@ const fn KB(num: u32) -> u32 {
     num << 10
 }
 
+const fn MB(num: u32) -> u32 {
+    num << 20
+}
+
 // the GBA memory map
 const REG_START: u32 = 0x0400_0000;
 const REG_LEN: u32 = KB(1);
@@ -50,6 +55,9 @@ const VRAM_LEN: u32 = KB(96);
 
 const OAM_START: u32 = 0x0700_0000;
 const OAM_LEN: u32 = KB(1);
+
+const ROM_START: u32 = 0x0800_0000;
+const ROM_LEN: u32 = MB(20);
 
 static mut NEW_REG: DisplayRegisters = DisplayRegisters::zeroed();
 static mut NEW_PALETTE: Palette = Palette::zeroed();
@@ -105,6 +113,9 @@ fn fix_addr(gba_addr: u32) -> Option<u32> {
     } else if gba_addr >= OAM_START && gba_addr < OAM_START + OAM_LEN {
         let new_oam_start = unsafe { &NEW_OAM as *const OAM as u32 };
         Some(gba_addr + new_oam_start - OAM_START)
+    } else if gba_addr >= ROM_START && gba_addr < ROM_START + ROM_LEN {
+        let new_rom_start = ROM_CODE.as_ptr() as u32;
+        Some(gba_addr + new_rom_start - ROM_START)
     } else {
         None
     }
@@ -117,6 +128,15 @@ extern "C" fn hard_fault(frame: &mut ExceptionFrame, other_regs: &mut Reg4_7) {
     unsafe {
         HF_COUNT += 1;
         hf_count = HF_COUNT;
+    }
+
+    if let Some(pc) = fix_addr(frame.pc()) {
+        // if we get an invalid PC assume from BX or BLX
+        // bx and blx can use all 16 regisers, r8-r15 are not handled yet
+        unsafe {
+            frame.set_pc(pc);
+        }
+        return;
     }
 
     // for debug purposes
@@ -175,10 +195,10 @@ extern "C" fn hard_fault(frame: &mut ExceptionFrame, other_regs: &mut Reg4_7) {
             1 => frame.set_r1(new_base_addr),
             2 => frame.set_r2(new_base_addr),
             3 => frame.set_r3(new_base_addr),
-            4 => other_regs.r4 = base_addr,
-            5 => other_regs.r5 = base_addr,
-            6 => other_regs.r6 = base_addr,
-            7 => other_regs.r7 = base_addr,
+            4 => other_regs.r4 = new_base_addr,
+            5 => other_regs.r5 = new_base_addr,
+            6 => other_regs.r6 = new_base_addr,
+            7 => other_regs.r7 = new_base_addr,
             _ => unreachable!(),
         }
     }
@@ -191,9 +211,9 @@ where
     RST: OutputPin,
     MODEL::ColorFormat: InterfacePixelFormat<DI::Word>,
 {
+    let mut x = 0;
+    let mut y = 0;
     loop {
-        let mut x = 0;
-        let mut y = 0;
         let (r, g, b) = video.get_pixel(x, y).to_rgb565_format();
 
         // We unwrap here as we want this code to exit if it fails. Real applications may want to handle this in a different way
@@ -261,12 +281,21 @@ fn main() -> ! {
 
     static mut buffer: [u8; 512] = [0; 512];
     let di = unsafe { SpiInterface::new(spi_device, dc_pin, &mut buffer) };
-    let display = Builder::new(models::ST7789, di)
+    let mut display = Builder::new(models::ST7789, di)
         .reset_pin(reset_pin)
         .display_size(SCREEN_WIDTH as u16, SCREEN_HEIGHT as u16)
         .invert_colors(ColorInversion::Inverted)
         .init(&mut timer)
         .unwrap();
+
+    // force the vblank to set for now
+    unsafe {
+        let mut disp_status = NEW_REG.disp_status;
+        disp_status.set_vblank_flag(true);
+        NEW_REG.disp_status = disp_status;
+    }
+
+    let disp_status = unsafe { NEW_REG.disp_status };
 
     let video = unsafe {
         Video {
@@ -276,6 +305,8 @@ fn main() -> ! {
             oam: &mut NEW_OAM,
         }
     };
+
+    display.clear(RgbColor::BLACK);
 
     let mut mc = multicore::Multicore::new(&mut pac.PSM, &mut pac.PPB, &mut sio.fifo);
     let cores = mc.cores();
@@ -290,7 +321,7 @@ fn main() -> ! {
     };
 
     let rom_addr = ROM_CODE.as_ptr() as u32;
-    let thumb_start = rom_addr + 0xdc + 1; // last bit needs to be 1 for thumb mode
+    let thumb_start = rom_addr + 0xdc | 1; // last bit needs to be 1 for thumb mode
     unsafe { asm!("bx {}", in(reg) thumb_start) };
 
     loop {}

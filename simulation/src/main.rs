@@ -34,7 +34,8 @@ fn main() {
     let mut vram_file = File::open(format!("simulation/{dump_base}/vram")).unwrap();
     let mut vram_mem = [0; 96 * 1024];
     vram_file.read_exact(&mut vram_mem).unwrap();
-    let mut vram = VRAM::init(vram_mem.as_mut_ptr());
+    let vram_ptr = vram_mem.as_mut_ptr() as *mut VRAM;
+    let mut vram = unsafe { &mut *vram_ptr };
 
     let mut palette_file = File::open(format!("simulation/{dump_base}/palette")).unwrap();
     let mut palette_mem = [0; 1024];
