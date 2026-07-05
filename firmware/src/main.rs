@@ -214,6 +214,8 @@ where
     let mut x = 0;
     let mut y = 0;
     loop {
+        let mut stat = video.registers.disp_status;
+
         let (r, g, b) = video.get_pixel(x, y).to_rgb565_format();
 
         // We unwrap here as we want this code to exit if it fails. Real applications may want to handle this in a different way
@@ -227,6 +229,10 @@ where
         }
         if y == 160 {
             y = 0;
+            stat.set_vblank_flag(false);
+            video.registers.disp_status = stat;
+            stat.set_vblank_flag(true);
+            video.registers.disp_status = stat;
         }
     }
 }

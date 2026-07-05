@@ -514,7 +514,7 @@ impl Video<'_> {
             prio: 0,
             is_bg: false,
             num: 0,
-        }; 4];
+        }; 4 + 2];
         for num in 0..=3 {
             prio_num_pairs[num] = PrioNum {
                 prio: bg_regs[num].bg_prio().as_usize(),
@@ -522,14 +522,14 @@ impl Video<'_> {
                 num: num,
             }
         }
-        // for num in 0..=127 {
-        //     let prio = self.oam.get(num).get_prio();
-        //     prio_num_pairs[4 + num] = PrioNum {
-        //         prio: prio.as_usize(),
-        //         is_bg: false,
-        //         num: num,
-        //     }
-        // }
+        for num in 0..2 {
+            let prio = self.oam.get(num).get_prio();
+            prio_num_pairs[4 + num] = PrioNum {
+                prio: prio.as_usize(),
+                is_bg: false,
+                num: num,
+            }
+        }
         prio_num_pairs.sort_unstable();
 
         // go through in prio order and if enabled continue until we find a non-transparent pixel
