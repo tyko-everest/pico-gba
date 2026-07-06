@@ -27,12 +27,8 @@ impl DisplayColour {
             | self.blue().as_u32() << 3
     }
 
-    pub fn to_rgb565_format(&self) -> (u8, u8, u8) {
-        (
-            self.red().as_u8(),
-            self.green().as_u8() << 1,
-            self.blue().as_u8(),
-        )
+    pub fn to_rgb565_format(&self) -> u16 {
+        self.red().as_u16() << 11 | self.green().as_u16() << 6 | self.blue().as_u16()
     }
 }
 
@@ -245,10 +241,16 @@ impl OAM {
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
-struct PrioNum {
-    prio: usize,
+struct Priority {
+    prio: u8,
     is_bg: bool,
-    num: usize,
+    num: u8,
+}
+
+impl Priority {
+    fn new(prio: u8, is_bg: bool, num: u8) -> Self {
+        Self { prio, is_bg, num }
+    }
 }
 
 pub struct Video<'a> {
@@ -361,74 +363,27 @@ impl Video<'_> {
         let sprite_base_x = attr1.x().as_usize();
         let sprite_base_y = attr0.y() as usize;
 
-        let sprite_width: usize;
-        let sprite_height: usize;
-        match attr0.shape().value() {
-            0 => match attr1.size().value() {
-                0 => {
-                    sprite_width = 8;
-                    sprite_height = 8;
-                }
-                1 => {
-                    sprite_width = 16;
-                    sprite_height = 16;
-                }
-                2 => {
-                    sprite_width = 32;
-                    sprite_height = 32;
-                }
-                3 => {
-                    sprite_width = 64;
-                    sprite_height = 64;
-                }
-                _ => {
-                    unreachable!()
-                }
-            },
-            1 => match attr1.size().value() {
-                0 => {
-                    sprite_width = 16;
-                    sprite_height = 8;
-                }
-                1 => {
-                    sprite_width = 32;
-                    sprite_height = 8;
-                }
-                2 => {
-                    sprite_width = 32;
-                    sprite_height = 16;
-                }
-                3 => {
-                    sprite_width = 64;
-                    sprite_height = 32;
-                }
-                _ => {
-                    unreachable!()
-                }
-            },
-            2 => match attr1.size().value() {
-                0 => {
-                    sprite_width = 8;
-                    sprite_height = 16;
-                }
-                1 => {
-                    sprite_width = 8;
-                    sprite_height = 32;
-                }
-                2 => {
-                    sprite_width = 16;
-                    sprite_height = 32;
-                }
-                3 => {
-                    sprite_width = 32;
-                    sprite_height = 64;
-                }
-                _ => {
-                    unreachable!()
-                }
-            },
-            _ => panic!(),
-        };
+        // set up the base size to start
+        let mut sprite_width: usize = 8 << attr1.size().as_usize();
+        let mut sprite_height: usize = 8 << attr1.size().as_usize();
+
+        if attr0.shape().as_usize() == 1 {
+            // this is a horizontal sprite
+            if attr1.size().as_usize() < 2 {
+                sprite_width <<= 1;
+                sprite_height = 8;
+            } else {
+                sprite_height >>= 1;
+            }
+        } else if attr0.shape().as_usize() == 2 {
+            // this is a vertical sprite
+            if attr1.size().as_usize() < 2 {
+                sprite_height <<= 1;
+                sprite_width = 8;
+            } else {
+                sprite_width >>= 1;
+            }
+        }
 
         if screen_x < sprite_base_x
             || screen_y < sprite_base_y
@@ -504,87 +459,83 @@ impl Video<'_> {
         }
     }
 
+    fn get_sprite_prio(&self, sprite: u8) -> Priority {
+        let prio = self.oam.get(sprite as usize).get_prio().as_u8();
+        Priority::new(prio, false, sprite)
+    }
+
+    fn get_bg_prio(&self, bg: u8) -> Priority {
+        let bg_ctrl = self.registers.bg_control[bg as usize];
+        let prio = bg_ctrl.bg_prio().as_u8();
+        Priority::new(prio, true, bg)
+    }
+
     pub fn get_pixel(&self, x: usize, y: usize) -> DisplayColour {
         let display_control = self.registers.disp_ctrl;
         let bg_regs = self.registers.bg_control;
         let bg_offsets = self.registers.bg_offset;
 
-        // figure out the display order, prio first, then if tie go to number
-        let mut prio_num_pairs = [PrioNum {
-            prio: 0,
-            is_bg: false,
-            num: 0,
-        }; 4 + 2];
-        for num in 0..=3 {
-            prio_num_pairs[num] = PrioNum {
-                prio: bg_regs[num].bg_prio().as_usize(),
-                is_bg: true,
-                num: num,
-            }
-        }
-        for num in 0..2 {
-            let prio = self.oam.get(num).get_prio();
-            prio_num_pairs[4 + num] = PrioNum {
-                prio: prio.as_usize(),
-                is_bg: false,
-                num: num,
-            }
-        }
-        prio_num_pairs.sort_unstable();
-
-        // go through in prio order and if enabled continue until we find a non-transparent pixel
+        let mut curr_prio = Priority::new(4, true, 128);
         let mut colour: Option<DisplayColour> = None;
-        for prio_num in prio_num_pairs {
-            let num = prio_num.num;
-            if prio_num.is_bg {
-                // get the x offset register
-                let mut offset_x = {
-                    let reg = bg_offsets[num].x;
-                    reg.offset().as_usize()
-                };
-                // get the current map's width
-                let width = bg_regs[num].width_in_tiles() << TILE_SIZE_LOG;
-                // wrap the offset to within range if needed
-                if offset_x >= width {
-                    offset_x -= width;
-                }
-                // get the x coordinate in that background map
-                let mut bg_x = x + offset_x;
-                if bg_x >= width {
-                    bg_x -= width;
-                }
 
-                // get the y offset register
-                let mut offset_y = {
-                    let reg = bg_offsets[num].y;
-                    reg.offset().as_usize()
-                };
-                // get the current map's height
-                let height = bg_regs[num].height_in_tiles() << TILE_SIZE_LOG;
-                // wrap the offset to within range if needed
-                if offset_y >= height {
-                    offset_y -= height;
+        for sprite in 0..128 {
+            // todo not handling rot scale mode
+            if self.oam.get(sprite).get_normal().unwrap().is_disabled() {
+                continue;
+            }
+            if let Some(c) = self.get_sprite_pixel(sprite, x, y) {
+                let new_prio = self.get_sprite_prio(sprite as u8);
+                if new_prio < curr_prio {
+                    curr_prio = new_prio;
+                    colour = Some(c)
                 }
-                // get the y coordinate in that background map
-                let mut bg_y = y + offset_y;
-                if bg_y >= height {
-                    bg_y -= height;
-                }
+            }
+        }
 
-                if let Some(bg_colour) = self.get_bg_pixel(num, bg_x, bg_y)
-                    && display_control.screen_disp_bg_at(num)
-                {
-                    colour = Some(bg_colour);
-                    break;
-                }
-            } else {
-                // todo not handling rot scale mode
-                if self.oam.get(num).get_normal().unwrap().is_disabled() {
-                    continue;
-                }
-                if let Some(c) = self.get_sprite_pixel(num, x, y) {
-                    colour = Some(c);
-                    break;
+        for bg in 0..4 {
+            if !display_control.screen_disp_bg_at(bg) {
+                continue;
+            }
+
+            // get the x offset register
+            let mut offset_x = {
+                let reg = bg_offsets[bg].x;
+                reg.offset().as_usize()
+            };
+            // get the current map's width
+            let width = bg_regs[bg].width_in_tiles() << TILE_SIZE_LOG;
+            // wrap the offset to within range if needed
+            if offset_x >= width {
+                offset_x -= width;
+            }
+            // get the x coordinate in that background map
+            let mut bg_x = x + offset_x;
+            if bg_x >= width {
+                bg_x -= width;
+            }
+
+            // get the y offset register
+            let mut offset_y = {
+                let reg = bg_offsets[bg].y;
+                reg.offset().as_usize()
+            };
+            // get the current map's height
+            let height = bg_regs[bg].height_in_tiles() << TILE_SIZE_LOG;
+            // wrap the offset to within range if needed
+            if offset_y >= height {
+                offset_y -= height;
+            }
+            // get the y coordinate in that background map
+            let mut bg_y = y + offset_y;
+            if bg_y >= height {
+                bg_y -= height;
+            }
+
+            if let Some(bg_colour) = self.get_bg_pixel(bg, bg_x, bg_y) {
+                let new_prio = self.get_bg_prio(bg as u8);
+                if new_prio < curr_prio {
+                    curr_prio = new_prio;
+                    colour = Some(bg_colour)
                 }
             }
         }

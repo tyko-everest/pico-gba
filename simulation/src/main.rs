@@ -1,6 +1,6 @@
 use common::{registers::*, video::*};
 use minifb::{Key, Window, WindowOptions};
-use std::{fmt::format, fs::File, io::Read};
+use std::{env::home_dir, fs::File, io::Read};
 
 const WIDTH: usize = 240;
 const HEIGHT: usize = 160;
@@ -22,28 +22,30 @@ fn main() {
     });
     window.set_target_fps(60);
 
-    let dump_base = "ram_dumps";
+    let home_path = home_dir().unwrap();
+    let home = home_path.to_str().unwrap();
+    let dump_base = format!("{home}/Dev/pico-gba/simulation/pong_dumps");
 
     // load in values from dump from real ram
-    let mut registers_file = File::open(format!("simulation/{dump_base}/registers")).unwrap();
+    let mut registers_file = File::open(format!("{dump_base}/registers")).unwrap();
     let mut registers_mem = [0; 32];
     registers_file.read_exact(&mut registers_mem).unwrap();
     let registers_ptr = registers_mem.as_mut_ptr() as *mut DisplayRegisters;
     let mut registers = unsafe { &mut *registers_ptr };
 
-    let mut vram_file = File::open(format!("simulation/{dump_base}/vram")).unwrap();
+    let mut vram_file = File::open(format!("{dump_base}/vram")).unwrap();
     let mut vram_mem = [0; 96 * 1024];
     vram_file.read_exact(&mut vram_mem).unwrap();
     let vram_ptr = vram_mem.as_mut_ptr() as *mut VRAM;
     let mut vram = unsafe { &mut *vram_ptr };
 
-    let mut palette_file = File::open(format!("simulation/{dump_base}/palette")).unwrap();
+    let mut palette_file = File::open(format!("{dump_base}/palette")).unwrap();
     let mut palette_mem = [0; 1024];
     palette_file.read_exact(&mut palette_mem).unwrap();
     let palette_ptr = palette_mem.as_mut_ptr() as *mut Palette;
     let mut palette = unsafe { &mut *palette_ptr };
 
-    let mut oam_file = File::open(format!("simulation/{dump_base}/oam")).unwrap();
+    let mut oam_file = File::open(format!("{dump_base}/oam")).unwrap();
     let mut oam_mem = [0; 1024];
     oam_file.read_exact(&mut oam_mem).unwrap();
     let oam_ptr = oam_mem.as_mut_ptr() as *mut OAM;

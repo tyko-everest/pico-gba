@@ -2,3 +2,8 @@
 resolver = "3"
 members = ["common", "firmware", "simulation"]
 default-members = ["simulation"]
+
+[profile.release]
+debug = true
+split-debuginfo = "off"
+strip = "none"

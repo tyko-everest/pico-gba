@@ -14,7 +14,7 @@
             "coreConfigs": [
                 {
                     "coreIndex": 0,
-                    "programBinary": "${workspaceFolder}/target/thumbv6m-none-eabi/debug/firmware",
+                    "programBinary": "${workspaceFolder}/target/thumbv6m-none-eabi/release/firmware",
                 }
             ]
         },
@@ -26,7 +26,8 @@
             "coreConfigs": [
                 {
                     "coreIndex": 1,
-                    "programBinary": "${workspaceFolder}/target/thumbv6m-none-eabi/debug/firmware",
+                    "programBinary": "${workspaceFolder}/target/thumbv6m-none-eabi/release/firmware",
+                    "rttEnabled": true
                 }
             ]
         }

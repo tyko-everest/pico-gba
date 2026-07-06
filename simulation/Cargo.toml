@@ -12,3 +12,4 @@ minifb = "0.28.0"
 [profile.release]
 debug = true
 split-debuginfo = "off"
+strip = "none"

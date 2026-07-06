@@ -8,9 +8,11 @@ use core::{
     mem::transmute,
     panic::PanicInfo,
 };
+use cortex_m::peripheral::syst::SystClkSource;
 use cortex_m_rt::{ExceptionFrame, entry};
+use defmt::info;
 use embedded_graphics::{
-    pixelcolor::{self, BinaryColor, Rgb565},
+    pixelcolor::{self, BinaryColor, Rgb565, raw::RawU16},
     prelude::*,
 };
 use embedded_hal::digital::OutputPin;
@@ -25,7 +27,7 @@ use rp2040_hal::{
     Clock, Spi, Timer, Watchdog,
     fugit::HertzU32,
     multicore::{self, Stack, StackAllocation},
-    pac,
+    pac::{self, SYST},
 };
 
 #[unsafe(link_section = ".boot_loader")]
@@ -204,28 +206,45 @@ extern "C" fn hard_fault(frame: &mut ExceptionFrame, other_regs: &mut Reg4_7) {
     }
 }
 
-fn video_loop<DI, MODEL, RST>(mut display: Display<DI, MODEL, RST>, video: Video) -> !
+fn video_loop<DI, MODEL, RST>(
+    mut display: Display<DI, MODEL, RST>,
+    video: Video,
+    mut systick: SYST,
+) -> !
 where
     DI: Interface,
     MODEL: Model<ColorFormat = Rgb565>,
     RST: OutputPin,
     MODEL::ColorFormat: InterfacePixelFormat<DI::Word>,
 {
+    let mut stat = video.registers.disp_status;
     let mut x = 0;
     let mut y = 0;
+    let mut colours = [0_u16; 240];
+
     loop {
-        let mut stat = video.registers.disp_status;
-
-        let (r, g, b) = video.get_pixel(x, y).to_rgb565_format();
-
-        // We unwrap here as we want this code to exit if it fails. Real applications may want to handle this in a different way
-        let colour = Rgb565::new(r, g, b);
-        display.set_pixel(x as u16, y as u16, colour);
+        let colour = video.get_pixel(x, y).to_rgb565_format();
+        colours[x] = colour;
 
         x += 1;
         if x == 240 {
             y += 1;
             x = 0;
+
+            systick.enable_counter();
+            let start = SYST::get_current();
+            display.set_pixels(
+                0,
+                y as u16,
+                SCREEN_WIDTH as u16 - 1,
+                y as u16,
+                colours.into_iter().map(|u| {
+                    Rgb565::new((u >> 11) as u8, ((u >> 5) & 0x3F) as u8, (u & 0x1F) as u8)
+                }),
+            );
+            let end = SYST::get_current();
+            let diff = start - end;
+            info!("cycle count: {}", diff);
         }
         if y == 160 {
             y = 0;
@@ -242,7 +261,14 @@ static mut CORE1_STACK: Stack<4096> = Stack::new();
 #[entry]
 fn main() -> ! {
     let mut pac = pac::Peripherals::take().unwrap();
+    let core = cortex_m::Peripherals::take().unwrap();
     let mut watchdog = Watchdog::new(pac.WATCHDOG);
+
+    let mut systick = core.SYST;
+    systick.disable_counter(); // Ensure it is stopped during config
+    systick.set_reload(0x00FF_FFFF); // Set to max 24-bit value (16,777,215)
+    systick.clear_current(); // Clear current value to force a reload
+    systick.set_clock_source(SystClkSource::Core); // Use the RP2040 CPU clock (typically 125MHz)
 
     let clocks = rp2040_hal::clocks::init_clocks_and_plls(
         12_000_000,
@@ -321,7 +347,7 @@ fn main() -> ! {
     unsafe {
         core1
             .spawn(CORE1_STACK.take().unwrap(), move || {
-                video_loop(display, video);
+                video_loop(display, video, systick);
             })
             .unwrap();
     };
