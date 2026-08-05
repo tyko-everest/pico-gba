@@ -4,38 +4,30 @@
 use common::{registers::*, video::*};
 use core::{
     arch::{asm, naked_asm},
-    f32::consts,
-    mem::transmute,
     panic::PanicInfo,
 };
 use cortex_m::peripheral::syst::SystClkSource;
 use cortex_m_rt::{ExceptionFrame, entry};
 use defmt::info;
-use embedded_graphics::{
-    pixelcolor::{self, BinaryColor, Rgb565, raw::RawU16},
-    prelude::*,
-};
+use embedded_graphics::{pixelcolor::Rgb565, prelude::*};
 use embedded_hal::digital::OutputPin;
 use embedded_hal_bus::spi::ExclusiveDevice;
 use mipidsi::{
     Builder, Display,
     interface::{Interface, InterfacePixelFormat, SpiInterface},
-    models::{self, Model, ST7789},
+    models::{self, Model},
     options::ColorInversion,
 };
 use rp2040_hal::{
     Clock, Spi, Timer, Watchdog,
     fugit::HertzU32,
-    multicore::{self, Stack, StackAllocation},
+    multicore::{self, Stack},
     pac::{self, SYST},
 };
 
 #[unsafe(link_section = ".boot_loader")]
 #[used]
 pub static BOOT_LOADER: [u8; 256] = rp2040_boot2::BOOT_LOADER_W25Q080;
-
-const SCREEN_WIDTH: usize = 240;
-const SCREEN_HEIGHT: usize = 160;
 
 const fn KB(num: u32) -> u32 {
     num << 10
@@ -220,19 +212,19 @@ where
     let mut stat = video.registers.disp_status;
     let mut x = 0;
     let mut y = 0;
-    let mut colours = [0_u16; 240];
 
     loop {
-        let colour = video.get_pixel(x, y).to_rgb565_format();
-        colours[x] = colour;
-
         x += 1;
-        if x == 240 {
+        if x == SCREEN_WIDTH {
             y += 1;
             x = 0;
 
             systick.enable_counter();
             let start = SYST::get_current();
+
+            let scanline = video.render_scanline(y);
+            let colours = scanline.map(|c| c.to_rgb565_format());
+
             display.set_pixels(
                 0,
                 y as u16,
@@ -246,7 +238,7 @@ where
             let diff = start - end;
             info!("cycle count: {}", diff);
         }
-        if y == 160 {
+        if y == SCREEN_HEIGHT {
             y = 0;
             stat.set_vblank_flag(false);
             video.registers.disp_status = stat;
@@ -327,7 +319,7 @@ fn main() -> ! {
         NEW_REG.disp_status = disp_status;
     }
 
-    let disp_status = unsafe { NEW_REG.disp_status };
+    // let disp_status = unsafe { NEW_REG.disp_status };
 
     let video = unsafe {
         Video {

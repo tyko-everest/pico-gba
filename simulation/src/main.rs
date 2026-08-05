@@ -2,11 +2,8 @@ use common::{registers::*, video::*};
 use minifb::{Key, Window, WindowOptions};
 use std::{env::home_dir, fs::File, io::Read};
 
-const WIDTH: usize = 240;
-const HEIGHT: usize = 160;
-
 fn main() {
-    let mut buffer: Vec<u32> = vec![0; WIDTH * HEIGHT];
+    let mut buffer: Vec<u32> = vec![0; SCREEN_WIDTH * SCREEN_HEIGHT];
     let opts = WindowOptions {
         borderless: false,
         title: true,
@@ -17,9 +14,10 @@ fn main() {
         transparency: false,
         none: true,
     };
-    let mut window = Window::new("Test - ESC to exit", WIDTH, HEIGHT, opts).unwrap_or_else(|e| {
-        panic!("{}", e);
-    });
+    let mut window = Window::new("Test - ESC to exit", SCREEN_WIDTH, SCREEN_HEIGHT, opts)
+        .unwrap_or_else(|e| {
+            panic!("{}", e);
+        });
     window.set_target_fps(60);
 
     let home_path = home_dir().unwrap();
@@ -63,20 +61,25 @@ fn main() {
     while window.is_open() && !window.is_key_down(Key::Escape) {
         let mut x = 0;
         let mut y = 0;
+        let mut scanline = video.render_scanline(0);
+
         for i in buffer.iter_mut() {
-            *i = video.get_pixel(x, y).to_minifb_format();
+            *i = scanline[x].to_minifb_format();
             x += 1;
-            if x == 240 {
+            if x == SCREEN_WIDTH {
                 y += 1;
                 x = 0;
+                scanline = video.render_scanline(y)
             }
-            if y == 160 {
+            if y == SCREEN_HEIGHT {
                 y = 0;
             }
         }
 
         // We unwrap here as we want this code to exit if it fails. Real applications may want to handle this in a different way
-        window.update_with_buffer(&buffer, WIDTH, HEIGHT).unwrap();
+        window
+            .update_with_buffer(&buffer, SCREEN_WIDTH, SCREEN_HEIGHT)
+            .unwrap();
 
         println!("frame {frame}");
         frame += 1;

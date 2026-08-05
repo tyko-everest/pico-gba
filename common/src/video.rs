@@ -1,10 +1,12 @@
 use crate::registers::*;
 use arbitrary_int::prelude::*;
 use bilge::*;
-use core::usize;
+use core::{ops::Deref, usize};
 
 // tiles are 8x8 pixels
 const TILE_SIZE_LOG: usize = 3;
+pub const SCREEN_WIDTH: usize = 240;
+pub const SCREEN_HEIGHT: usize = 160;
 
 // Final colour generated for the display
 #[bitsize(16)]
@@ -179,6 +181,43 @@ impl ObjAttrNormal {
         let attr0 = self.attr0;
         attr0.disable()
     }
+
+    fn width(&self) -> usize {
+        let map = [[8, 16, 8], [16, 32, 8], [32, 32, 16], [64, 64, 32]];
+        let attr0 = self.attr0;
+        let attr1 = self.attr1;
+        map[attr1.size().as_usize()][attr0.shape().as_usize()]
+    }
+
+    fn height(&self) -> usize {
+        let map = [[8, 8, 16], [16, 8, 32], [32, 16, 32], [64, 32, 64]];
+        let attr0 = self.attr0;
+        let attr1 = self.attr1;
+        map[attr1.size().as_usize()][attr0.shape().as_usize()]
+    }
+
+    fn is_on_scanline(&self, scanline: usize) -> bool {
+        if self.is_disabled() {
+            return false;
+        }
+        let attr0 = self.attr0;
+        let y = attr0.y().as_usize();
+        if scanline >= y && scanline < y + self.height() {
+            true
+        } else {
+            false
+        }
+    }
+
+    fn is_on_x(&self, screen_x: usize) -> bool {
+        let attr1 = self.attr1;
+        let x = attr1.x().as_usize();
+        if screen_x >= x && screen_x < x + self.width() {
+            true
+        } else {
+            false
+        }
+    }
 }
 
 #[repr(C, packed)]
@@ -192,7 +231,7 @@ struct ObjAttrRotScale {
 
 #[repr(C, packed)]
 #[derive(Clone, Copy)]
-union ObjAttr {
+pub union ObjAttr {
     normal: ObjAttrNormal,
     rot_scale: ObjAttrRotScale,
 }
@@ -237,6 +276,13 @@ impl OAM {
 
     fn get(&self, index: usize) -> &ObjAttr {
         &self.0[index]
+    }
+}
+
+impl Deref for OAM {
+    type Target = [ObjAttr; 128];
+    fn deref(&self) -> &Self::Target {
+        &self.0
     }
 }
 
@@ -336,10 +382,47 @@ impl Video<'_> {
         }
     }
 
-    fn get_bg_pixel(&self, bg: usize, x: usize, y: usize) -> Option<DisplayColour> {
+    fn get_bg_pixel(&self, bg: usize, screen_x: usize, screen_y: usize) -> Option<DisplayColour> {
         let register = self.registers.disp_ctrl;
+        let bg_regs = self.registers.bg_control;
+        let bg_offsets = self.registers.bg_offset;
+
+        // get the x offset register
+        let mut offset_x = {
+            let reg = bg_offsets[bg].x;
+            reg.offset().as_usize()
+        };
+        // get the current map's width
+        let width = bg_regs[bg].width_in_tiles() << TILE_SIZE_LOG;
+        // wrap the offset to within range if needed
+        if offset_x >= width {
+            offset_x -= width;
+        }
+        // get the x coordinate in that background map
+        let mut bg_x = screen_x + offset_x;
+        if bg_x >= width {
+            bg_x -= width;
+        }
+
+        // get the y offset register
+        let mut offset_y = {
+            let reg = bg_offsets[bg].y;
+            reg.offset().as_usize()
+        };
+        // get the current map's height
+        let height = bg_regs[bg].height_in_tiles() << TILE_SIZE_LOG;
+        // wrap the offset to within range if needed
+        if offset_y >= height {
+            offset_y -= height;
+        }
+        // get the y coordinate in that background map
+        let mut bg_y = screen_y + offset_y;
+        if bg_y >= height {
+            bg_y -= height;
+        }
+
         match register.bg_mode().as_u8() {
-            0 => self.get_bg_pixel_mode_0(bg, x, y),
+            0 => self.get_bg_pixel_mode_0(bg, bg_x, bg_y),
             1 => todo!(),
             2 => todo!(),
             3 => todo!(),
@@ -459,94 +542,59 @@ impl Video<'_> {
         }
     }
 
-    fn get_sprite_prio(&self, sprite: u8) -> Priority {
-        let prio = self.oam.get(sprite as usize).get_prio().as_u8();
-        Priority::new(prio, false, sprite)
-    }
+    pub fn render_scanline(&self, scanline: usize) -> [DisplayColour; SCREEN_WIDTH] {
+        // let display_control = self.registers.disp_ctrl;
+        let bg_control = self.registers.bg_control;
 
-    fn get_bg_prio(&self, bg: u8) -> Priority {
-        let bg_ctrl = self.registers.bg_control[bg as usize];
-        let prio = bg_ctrl.bg_prio().as_u8();
-        Priority::new(prio, true, bg)
-    }
+        let mut pixels = [DisplayColour::init(0, 0, 0); SCREEN_WIDTH];
+        let mut prio_list_raw = [Priority::new(0, false, 0); 128 + 4];
+        let mut prio_item_count = 0;
 
-    pub fn get_pixel(&self, x: usize, y: usize) -> DisplayColour {
-        let display_control = self.registers.disp_ctrl;
-        let bg_regs = self.registers.bg_control;
-        let bg_offsets = self.registers.bg_offset;
+        for (num, obj) in self.oam.iter().enumerate() {
+            unsafe {
+                // todo! this does not handle rotscale sprites, it assumes all are normal
+                if obj.normal.is_on_scanline(scanline) {
+                    prio_list_raw[prio_item_count] =
+                        Priority::new(obj.get_prio().as_u8(), false, num as u8);
+                    prio_item_count += 1;
+                }
+            }
+        }
+        for bg in 0..4 {
+            prio_list_raw[prio_item_count] =
+                Priority::new(bg_control[bg].bg_prio().as_u8(), true, bg as u8);
+            prio_item_count += 1;
+        }
 
-        let mut curr_prio = Priority::new(4, true, 128);
+        let prio_list = &mut prio_list_raw[0..prio_item_count];
+        prio_list.sort_unstable();
+
         let mut colour: Option<DisplayColour> = None;
 
-        for sprite in 0..128 {
-            // todo not handling rot scale mode
-            if self.oam.get(sprite).get_normal().unwrap().is_disabled() {
-                continue;
-            }
-            if let Some(c) = self.get_sprite_pixel(sprite, x, y) {
-                let new_prio = self.get_sprite_prio(sprite as u8);
-                if new_prio < curr_prio {
-                    curr_prio = new_prio;
-                    colour = Some(c)
+        for x in 0..SCREEN_WIDTH {
+            for item in &mut *prio_list {
+                // todo! does not handle rotscale, assumes always normal
+                let is_on_x = unsafe { self.oam.get(item.num as usize).normal.is_on_x(x) };
+                if !item.is_bg && is_on_x {
+                    colour = self.get_sprite_pixel(item.num as usize, x, scanline);
+                    break;
+                }
+                if item.is_bg {
+                    colour = self.get_bg_pixel(item.num as usize, x, scanline);
+                    break;
                 }
             }
+
+            let final_colour: DisplayColour;
+            if let Some(c) = colour {
+                final_colour = c;
+            } else {
+                // colour 0 of palette 0 is the default colour if nothing else is opaque
+                final_colour = self.palette.get_bg_colour_16(0, 0);
+            }
+            pixels[x] = final_colour;
         }
 
-        for bg in 0..4 {
-            if !display_control.screen_disp_bg_at(bg) {
-                continue;
-            }
-
-            // get the x offset register
-            let mut offset_x = {
-                let reg = bg_offsets[bg].x;
-                reg.offset().as_usize()
-            };
-            // get the current map's width
-            let width = bg_regs[bg].width_in_tiles() << TILE_SIZE_LOG;
-            // wrap the offset to within range if needed
-            if offset_x >= width {
-                offset_x -= width;
-            }
-            // get the x coordinate in that background map
-            let mut bg_x = x + offset_x;
-            if bg_x >= width {
-                bg_x -= width;
-            }
-
-            // get the y offset register
-            let mut offset_y = {
-                let reg = bg_offsets[bg].y;
-                reg.offset().as_usize()
-            };
-            // get the current map's height
-            let height = bg_regs[bg].height_in_tiles() << TILE_SIZE_LOG;
-            // wrap the offset to within range if needed
-            if offset_y >= height {
-                offset_y -= height;
-            }
-            // get the y coordinate in that background map
-            let mut bg_y = y + offset_y;
-            if bg_y >= height {
-                bg_y -= height;
-            }
-
-            if let Some(bg_colour) = self.get_bg_pixel(bg, bg_x, bg_y) {
-                let new_prio = self.get_bg_prio(bg as u8);
-                if new_prio < curr_prio {
-                    curr_prio = new_prio;
-                    colour = Some(bg_colour)
-                }
-            }
-        }
-
-        let final_colour: DisplayColour;
-        if let Some(c) = colour {
-            final_colour = c;
-        } else {
-            // colour 0 of palette 0 is the default colour if nothing else is opaque
-            final_colour = self.palette.get_bg_colour_16(0, 0);
-        }
-        final_colour
+        pixels
     }
 }
