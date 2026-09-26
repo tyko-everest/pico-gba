@@ -50,8 +50,8 @@ struct Tile4Line {
 }
 
 impl Tile4Line {
-    fn get_tile(&self, tile_x: usize) -> u4 {
-        u4::from_u32((self.data >> (tile_x * 4)) & 0xF)
+    fn get_tile(&self, x: usize) -> u4 {
+        u4::from_u32((self.data >> (x * 4)) & 0xF)
     }
 }
 
@@ -67,15 +67,27 @@ impl Tile4 {
     }
 }
 
+// One line of pixels in 8-bit colour mode
+#[derive(Copy, Clone)]
+struct Tile8Line {
+    data: [u8; 8],
+}
+
+impl Tile8Line {
+    fn get_tile(&self, x: usize) -> u8 {
+        self.data[x]
+    }
+}
+
 // One tile in 8-bit colour mode
 #[derive(Copy, Clone)]
 struct Tile8 {
-    data: [[u8; 8]; 8],
+    data: [Tile8Line; 8],
 }
 
 impl Tile8 {
-    pub fn get_colour(&self, x: usize, y: usize) -> u8 {
-        self.data[y][x]
+    pub fn get_line(&self, y: usize) -> Tile8Line {
+        self.data[y]
     }
 }
 
@@ -132,12 +144,20 @@ impl Palette {
     pub const fn zeroed() -> Self {
         unsafe { core::mem::zeroed() }
     }
-    fn get_bg_colour_256(&self, colour: usize) -> DisplayColour {
-        self.bg[colour]
+    fn get_bg_colour_256(&self, palette_colour: usize) -> DisplayColour {
+        let mut colour = self.bg[palette_colour];
+        if palette_colour != 0 {
+            colour.set_opaque(true);
+        };
+        colour
     }
 
-    fn get_bg_colour_16(&self, palette: usize, colour: usize) -> DisplayColour {
-        self.bg[palette * 16 + colour]
+    fn get_bg_colour_16(&self, palette_num: usize, palette_colour: usize) -> DisplayColour {
+        let mut colour = self.bg[palette_num * 16 + palette_colour];
+        if palette_colour != 0 {
+            colour.set_opaque(true);
+        };
+        colour
     }
 
     fn get_obj_colour_256(&self, colour: usize) -> DisplayColour {
@@ -368,6 +388,12 @@ impl Video<'_> {
         unsafe { ptr.read().get_line(y) }
     }
 
+    fn get_tile8_line(&self, bg: usize, index: usize, y: usize) -> Tile8Line {
+        let base_ptr = self.get_tileset_base_addr(bg) as *const Tile8;
+        let ptr = unsafe { base_ptr.add(index) };
+        unsafe { ptr.read().get_line(y) }
+    }
+
     // Get info about a tile map entry assuming this BG is in text mode
     fn get_map_text_entry(&self, bg: usize, tile_x: usize, tile_y: usize) -> MapTextEntry {
         let bg_control = self.registers.bg_control[bg];
@@ -399,51 +425,56 @@ impl Video<'_> {
 
         // keep track of which output screen_x we are generating right now
         let mut screen_x = 0;
-        if bg_control.palette_mode() {
-            // todo!()
-        } else {
-            for _ in 0..=31 {
-                // x and y index of the tile in the background (not the pixel)
-                // i.e. the coordinate in the background divided by tile size of 8
-                let bg_tile_x = bg_x >> TILE_SIZE_LOG;
-                let bg_tile_y = bg_y >> TILE_SIZE_LOG;
 
-                // y index within that tile we are currently drawing (i.e. 0-7)
-                let tile_y = bg_y & TILE_MASK;
+        // iterate through the tiles we need to get to render this scanline
+        for _ in 0..=31 {
+            // x and y index of the tile in the background (not the pixel)
+            // i.e. the coordinate in the background divided by tile size of 8
+            let bg_tile_x = bg_x >> TILE_SIZE_LOG;
+            let bg_tile_y = bg_y >> TILE_SIZE_LOG;
 
-                let entry = self.get_map_text_entry(bg, bg_tile_x, bg_tile_y);
-                let tile_line = self.get_tile4_line(bg, entry.tile().as_usize(), tile_y);
+            // y index within that tile we are currently drawing (i.e. 0-7)
+            let tile_y = bg_y & TILE_MASK;
+            let entry = self.get_map_text_entry(bg, bg_tile_x, bg_tile_y);
+            let tile4_line = self.get_tile4_line(bg, entry.tile().as_usize(), tile_y);
+            let tile8_line = self.get_tile8_line(bg, entry.tile().as_usize(), tile_y);
 
-                for tile_x in (bg_x & TILE_MASK)..TILE_SIZE {
-                    let palette_colour = tile_line.get_tile(tile_x).as_usize();
+            for tile_x in (bg_x & TILE_MASK)..TILE_SIZE {
+                if bg_control.palette_mode() {
+                    // temporarily just generate a transparent colour
+                    let palette_colour = tile8_line.get_tile(tile_x).as_usize();
+                    let colour = self.palette.get_bg_colour_256(palette_colour);
+                    pixels[screen_x] = colour;
+                } else {
+                    let palette_colour = tile4_line.get_tile(tile_x).as_usize();
                     let colour = self
                         .palette
                         .get_bg_colour_16(entry.palette().as_usize(), palette_colour);
                     pixels[screen_x] = colour;
+                }
 
-                    bg_x += 1;
-                    if bg_x >= bg_control.width_in_pixels() {
-                        bg_x = bg_control.width_in_pixels();
-                    }
+                bg_x += 1;
+                if bg_x >= bg_control.width_in_pixels() {
+                    bg_x = bg_control.width_in_pixels();
+                }
 
-                    screen_x += 1;
-                    if screen_x >= SCREEN_WIDTH {
-                        return;
-                    }
+                screen_x += 1;
+                if screen_x >= SCREEN_WIDTH {
+                    return;
                 }
             }
         }
     }
 
     pub fn render_scanline(&self, scanline: usize) -> [DisplayColour; SCREEN_WIDTH] {
-        // let display_control = self.registers.disp_ctrl;
+        let display_control = self.registers.disp_ctrl;
         let bg_control = self.registers.bg_control;
 
         let mut prio_list_raw = [Priority::new(0, false, 0); 128 + 4];
         let mut prio_item_count = 0;
 
-        let mut sprite_x = [0u16; 240];
-        let mut sprite_widths = [0u8; 240];
+        // let mut sprite_x = [0u16; 240];
+        // let mut sprite_widths = [0u8; 240];
 
         // for (num, obj) in self.oam.iter().enumerate() {
         //     unsafe {
@@ -459,10 +490,12 @@ impl Video<'_> {
         //         }
         //     }
         // }
-        for bg in 0..1 {
-            prio_list_raw[prio_item_count] =
-                Priority::new(bg_control[bg].bg_prio().as_u8(), true, bg as u8);
-            prio_item_count += 1;
+        for bg in 0..4 {
+            if display_control.screen_disp_bg_at(bg) {
+                prio_list_raw[prio_item_count] =
+                    Priority::new(bg_control[bg].bg_prio().as_u8(), true, bg as u8);
+                prio_item_count += 1;
+            }
         }
 
         let prio_list = &mut prio_list_raw[0..prio_item_count];
@@ -479,19 +512,22 @@ impl Video<'_> {
         'pixel_loop: for x in 0..SCREEN_WIDTH {
             for item in &mut *prio_list {
                 if item.is_bg {
-                    pixels[x] = bg_pixels[item.num as usize][x];
-                    continue 'pixel_loop;
+                    let colour = bg_pixels[item.num as usize][x];
+                    if colour.opaque() {
+                        pixels[x] = colour;
+                        continue 'pixel_loop;
+                    }
                 }
 
-                // todo! does not handle rotscale, assumes always normal
-                let is_on_x = x >= sprite_x[item.num as usize] as usize
-                    && x < sprite_widths[item.num as usize] as usize
-                        + sprite_x[item.num as usize] as usize;
+                // // todo! does not handle rotscale, assumes always normal
+                // let is_on_x = x >= sprite_x[item.num as usize] as usize
+                //     && x < sprite_widths[item.num as usize] as usize
+                //         + sprite_x[item.num as usize] as usize;
 
-                if is_on_x {
-                    // colour = self.get_sprite_pixel(item.num as usize, x, scanline);
-                    continue 'pixel_loop;
-                }
+                // if is_on_x {
+                //     // colour = self.get_sprite_pixel(item.num as usize, x, scanline);
+                //     continue 'pixel_loop;
+                // }
             }
 
             // colour 0 of palette 0 is the default colour if nothing else is opaque
