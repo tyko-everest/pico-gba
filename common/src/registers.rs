@@ -51,14 +51,44 @@ pub struct BgControl {
 }
 
 impl BgControl {
+    pub fn is_wide(&self) -> bool {
+        self.tilemap_size().value() & 0b1 == 0b1
+    }
+
+    pub fn is_tall(&self) -> bool {
+        self.tilemap_size().value() & 0b10 == 0b10
+    }
+
     pub fn width_in_tiles(&self) -> usize {
-        let is_wide = self.tilemap_size().value() & 0b1 == 0b1;
-        if is_wide { 64 } else { 32 }
+        if self.is_wide() { 64 } else { 32 }
     }
 
     pub fn height_in_tiles(&self) -> usize {
-        let is_tall = self.tilemap_size().value() & 0b10 == 0b10;
-        if is_tall { 64 } else { 32 }
+        if self.is_tall() { 64 } else { 32 }
+    }
+
+    pub fn width_in_pixels(&self) -> usize {
+        if self.is_wide() { 512 } else { 256 }
+    }
+
+    pub fn height_in_pixels(&self) -> usize {
+        if self.is_tall() { 512 } else { 256 }
+    }
+
+    pub fn width_mask_tiles(&self) -> usize {
+        if self.is_wide() { 64 - 1 } else { 32 - 1 }
+    }
+
+    pub fn height_mask_tiles(&self) -> usize {
+        if self.is_tall() { 64 - 1 } else { 32 - 1 }
+    }
+
+    pub fn width_mask_pixels(&self) -> usize {
+        if self.is_wide() { 512 - 1 } else { 256 - 1 }
+    }
+
+    pub fn height_mask_pixels(&self) -> usize {
+        if self.is_tall() { 512 - 1 } else { 256 - 1 }
     }
 }
 
