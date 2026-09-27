@@ -22,7 +22,7 @@ fn main() {
 
     let home_path = home_dir().unwrap();
     let home = home_path.to_str().unwrap();
-    let dump_base = format!("{home}/Dev/pico-gba/simulation/ram_dumps");
+    let dump_base = format!("{home}/Dev/pico-gba/simulation/pong_dumps");
 
     // load in values from dump from real ram
     let mut registers_file = File::open(format!("{dump_base}/registers")).unwrap();

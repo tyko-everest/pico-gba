@@ -50,7 +50,7 @@ struct Tile4Line {
 }
 
 impl Tile4Line {
-    fn get_tile(&self, x: usize) -> u4 {
+    fn get_pixel(&self, x: usize) -> u4 {
         u4::from_u32((self.data >> (x * 4)) & 0xF)
     }
 }
@@ -160,12 +160,20 @@ impl Palette {
         colour
     }
 
-    fn get_obj_colour_256(&self, colour: usize) -> DisplayColour {
-        self.obj[colour]
+    fn get_obj_colour_256(&self, palette_colour: usize) -> DisplayColour {
+        let mut colour = self.obj[palette_colour];
+        if palette_colour != 0 {
+            colour.set_opaque(true);
+        };
+        colour
     }
 
-    fn get_obj_colour_16(&self, palette: usize, colour: usize) -> DisplayColour {
-        self.obj[palette * 16 + colour]
+    fn get_obj_colour_16(&self, palette_num: usize, palette_colour: usize) -> DisplayColour {
+        let mut colour = self.obj[palette_num * 16 + palette_colour];
+        if palette_colour != 0 {
+            colour.set_opaque(true);
+        };
+        colour
     }
 }
 
@@ -360,14 +368,9 @@ pub struct Video<'a> {
 
 impl Video<'_> {
     // Get the base address of a tile set given the current status of the control registers
-    fn get_tileset_base_addr(&self, bg: usize) -> *const u8 {
+    fn get_tileset_base_addr(&self, offset: usize) -> *const u8 {
         const TILESET_OFFSET: usize = 16 * 1024;
-        let register = self.registers.bg_control[bg];
-        unsafe {
-            self.vram
-                .data()
-                .add(register.tileset_base().as_usize() * TILESET_OFFSET)
-        }
+        unsafe { self.vram.data().add(offset * TILESET_OFFSET) }
     }
 
     // Get the base address of a tile map given the current status of the control registers
@@ -381,15 +384,34 @@ impl Video<'_> {
         }
     }
 
-    // Get a specific 4-bit colour depth tile
-    fn get_tile4_line(&self, bg: usize, index: usize, y: usize) -> Tile4Line {
-        let base_ptr = self.get_tileset_base_addr(bg) as *const Tile4;
+    fn get_sprite_tile4_line(&self, index: usize, y: usize) -> Tile4Line {
+        let base_ptr = self.get_tileset_base_addr(4) as *const Tile4;
         let ptr = unsafe { base_ptr.add(index) };
         unsafe { ptr.read().get_line(y) }
     }
 
-    fn get_tile8_line(&self, bg: usize, index: usize, y: usize) -> Tile8Line {
-        let base_ptr = self.get_tileset_base_addr(bg) as *const Tile8;
+    fn get_sprite_tile8_line(&self, index: usize, y: usize) -> Tile8Line {
+        let base_ptr = self.get_tileset_base_addr(4) as *const Tile8;
+        let ptr = unsafe { base_ptr.add(index) };
+        unsafe { ptr.read().get_line(y) }
+    }
+
+    fn get_bg_tileset_offset(&self, bg: usize) -> usize {
+        let register = self.registers.bg_control[bg];
+        register.tileset_base().as_usize()
+    }
+
+    // Get a specific 4-bit colour depth tile
+    fn get_bg_tile4_line(&self, bg: usize, index: usize, y: usize) -> Tile4Line {
+        let offset = self.get_bg_tileset_offset(bg);
+        let base_ptr = self.get_tileset_base_addr(offset) as *const Tile4;
+        let ptr = unsafe { base_ptr.add(index) };
+        unsafe { ptr.read().get_line(y) }
+    }
+
+    fn get_bg_tile8_line(&self, bg: usize, index: usize, y: usize) -> Tile8Line {
+        let offset = self.get_bg_tileset_offset(bg);
+        let base_ptr = self.get_tileset_base_addr(offset) as *const Tile8;
         let ptr = unsafe { base_ptr.add(index) };
         unsafe { ptr.read().get_line(y) }
     }
@@ -436,17 +458,16 @@ impl Video<'_> {
             // y index within that tile we are currently drawing (i.e. 0-7)
             let tile_y = bg_y & TILE_MASK;
             let entry = self.get_map_text_entry(bg, bg_tile_x, bg_tile_y);
-            let tile4_line = self.get_tile4_line(bg, entry.tile().as_usize(), tile_y);
-            let tile8_line = self.get_tile8_line(bg, entry.tile().as_usize(), tile_y);
+            let tile4_line = self.get_bg_tile4_line(bg, entry.tile().as_usize(), tile_y);
+            let tile8_line = self.get_bg_tile8_line(bg, entry.tile().as_usize(), tile_y);
 
             for tile_x in (bg_x & TILE_MASK)..TILE_SIZE {
                 if bg_control.palette_mode() {
-                    // temporarily just generate a transparent colour
                     let palette_colour = tile8_line.get_tile(tile_x).as_usize();
                     let colour = self.palette.get_bg_colour_256(palette_colour);
                     pixels[screen_x] = colour;
                 } else {
-                    let palette_colour = tile4_line.get_tile(tile_x).as_usize();
+                    let palette_colour = tile4_line.get_pixel(tile_x).as_usize();
                     let colour = self
                         .palette
                         .get_bg_colour_16(entry.palette().as_usize(), palette_colour);
@@ -473,23 +494,23 @@ impl Video<'_> {
         let mut prio_list_raw = [Priority::new(0, false, 0); 128 + 4];
         let mut prio_item_count = 0;
 
-        // let mut sprite_x = [0u16; 240];
-        // let mut sprite_widths = [0u8; 240];
+        let mut sprite_x = [0u16; 240];
+        let mut sprite_widths = [0u8; 240];
 
-        // for (num, obj) in self.oam.iter().enumerate() {
-        //     unsafe {
-        //         // todo! this does not handle rotscale sprites, it assumes all are normal
-        //         if obj.normal.is_on_scanline(scanline) {
-        //             prio_list_raw[prio_item_count] =
-        //                 Priority::new(obj.get_prio().as_u8(), false, num as u8);
-        //             prio_item_count += 1;
+        for (num, obj) in self.oam.iter().enumerate() {
+            unsafe {
+                // todo! this does not handle rotscale sprites, it assumes all are normal
+                if obj.normal.is_on_scanline(scanline) {
+                    prio_list_raw[prio_item_count] =
+                        Priority::new(obj.get_prio().as_u8(), false, num as u8);
+                    prio_item_count += 1;
 
-        //             sprite_widths[num] = obj.normal.width() as u8;
-        //             let attr1 = obj.normal.attr1;
-        //             sprite_x[num] = attr1.x().as_u16();
-        //         }
-        //     }
-        // }
+                    sprite_widths[num] = obj.normal.width() as u8;
+                    let attr1 = obj.normal.attr1;
+                    sprite_x[num] = attr1.x().as_u16();
+                }
+            }
+        }
         for bg in 0..4 {
             if display_control.screen_disp_bg_at(bg) {
                 prio_list_raw[prio_item_count] =
@@ -501,9 +522,53 @@ impl Video<'_> {
         let prio_list = &mut prio_list_raw[0..prio_item_count];
         prio_list.sort_unstable();
 
-        let mut pixels = [DisplayColour::init(0, 0, 0); SCREEN_WIDTH];
+        // calculate the sprite pixels
+        let mut sprite_pixels = [DisplayColour::init(0, 0, 0); SCREEN_WIDTH];
+        for item in &mut *prio_list {
+            if !item.is_bg {
+                let sprite_num = item.num as usize;
+                let oam = unsafe { self.oam[sprite_num].normal };
+                let attr0 = oam.attr0;
+                let attr1 = oam.attr1;
+                let attr2 = oam.attr2;
 
-        // this assumes tile4 mode
+                // location of sprite in pixels in screen-space
+                let sprite_x = attr1.x().as_usize();
+                let sprite_y = attr0.y().as_usize();
+                // sprite dimensions in pixels
+                let sprite_width = oam.width();
+                let sprite_height = oam.height();
+
+                // y in pixels in sprite-space
+                let sprite_tile_y = scanline - sprite_y;
+
+                // x and y in tiles (not pixels) in sprite-space
+                let sprite_tile_index_y = sprite_tile_y >> TILE_SIZE_LOG;
+                for sprite_tile_index_x in 0..(sprite_width >> TILE_SIZE_LOG) {
+                    // linear sprite mapping
+                    let tile_index = attr2.tile().as_usize()
+                        + sprite_tile_index_y * (sprite_width >> TILE_SIZE_LOG)
+                        + sprite_tile_index_x;
+                    let tile4_line =
+                        self.get_sprite_tile4_line(tile_index, sprite_tile_y & TILE_MASK);
+                    for tile_x in 0..TILE_SIZE {
+                        let palette_colour = tile4_line.get_pixel(tile_x).as_usize();
+                        let colour = self
+                            .palette
+                            .get_obj_colour_16(attr2.palette().as_usize(), palette_colour);
+                        let screen_x = sprite_x + (sprite_tile_index_x << TILE_SIZE_LOG) + tile_x;
+                        if screen_x < SCREEN_WIDTH && colour.opaque() {
+                            sprite_pixels[screen_x] = colour;
+                        }
+                    }
+                }
+            }
+        }
+
+        // start every pixel as the default colour if every other layer is transparent
+        let default_colour = self.palette.get_bg_colour_16(0, 0);
+        let mut pixels = [default_colour; SCREEN_WIDTH];
+
         let mut bg_pixels = [[DisplayColour::init(0, 0, 0); SCREEN_WIDTH]; 4];
         for bg in 0..4 {
             self.render_bg_scanline(bg, scanline, &mut bg_pixels[bg]);
@@ -517,21 +582,14 @@ impl Video<'_> {
                         pixels[x] = colour;
                         continue 'pixel_loop;
                     }
+                } else {
+                    let colour = sprite_pixels[x];
+                    if colour.opaque() {
+                        pixels[x] = colour;
+                        continue 'pixel_loop;
+                    }
                 }
-
-                // // todo! does not handle rotscale, assumes always normal
-                // let is_on_x = x >= sprite_x[item.num as usize] as usize
-                //     && x < sprite_widths[item.num as usize] as usize
-                //         + sprite_x[item.num as usize] as usize;
-
-                // if is_on_x {
-                //     // colour = self.get_sprite_pixel(item.num as usize, x, scanline);
-                //     continue 'pixel_loop;
-                // }
             }
-
-            // colour 0 of palette 0 is the default colour if nothing else is opaque
-            pixels[x] = self.palette.get_bg_colour_16(0, 0);
         }
 
         pixels
