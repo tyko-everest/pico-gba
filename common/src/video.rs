@@ -3,6 +3,7 @@ use arbitrary_int::prelude::*;
 use bilge::*;
 use core::{
     ops::{Deref, Index},
+    ptr::read_volatile,
     todo, usize,
 };
 
@@ -63,7 +64,7 @@ struct Tile4 {
 
 impl Tile4 {
     pub fn get_line(&self, y: usize) -> Tile4Line {
-        self.data[y]
+        unsafe { read_volatile(&self.data[y]) }
     }
 }
 
@@ -385,15 +386,19 @@ impl Video<'_> {
     }
 
     fn get_sprite_tile4_line(&self, index: usize, y: usize) -> Tile4Line {
+        // let tiles_ptr = self.get_tileset_base_addr(4) as *const [Tile4; 2048];
+        // let tiles = unsafe { &*tiles_ptr };
+        // tiles[index].get_line(y)
+
         let base_ptr = self.get_tileset_base_addr(4) as *const Tile4;
         let ptr = unsafe { base_ptr.add(index) };
         unsafe { ptr.read().get_line(y) }
     }
 
     fn get_sprite_tile8_line(&self, index: usize, y: usize) -> Tile8Line {
-        let base_ptr = self.get_tileset_base_addr(4) as *const Tile8;
-        let ptr = unsafe { base_ptr.add(index) };
-        unsafe { ptr.read().get_line(y) }
+        let tiles_ptr = self.get_tileset_base_addr(4) as *const [Tile8; 1024];
+        let tiles = unsafe { &*tiles_ptr };
+        tiles[index].get_line(y)
     }
 
     fn get_bg_tileset_offset(&self, bg: usize) -> usize {
@@ -404,24 +409,26 @@ impl Video<'_> {
     // Get a specific 4-bit colour depth tile
     fn get_bg_tile4_line(&self, bg: usize, index: usize, y: usize) -> Tile4Line {
         let offset = self.get_bg_tileset_offset(bg);
-        let base_ptr = self.get_tileset_base_addr(offset) as *const Tile4;
-        let ptr = unsafe { base_ptr.add(index) };
-        unsafe { ptr.read().get_line(y) }
+        let tiles_ptr = self.get_tileset_base_addr(offset) as *const [Tile4; 1024];
+        let tiles = unsafe { &*tiles_ptr };
+        tiles[index].get_line(y)
     }
 
     fn get_bg_tile8_line(&self, bg: usize, index: usize, y: usize) -> Tile8Line {
         let offset = self.get_bg_tileset_offset(bg);
-        let base_ptr = self.get_tileset_base_addr(offset) as *const Tile8;
-        let ptr = unsafe { base_ptr.add(index) };
-        unsafe { ptr.read().get_line(y) }
+        let tiles_ptr = self.get_tileset_base_addr(offset) as *const [Tile8; 1024];
+        let tiles = unsafe { &*tiles_ptr };
+        tiles[index].get_line(y)
     }
 
     // Get info about a tile map entry assuming this BG is in text mode
     fn get_map_text_entry(&self, bg: usize, tile_x: usize, tile_y: usize) -> MapTextEntry {
         let bg_control = self.registers.bg_control[bg];
-        let base_ptr = self.get_map_base_addr(bg) as *const MapTextEntry;
-        let ptr = unsafe { base_ptr.add(tile_y * bg_control.width_in_tiles() + tile_x) };
-        unsafe { *ptr }
+        let index = tile_y * bg_control.width_in_tiles() + tile_x;
+
+        let entries_ptr = self.get_map_base_addr(bg) as *const [MapTextEntry; 4096];
+        let entries = unsafe { &*entries_ptr };
+        entries[index]
     }
 
     // For a background in a text-based mode, render that scanline
