@@ -1,11 +1,7 @@
 use crate::registers::*;
 use arbitrary_int::prelude::*;
 use bilge::*;
-use core::{
-    ops::{Deref, Index},
-    ptr::read_volatile,
-    todo, usize,
-};
+use core::{ops::Deref, ptr::read_volatile, usize};
 
 // tiles are 8x8 pixels
 const TILE_SIZE_LOG: usize = 3;
@@ -360,6 +356,47 @@ impl Priority {
     }
 }
 
+#[bitsize(8)]
+#[derive(FromBits, Copy, Clone)]
+pub struct Palette16Colour {
+    palette: u4,
+    colour: u4,
+}
+
+impl Palette16Colour {
+    fn is_transparent(&self) -> bool {
+        self.colour().as_usize() == 0
+    }
+}
+
+#[derive(Copy, Clone, Debug)]
+pub struct Palette256Colour {
+    colour: u8,
+}
+
+impl Palette256Colour {
+    fn new(colour: u8) -> Self {
+        Self { colour }
+    }
+    fn is_transparent(&self) -> bool {
+        self.colour == 0
+    }
+}
+
+#[derive(Copy, Clone)]
+union PaletteColour {
+    p16: Palette16Colour,
+    p256: Palette256Colour,
+}
+
+impl PaletteColour {
+    fn zeroed() -> Self {
+        Self {
+            p256: Palette256Colour::new(0),
+        }
+    }
+}
+
 pub struct Video<'a> {
     pub registers: &'a mut DisplayRegisters,
     pub palette: &'a mut Palette,
@@ -436,8 +473,8 @@ impl Video<'_> {
         &self,
         bg: usize,
         scanline: usize,
-        pixels: &mut [DisplayColour; SCREEN_WIDTH],
-    ) {
+        colours: &mut [PaletteColour; SCREEN_WIDTH],
+    ) -> PaletteType {
         let bg_control = self.registers.bg_control[bg];
         let bg_offset = self.registers.bg_offset[bg];
 
@@ -469,16 +506,20 @@ impl Video<'_> {
             let tile8_line = self.get_bg_tile8_line(bg, entry.tile().as_usize(), tile_y);
 
             for tile_x in (bg_x & TILE_MASK)..TILE_SIZE {
-                if bg_control.palette_mode() {
-                    let palette_colour = tile8_line.get_tile(tile_x).as_usize();
-                    let colour = self.palette.get_bg_colour_256(palette_colour);
-                    pixels[screen_x] = colour;
-                } else {
-                    let palette_colour = tile4_line.get_pixel(tile_x).as_usize();
-                    let colour = self
-                        .palette
-                        .get_bg_colour_16(entry.palette().as_usize(), palette_colour);
-                    pixels[screen_x] = colour;
+                match bg_control.palette_type() {
+                    PaletteType::P16 => {
+                        colours[screen_x] = PaletteColour {
+                            p16: Palette16Colour::new(
+                                entry.palette(),
+                                tile4_line.get_pixel(tile_x),
+                            ),
+                        }
+                    }
+                    PaletteType::P256 => {
+                        colours[screen_x] = PaletteColour {
+                            p256: Palette256Colour::new(tile8_line.get_tile(tile_x)),
+                        }
+                    }
                 }
 
                 bg_x += 1;
@@ -488,10 +529,11 @@ impl Video<'_> {
 
                 screen_x += 1;
                 if screen_x >= SCREEN_WIDTH {
-                    return;
+                    return bg_control.palette_type();
                 }
             }
         }
+        bg_control.palette_type()
     }
 
     pub fn render_scanline(&self, scanline: usize) -> [DisplayColour; SCREEN_WIDTH] {
@@ -576,18 +618,38 @@ impl Video<'_> {
         let default_colour = self.palette.get_bg_colour_16(0, 0);
         let mut pixels = [default_colour; SCREEN_WIDTH];
 
-        let mut bg_pixels = [[DisplayColour::init(0, 0, 0); SCREEN_WIDTH]; 4];
+        let mut bg_colours = [[PaletteColour::zeroed(); SCREEN_WIDTH]; 4];
+        let mut bg_palette_modes = [PaletteType::P16; 4];
         for bg in 0..4 {
-            self.render_bg_scanline(bg, scanline, &mut bg_pixels[bg]);
+            bg_palette_modes[bg] = self.render_bg_scanline(bg, scanline, &mut bg_colours[bg]);
         }
 
         'pixel_loop: for x in 0..SCREEN_WIDTH {
             for item in &mut *prio_list {
                 if item.is_bg {
-                    let colour = bg_pixels[item.num as usize][x];
-                    if colour.opaque() {
-                        pixels[x] = colour;
-                        continue 'pixel_loop;
+                    let bg = item.num as usize;
+                    let colour = bg_colours[bg][x];
+                    let mode = bg_palette_modes[bg];
+
+                    match mode {
+                        PaletteType::P16 => {
+                            let colour16 = unsafe { colour.p16 };
+                            if !colour16.is_transparent() {
+                                pixels[x] = self.palette.get_bg_colour_16(
+                                    colour16.palette().as_usize(),
+                                    colour16.colour().as_usize(),
+                                );
+                                continue 'pixel_loop;
+                            }
+                        }
+                        PaletteType::P256 => {
+                            let colour256 = unsafe { colour.p256 };
+                            if !colour256.is_transparent() {
+                                pixels[x] =
+                                    self.palette.get_bg_colour_256(colour256.colour as usize);
+                                continue 'pixel_loop;
+                            }
+                        }
                     }
                 } else {
                     let colour = sprite_pixels[x];

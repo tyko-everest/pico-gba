@@ -37,6 +37,12 @@ pub struct VertCounter {
     pub unused: u8,
 }
 
+#[derive(Clone, Copy)]
+pub enum PaletteType {
+    P16 = 0,
+    P256 = 1,
+}
+
 #[bitsize(16)]
 #[derive(FromBits, Clone, Copy, Default)]
 pub struct BgControl {
@@ -48,6 +54,15 @@ pub struct BgControl {
     pub tilemap_base: u5,
     pub disp_area_overflow: bool,
     pub tilemap_size: u2,
+}
+
+impl BgControl {
+    pub fn palette_type(&self) -> PaletteType {
+        match self.palette_mode() {
+            false => PaletteType::P16,
+            true => PaletteType::P256,
+        }
+    }
 }
 
 impl BgControl {
