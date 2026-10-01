@@ -8,7 +8,6 @@ use core::{
 };
 use cortex_m::peripheral::syst::SystClkSource;
 use cortex_m_rt::{ExceptionFrame, entry};
-use defmt::info;
 use embedded_graphics::{pixelcolor::Rgb565, prelude::*};
 use embedded_hal::digital::OutputPin;
 use embedded_hal_bus::spi::ExclusiveDevice;
@@ -24,6 +23,7 @@ use rp2040_hal::{
     multicore::{self, Stack},
     pac::{self, SYST},
 };
+use rtt_target::{rprintln, rtt_init_print};
 
 #[unsafe(link_section = ".boot_loader")]
 #[used]
@@ -210,21 +210,18 @@ where
     MODEL::ColorFormat: InterfacePixelFormat<DI::Word>,
 {
     let mut stat = video.registers.disp_status;
-    let mut x = 0;
-    let mut y = 0;
+
+    rtt_init_print!();
+    // this is using the 1MHz reference clock right now
+    systick.enable_counter();
+    const CYCLES_PER_FRAME: u32 = 1_000_000 / 60;
 
     loop {
-        x += 1;
-        if x == SCREEN_WIDTH {
-            y += 1;
-            x = 0;
+        let render_start = SYST::get_current();
 
-            systick.enable_counter();
-            let start = SYST::get_current();
-
+        for y in 0..SCREEN_HEIGHT {
             let scanline = video.render_scanline(y);
             let colours = scanline.map(|c| c.to_rgb565_format());
-
             display.set_pixels(
                 0,
                 y as u16,
@@ -234,17 +231,25 @@ where
                     Rgb565::new((u >> 11) as u8, ((u >> 5) & 0x3F) as u8, (u & 0x1F) as u8)
                 }),
             );
-            let end = SYST::get_current();
-            let diff = start - end;
-            info!("cycle count: {}", diff);
         }
-        if y == SCREEN_HEIGHT {
-            y = 0;
-            stat.set_vblank_flag(false);
-            video.registers.disp_status = stat;
-            stat.set_vblank_flag(true);
-            video.registers.disp_status = stat;
+
+        stat.set_vblank_flag(true);
+        video.registers.disp_status = stat;
+
+        let render_end = SYST::get_current();
+        let render_time = render_start - render_end;
+        rprintln!("rendering took {} us", render_time);
+
+        if render_time >= CYCLES_PER_FRAME {
+            rprintln!("rendering took too long! cannot delay")
+        } else {
+            let vblank_end = render_start - CYCLES_PER_FRAME;
+            let delay = render_end - vblank_end;
+            rprintln!("delaying for {}", delay);
         }
+
+        stat.set_vblank_flag(false);
+        video.registers.disp_status = stat;
     }
 }
 

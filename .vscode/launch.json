@@ -15,8 +15,10 @@
                 {
                     "coreIndex": 0,
                     "programBinary": "${workspaceFolder}/target/thumbv6m-none-eabi/release/firmware",
-                }
-            ]
+                    "rttEnabled": true,
+                },
+            ],
+            "consoleLogLevel": "Console"
         },
         {
             "name": "pico core 1",
