@@ -287,10 +287,7 @@ fn send_command<SPI: SpiDevice, DC: OutputPin>(spi: &mut SPI, dc: &mut DC, comma
 // GBA BGR555 to the display's RGB565, byte swapped since SPI sends each byte of the line buffer in
 // memory order and the display expects the high byte first
 fn gba_to_display(colour: u16) -> u16 {
-    let red = colour & 0x1F;
-    let green = (colour >> 5) & 0x1F;
-    let blue = (colour >> 10) & 0x1F;
-    ((red << 11) | (green << 6) | blue).swap_bytes()
+    DisplayColour::from(colour).to_rgb565_format().swap_bytes()
 }
 
 // Scanlines are rendered into one buffer while DMA sends the other to the display

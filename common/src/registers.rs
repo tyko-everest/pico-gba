@@ -134,20 +134,6 @@ pub struct DisplayRegisters {
 }
 
 impl DisplayRegisters {
-    pub fn new() -> Self {
-        Self {
-            disp_ctrl: DisplayControl::from(0),
-            green_swap: 0,
-            disp_status: DisplayStatus::from(0),
-            vert_counter: VertCounter::from(0),
-            bg_control: [BgControl::from(0); 4],
-            bg_offset: [BgOffsetPair {
-                x: BgOffset::from(0),
-                y: BgOffset::from(0),
-            }; 4],
-        }
-    }
-
     pub const fn zeroed() -> Self {
         unsafe { core::mem::zeroed() }
     }

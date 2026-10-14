@@ -7,7 +7,7 @@ use core::ops::Deref;
 // tiles are 8x8 pixels
 const TILE_SIZE_LOG: usize = 3;
 const TILE_SIZE: usize = 1 << TILE_SIZE_LOG;
-const TILE_MASK: usize = 0b111;
+const TILE_MASK: usize = TILE_SIZE - 1;
 pub const SCREEN_WIDTH: usize = 240;
 pub const SCREEN_HEIGHT: usize = 160;
 
@@ -18,22 +18,10 @@ pub struct DisplayColour {
     red: u5,
     green: u5,
     blue: u5,
-    _transparent: bool,
+    _unused: bool,
 }
 
 impl DisplayColour {
-    pub fn init(r: u8, g: u8, b: u8) -> Self {
-        Self::new(u5::new(r), u5::new(g), u5::new(b), false)
-    }
-
-    pub fn transparent() -> Self {
-        Self::new(u5::new(0), u5::new(0), u5::new(0), true)
-    }
-
-    pub fn is_transparent(&self) -> bool {
-        self._transparent()
-    }
-
     pub fn to_minifb_format(&self) -> u32 {
         self.red().as_u32() << (16 + 3)
             | self.green().as_u32() << (8 + 3)
@@ -45,8 +33,9 @@ impl DisplayColour {
     }
 }
 
+// One entry of a text mode BG map
 #[bitsize(16)]
-#[derive(Copy, Clone)]
+#[derive(FromBits, Copy, Clone)]
 struct MapTextEntry {
     tile: u10,
     horiz_flip: bool,
@@ -54,24 +43,9 @@ struct MapTextEntry {
     palette: u4,
 }
 
-impl MapTextEntry {
-    pub const fn zeroed() -> Self {
-        unsafe { core::mem::zeroed() }
-    }
-}
-
-struct MapTextLine {
-    data: [MapTextEntry; 31],
-}
-
-impl MapTextLine {
-    pub const fn zeroed() -> Self {
-        unsafe { core::mem::zeroed() }
-    }
-
-    // pub fn get_
-}
-
+// One entry of a rotation/scaling BG map
+// todo! not used until rotation/scaling BGs are drawn
+#[allow(dead_code)]
 struct MapRotScaleEntry(u8);
 
 // align(4) keeps the size the same but lets tile rows be read as whole words
@@ -83,10 +57,6 @@ pub struct VRAM {
 impl VRAM {
     pub const fn zeroed() -> Self {
         unsafe { core::mem::zeroed() }
-    }
-
-    pub fn data(&self) -> *mut u8 {
-        self._data.as_ptr().cast_mut()
     }
 
     pub fn bytes_mut(&mut self) -> &mut [u8] {
@@ -179,12 +149,8 @@ struct ObjAttrNormal {
     unused: u16,
 }
 
+// size and shape are in the same place for both kinds of sprite
 impl ObjAttrNormal {
-    fn is_disabled(&self) -> bool {
-        let attr0 = self.attr0;
-        attr0.disable()
-    }
-
     fn width(&self) -> usize {
         let map = [[8, 16, 8], [16, 32, 8], [32, 32, 16], [64, 64, 32]];
         let attr0 = self.attr0;
@@ -197,29 +163,6 @@ impl ObjAttrNormal {
         let attr0 = self.attr0;
         let attr1 = self.attr1;
         map[attr1.size().as_usize()][attr0.shape().as_usize()]
-    }
-
-    fn is_on_scanline(&self, scanline: usize) -> bool {
-        if self.is_disabled() {
-            return false;
-        }
-        let attr0 = self.attr0;
-        let y = attr0.y().as_usize();
-        if scanline >= y && scanline < y + self.height() {
-            true
-        } else {
-            false
-        }
-    }
-
-    fn is_on_x(&self, screen_x: usize) -> bool {
-        let attr1 = self.attr1;
-        let x = attr1.x().as_usize();
-        if screen_x >= x && screen_x < x + self.width() {
-            true
-        } else {
-            false
-        }
     }
 }
 
@@ -247,11 +190,6 @@ impl ObjAttr {
         }
     }
 
-    fn get_prio(&self) -> u2 {
-        let attr2 = unsafe { self.normal.attr2 };
-        attr2.prio()
-    }
-
     fn get_normal(&self) -> Option<&ObjAttrNormal> {
         if self.is_rot_scale() {
             None
@@ -275,10 +213,6 @@ pub struct OAM([ObjAttr; 128]);
 impl OAM {
     pub const fn zeroed() -> Self {
         unsafe { core::mem::zeroed() }
-    }
-
-    fn get(&self, index: usize) -> &ObjAttr {
-        &self.0[index]
     }
 }
 
@@ -400,27 +334,45 @@ impl<'a> Video<'a> {
         cache.count = 0;
         cache.line_masks = [[0; 4]; SCREEN_HEIGHT];
         for obj in self.oam.iter() {
-            // todo! rotscale sprites are drawn as normal sprites, without rotation or double size
-            let obj = unsafe { obj.normal };
-            let attr0 = obj.attr0;
-            let attr1 = obj.attr1;
-            let attr2 = obj.attr2;
-            let rot_scale = attr0.rot_scale();
+            // the fields both kinds of sprite share are read through the normal layout
+            let shared = unsafe { obj.normal };
+            let attr0 = shared.attr0;
+            let attr1 = shared.attr1;
+            let attr2 = shared.attr2;
 
-            // without rotscale bit 9 hides the sprite, with rotscale it is the double size flag
-            if !rot_scale && attr0.disable() {
-                continue;
-            }
             // mode 2 is the OBJ window which is never drawn, mode 3 and shape 3 are prohibited
             if attr0.mode().as_u8() >= 2 || attr0.shape().as_u8() == 3 {
                 continue;
             }
+            let width = shared.width();
+            let height = shared.height();
 
-            let width = obj.width();
-            let height = obj.height();
+            let mut flags = 0;
+            // how far right and down the sprite is drawn from its position
+            let (mut offset_x, mut offset_y) = (0, 0);
+            if let Some(normal) = obj.get_normal() {
+                let (attr0, attr1) = (normal.attr0, normal.attr1);
+                if attr0.disable() {
+                    continue;
+                }
+                if attr1.horiz_flip() {
+                    flags |= SPRITE_HFLIP;
+                }
+                if attr1.vert_flip() {
+                    flags |= SPRITE_VFLIP;
+                }
+            } else if let Some(rot_scale) = obj.get_rot_scale() {
+                // todo! rotation and scaling are not drawn, these sprites are drawn as if their
+                // matrix was the identity. Double size doubles the area the sprite is drawn in,
+                // which centres an unscaled sprite inside it.
+                let attr0 = rot_scale.attr0;
+                if attr0.double_size() {
+                    (offset_x, offset_y) = (width / 2, height / 2);
+                }
+            }
 
             // y wraps at 256, so a sprite is on a line when (line - y) & 0xFF < height
-            let y = attr0.y().as_u8();
+            let y = attr0.y().as_u8().wrapping_add(offset_y as u8);
             if y as usize >= SCREEN_HEIGHT && y as usize + height <= 256 {
                 continue;
             }
@@ -430,17 +382,11 @@ impl<'a> Video<'a> {
             if x >= SCREEN_WIDTH as i16 {
                 x -= 512;
             }
+            x += offset_x as i16;
             if x + width as i16 <= 0 {
                 continue;
             }
 
-            let mut flags = 0;
-            if !rot_scale && attr1.horiz_flip() {
-                flags |= SPRITE_HFLIP;
-            }
-            if !rot_scale && attr1.vert_flip() {
-                flags |= SPRITE_VFLIP;
-            }
             let palette = if attr0.enable_256_colour() {
                 flags |= SPRITE_8BPP;
                 OBJ_PALETTE
@@ -498,7 +444,7 @@ impl Video<'_> {
         let mut tile_x = bg_x >> TILE_SIZE_LOG;
         // the first tile starts up to 7 pixels left of the screen, inside the margin
         let mut pos = LINE_MARGIN - (bg_x & TILE_MASK);
-        let p256 = control.palette_mode();
+        let palette_type = control.palette_type();
 
         for _ in 0..(SCREEN_WIDTH / TILE_SIZE + 1) {
             let column = tile_x & width_mask_tiles;
@@ -506,27 +452,30 @@ impl Video<'_> {
             if column >= 32 {
                 entry_addr += SCREENBLOCK;
             }
-            let entry = self.vram.read_u16(entry_addr) as usize;
-            let tile = entry & 0x3FF;
-            let hflip = entry & (1 << 10) != 0;
-            let tile_row = if entry & (1 << 11) != 0 { TILE_MASK - row } else { row };
+            let entry = MapTextEntry::from(self.vram.read_u16(entry_addr));
+            let tile = entry.tile().as_usize();
+            let hflip = entry.horiz_flip();
+            let tile_row = if entry.vert_flip() { TILE_MASK - row } else { row };
             let dst = (&mut line[pos..pos + TILE_SIZE]).try_into().unwrap();
 
-            if p256 {
-                let addr = tileset + tile * 64 + tile_row * 8;
-                if addr < BG_VRAM_SIZE {
-                    let low = self.vram.read_u32(addr);
-                    let high = self.vram.read_u32(addr + 4);
-                    let palette = (&self.palette_cache[..256]).try_into().unwrap();
-                    draw_tile_row_8bpp(dst, low, high, palette, hflip);
+            match palette_type {
+                PaletteType::P16 => {
+                    let addr = tileset + tile * 32 + tile_row * 4;
+                    if addr < BG_VRAM_SIZE {
+                        let pixels = self.vram.read_u32(addr);
+                        let base = entry.palette().as_usize() * 16;
+                        let palette = (&self.palette_cache[base..base + 16]).try_into().unwrap();
+                        draw_tile_row_4bpp(dst, pixels, palette, hflip);
+                    }
                 }
-            } else {
-                let addr = tileset + tile * 32 + tile_row * 4;
-                if addr < BG_VRAM_SIZE {
-                    let pixels = self.vram.read_u32(addr);
-                    let base = (entry >> 12) * 16;
-                    let palette = (&self.palette_cache[base..base + 16]).try_into().unwrap();
-                    draw_tile_row_4bpp(dst, pixels, palette, hflip);
+                PaletteType::P256 => {
+                    let addr = tileset + tile * 64 + tile_row * 8;
+                    if addr < BG_VRAM_SIZE {
+                        let low = self.vram.read_u32(addr);
+                        let high = self.vram.read_u32(addr + 4);
+                        let palette = (&self.palette_cache[..256]).try_into().unwrap();
+                        draw_tile_row_8bpp(dst, low, high, palette, hflip);
+                    }
                 }
             }
 
@@ -662,6 +611,7 @@ impl Video<'_> {
         profile::mark(3);
     }
 
+    // Render a scanline as GBA colours, only correct while set_colour_format is left at the default
     pub fn render_scanline(&self, scanline: usize) -> [DisplayColour; SCREEN_WIDTH] {
         let mut line = [0; SCREEN_WIDTH];
         self.render_scanline_into(scanline, &mut line);
