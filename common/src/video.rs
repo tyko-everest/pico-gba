@@ -319,7 +319,10 @@ impl<'a> Video<'a> {
 
     // Snapshot the state that only needs reading once per frame; call before rendering scanline 0
     #[inline(never)]
-    #[cfg_attr(all(target_arch = "arm", target_os = "none"), unsafe(link_section = ".data.ram_func"))]
+    #[cfg_attr(
+        all(target_arch = "arm", target_os = "none"),
+        unsafe(link_section = ".data.ram_func")
+    )]
     pub fn begin_frame(&mut self) {
         profile::start();
 
@@ -436,7 +439,11 @@ impl Video<'_> {
         const SCREENBLOCK: usize = 0x800;
         let mut map_row = control.tilemap_base().as_usize() * SCREENBLOCK + (tile_y & 31) * 64;
         if tile_y >= 32 {
-            map_row += if control.is_wide() { 2 * SCREENBLOCK } else { SCREENBLOCK };
+            map_row += if control.is_wide() {
+                2 * SCREENBLOCK
+            } else {
+                SCREENBLOCK
+            };
         }
         let tileset = control.tileset_base().as_usize() * 0x4000;
         let width_mask_tiles = control.width_mask_tiles();
@@ -455,7 +462,11 @@ impl Video<'_> {
             let entry = MapTextEntry::from(self.vram.read_u16(entry_addr));
             let tile = entry.tile().as_usize();
             let hflip = entry.horiz_flip();
-            let tile_row = if entry.vert_flip() { TILE_MASK - row } else { row };
+            let tile_row = if entry.vert_flip() {
+                TILE_MASK - row
+            } else {
+                row
+            };
             let dst = (&mut line[pos..pos + TILE_SIZE]).try_into().unwrap();
 
             match palette_type {
@@ -515,7 +526,11 @@ impl Video<'_> {
             let pos = (screen_x + LINE_MARGIN as isize) as usize;
             let dst = (&mut line[pos..pos + TILE_SIZE]).try_into().unwrap();
 
-            let source_x = if hflip { tiles_wide - 1 - tile_index_x } else { tile_index_x };
+            let source_x = if hflip {
+                tiles_wide - 1 - tile_index_x
+            } else {
+                tile_index_x
+            };
             let tile = row_tile + source_x * tile_step;
             let palette = sprite.palette as usize;
 
@@ -524,12 +539,16 @@ impl Video<'_> {
                 let addr = OBJ_VRAM_BASE + ((tile * 32 + tile_row * 8) & OBJ_VRAM_MASK);
                 let low = self.vram.read_u32(addr);
                 let high = self.vram.read_u32(addr + 4);
-                let palette = (&self.palette_cache[palette..palette + 256]).try_into().unwrap();
+                let palette = (&self.palette_cache[palette..palette + 256])
+                    .try_into()
+                    .unwrap();
                 draw_tile_row_8bpp(dst, low, high, palette, hflip);
             } else {
                 let addr = OBJ_VRAM_BASE + ((tile * 32 + tile_row * 4) & OBJ_VRAM_MASK);
                 let pixels = self.vram.read_u32(addr);
-                let palette = (&self.palette_cache[palette..palette + 16]).try_into().unwrap();
+                let palette = (&self.palette_cache[palette..palette + 16])
+                    .try_into()
+                    .unwrap();
                 draw_tile_row_4bpp(dst, pixels, palette, hflip);
             }
         }
@@ -538,7 +557,10 @@ impl Video<'_> {
     // Render a scanline in the colour format set by set_colour_format (BGR555 by default)
     // on the microcontroller this runs from RAM, flash is slow and its cache is shared with the game
     #[inline(never)]
-    #[cfg_attr(all(target_arch = "arm", target_os = "none"), unsafe(link_section = ".data.ram_func"))]
+    #[cfg_attr(
+        all(target_arch = "arm", target_os = "none"),
+        unsafe(link_section = ".data.ram_func")
+    )]
     pub fn render_scanline_into(&self, scanline: usize, out: &mut [u16; SCREEN_WIDTH]) {
         profile::start();
         let display_control = self.registers.disp_ctrl;
@@ -621,7 +643,12 @@ impl Video<'_> {
 
 // Draw the 8 pixels of a 4 bit tile row, colour 0 is transparent
 #[inline(always)]
-fn draw_tile_row_4bpp(dst: &mut [u16; TILE_SIZE], mut pixels: u32, palette: &[u16; 16], hflip: bool) {
+fn draw_tile_row_4bpp(
+    dst: &mut [u16; TILE_SIZE],
+    mut pixels: u32,
+    palette: &[u16; 16],
+    hflip: bool,
+) {
     if pixels == 0 {
         return;
     }

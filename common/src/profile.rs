@@ -2,8 +2,13 @@
 // The host installs a timer that counts *up*; phase times accumulate until reset.
 
 // phase 4 is timed in Video::begin_frame, once per frame
-pub const PHASE_NAMES: [&str; PHASE_COUNT] =
-    ["line setup", "bg draw", "sprite draw", "output", "frame prep"];
+pub const PHASE_NAMES: [&str; PHASE_COUNT] = [
+    "line setup",
+    "bg draw",
+    "sprite draw",
+    "output",
+    "frame prep",
+];
 pub const PHASE_COUNT: usize = 5;
 
 #[cfg(feature = "profile")]
@@ -40,7 +45,11 @@ mod imp {
     pub fn mark(phase: usize) {
         let now = (PROFILER.timer.get())();
         let total = &PROFILER.totals[phase];
-        total.set(total.get().wrapping_add(now.wrapping_sub(PROFILER.last.get())));
+        total.set(
+            total
+                .get()
+                .wrapping_add(now.wrapping_sub(PROFILER.last.get())),
+        );
         PROFILER.last.set(now);
     }
 

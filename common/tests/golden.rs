@@ -10,12 +10,19 @@ const GOLDEN_HASH: u64 = 0xee316f3a95681005;
 struct Aligned<T>(T);
 
 fn load<T>(name: &str) -> Box<Aligned<T>> {
-    let path = format!("{}/../simulation/ram_dumps/{name}", env!("CARGO_MANIFEST_DIR"));
+    let path = format!(
+        "{}/../simulation/ram_dumps/{name}",
+        env!("CARGO_MANIFEST_DIR")
+    );
     let bytes = fs::read(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
     assert!(bytes.len() >= size_of::<T>(), "{path} is too small");
     let mut out: Box<Aligned<T>> = Box::new(unsafe { core::mem::zeroed() });
     unsafe {
-        core::ptr::copy_nonoverlapping(bytes.as_ptr(), &mut out.0 as *mut T as *mut u8, size_of::<T>())
+        core::ptr::copy_nonoverlapping(
+            bytes.as_ptr(),
+            &mut out.0 as *mut T as *mut u8,
+            size_of::<T>(),
+        )
     };
     out
 }

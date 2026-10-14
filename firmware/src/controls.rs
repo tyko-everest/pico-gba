@@ -23,7 +23,12 @@ pub struct Rect {
 
 impl Rect {
     pub const fn new(x: u16, y: u16, width: u16, height: u16) -> Self {
-        Self { x, y, width, height }
+        Self {
+            x,
+            y,
+            width,
+            height,
+        }
     }
 
     fn contains(&self, x: u16, y: u16) -> bool {
@@ -31,7 +36,12 @@ impl Rect {
     }
 
     pub const fn inset(&self, by: u16) -> Rect {
-        Rect::new(self.x + by, self.y + by, self.width - 2 * by, self.height - 2 * by)
+        Rect::new(
+            self.x + by,
+            self.y + by,
+            self.width - 2 * by,
+            self.height - 2 * by,
+        )
     }
 }
 
@@ -42,7 +52,12 @@ pub const PANEL: Rect = Rect::new(0, 160, 240, 160);
 const DPAD_CELL: u16 = 44;
 const DPAD: Rect = Rect::new(6, 174, DPAD_CELL * 3, DPAD_CELL * 3);
 const fn dpad_cell(column: u16, row: u16) -> Rect {
-    Rect::new(DPAD.x + column * DPAD_CELL, DPAD.y + row * DPAD_CELL, DPAD_CELL, DPAD_CELL)
+    Rect::new(
+        DPAD.x + column * DPAD_CELL,
+        DPAD.y + row * DPAD_CELL,
+        DPAD_CELL,
+        DPAD_CELL,
+    )
 }
 pub const DPAD_CENTRE: Rect = dpad_cell(1, 1);
 
@@ -61,8 +76,12 @@ pub const GLYPH_WIDTH: u16 = 5;
 pub const GLYPH_HEIGHT: u16 = 7;
 pub type Glyph = [u8; GLYPH_HEIGHT as usize];
 
-const GLYPH_A: Glyph = [0b01110, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001];
-const GLYPH_B: Glyph = [0b11110, 0b10001, 0b10001, 0b11110, 0b10001, 0b10001, 0b11110];
+const GLYPH_A: Glyph = [
+    0b01110, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001,
+];
+const GLYPH_B: Glyph = [
+    0b11110, 0b10001, 0b10001, 0b11110, 0b10001, 0b10001, 0b11110,
+];
 
 // The letter drawn on a button, if it has one
 pub fn label(key: u16) -> Option<&'static Glyph> {

@@ -275,7 +275,12 @@ const CASET: u8 = 0x2A;
 const RASET: u8 = 0x2B;
 const RAMWR: u8 = 0x2C;
 
-fn send_command<SPI: SpiDevice, DC: OutputPin>(spi: &mut SPI, dc: &mut DC, command: u8, args: &[u8]) {
+fn send_command<SPI: SpiDevice, DC: OutputPin>(
+    spi: &mut SPI,
+    dc: &mut DC,
+    command: u8,
+    args: &[u8],
+) {
     dc.set_low().ok();
     spi.write(&[command]).ok();
     dc.set_high().ok();
@@ -428,13 +433,26 @@ fn draw_button<SPI: SpiDevice, DC: OutputPin, CH: SingleChannel>(
     key: u16,
     pressed: bool,
 ) {
-    let colour = gba_to_display(if pressed { PRESSED_COLOUR } else { BUTTON_COLOUR });
+    let colour = gba_to_display(if pressed {
+        PRESSED_COLOUR
+    } else {
+        BUTTON_COLOUR
+    });
     fill_rect(spi, dc, idle, rect.inset(BUTTON_BORDER), colour);
     if let Some(glyph) = controls::label(key) {
         // centred on the button
         let x = rect.x + (rect.width - GLYPH_WIDTH * LABEL_SCALE) / 2;
         let y = rect.y + (rect.height - GLYPH_HEIGHT * LABEL_SCALE) / 2;
-        draw_glyph(spi, dc, idle, x, y, glyph, gba_to_display(LABEL_COLOUR), colour);
+        draw_glyph(
+            spi,
+            dc,
+            idle,
+            x,
+            y,
+            glyph,
+            gba_to_display(LABEL_COLOUR),
+            colour,
+        );
     }
 }
 
@@ -557,7 +575,14 @@ where
                     keys = controls::keys_at(x, y);
                     // print readings a few times a second to calibrate against
                     if touch_frames % 15 == 0 {
-                        rprintln!("touch raw {} {} -> screen {} {}, keys {:#x}", raw_x, raw_y, x, y, keys);
+                        rprintln!(
+                            "touch raw {} {} -> screen {} {}, keys {:#x}",
+                            raw_x,
+                            raw_y,
+                            x,
+                            y,
+                            keys
+                        );
                     }
                     touch_frames += 1;
                 } else {
@@ -574,7 +599,8 @@ where
                 }
                 input_max = input_max.max(elapsed(input_start));
 
-                vblank_late_max = vblank_late_max.max(elapsed(frame_start).saturating_sub(line_start));
+                vblank_late_max =
+                    vblank_late_max.max(elapsed(frame_start).saturating_sub(line_start));
 
                 frames += 1;
                 render_total += render_time;
@@ -683,7 +709,7 @@ fn main() -> ! {
     let spi_bus = Spi::<_, _, _, 8>::new(pac.SPI1, (spi_mosi, spi_miso, spi_sclk)).init(
         &mut pac.RESETS,
         clocks.peripheral_clock.freq(),
-        HertzU32::Hz(62_500_000),  // clk_peri / 2, the fastest the SPI divider allows
+        HertzU32::Hz(62_500_000), // clk_peri / 2, the fastest the SPI divider allows
         // mode 3 since in mode 0 the RP2040 SPI leaves a gap between every byte
         embedded_hal::spi::MODE_3,
     );
@@ -710,7 +736,12 @@ fn main() -> ! {
     unsafe { core::ptr::write_volatile(keyinput_register(), KEYS_RELEASED) };
 
     let video = unsafe {
-        Video::new(&mut NEW_REG.display, &mut NEW_PALETTE, &mut NEW_VRAM, &mut NEW_OAM)
+        Video::new(
+            &mut NEW_REG.display,
+            &mut NEW_PALETTE,
+            &mut NEW_VRAM,
+            &mut NEW_OAM,
+        )
     };
 
     display.clear(RgbColor::BLACK);
@@ -727,8 +758,20 @@ fn main() -> ! {
     unsafe {
         core1
             .spawn(CORE1_STACK.take().unwrap(), move || {
-                let touch = Touch { tp_cs, tp_irq, lcd_cs: spi_cs };
-                video_loop(spi_device, dc_pin, dma.ch0, video, systick, touch, keyinput_register());
+                let touch = Touch {
+                    tp_cs,
+                    tp_irq,
+                    lcd_cs: spi_cs,
+                };
+                video_loop(
+                    spi_device,
+                    dc_pin,
+                    dma.ch0,
+                    video,
+                    systick,
+                    touch,
+                    keyinput_register(),
+                );
             })
             .unwrap();
     };
