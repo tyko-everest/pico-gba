@@ -333,6 +333,8 @@ impl CachedSprite {
 struct SpriteCache {
     sprites: [CachedSprite; 128],
     count: usize,
+    // for each scanline, bit n is set when sprites[n] covers that line
+    line_masks: [[u32; 4]; SCREEN_HEIGHT],
 }
 
 impl SpriteCache {
@@ -340,6 +342,7 @@ impl SpriteCache {
         Self {
             sprites: [CachedSprite::zeroed(); 128],
             count: 0,
+            line_masks: [[0; 4]; SCREEN_HEIGHT],
         }
     }
 }
@@ -372,6 +375,8 @@ impl<'a> Video<'a> {
     }
 
     // Snapshot the state that only needs reading once per frame; call before rendering scanline 0
+    #[inline(never)]
+    #[cfg_attr(all(target_arch = "arm", target_os = "none"), unsafe(link_section = ".data.ram_func"))]
     pub fn begin_frame(&mut self) {
         profile::start();
 
@@ -383,6 +388,7 @@ impl<'a> Video<'a> {
 
         let cache = &mut self.sprite_cache;
         cache.count = 0;
+        cache.line_masks = [[0; 4]; SCREEN_HEIGHT];
         for obj in self.oam.iter() {
             // todo! rotscale sprites are drawn as normal sprites, without rotation or double size
             let obj = unsafe { obj.normal };
@@ -442,6 +448,15 @@ impl<'a> Video<'a> {
                 prio: attr2.prio().as_u8(),
                 flags,
             };
+
+            // y wraps at 256, so a sprite near the bottom can continue at the top
+            let (word, bit) = (cache.count / 32, 1 << (cache.count % 32));
+            for row in 0..height {
+                let line = (y as usize + row) & 0xFF;
+                if line < SCREEN_HEIGHT {
+                    cache.line_masks[line][word] |= bit;
+                }
+            }
             cache.count += 1;
         }
         profile::mark(4);
@@ -562,6 +577,9 @@ impl Video<'_> {
     }
 
     // Render a scanline as GBA colours (BGR555)
+    // on the microcontroller this runs from RAM, flash is slow and its cache is shared with the game
+    #[inline(never)]
+    #[cfg_attr(all(target_arch = "arm", target_os = "none"), unsafe(link_section = ".data.ram_func"))]
     pub fn render_scanline_into(&self, scanline: usize, out: &mut [u16; SCREEN_WIDTH]) {
         profile::start();
         let display_control = self.registers.disp_ctrl;
@@ -591,14 +609,18 @@ impl Video<'_> {
         bgs &= text_bgs;
         let bg_control = self.registers.bg_control;
 
-        // the sprites on this line, in OAM order
-        let sprites = &self.sprite_cache.sprites[..self.sprite_cache.count];
+        // the sprites on this line, from the highest OAM number to the lowest
+        let sprites = &self.sprite_cache.sprites;
         let mut line_sprites = [0u8; 128];
         let mut line_sprite_count = 0;
         if display_control.screen_disp_obj() {
-            for (num, sprite) in sprites.iter().enumerate() {
-                if (scanline as u8).wrapping_sub(sprite.y) < sprite.height {
-                    line_sprites[line_sprite_count] = num as u8;
+            let masks = &self.sprite_cache.line_masks[scanline];
+            for word in (0..4).rev() {
+                let mut bits = masks[word];
+                while bits != 0 {
+                    let bit = 31 - bits.leading_zeros() as usize;
+                    bits &= !(1 << bit);
+                    line_sprites[line_sprite_count] = (word * 32 + bit) as u8;
                     line_sprite_count += 1;
                 }
             }
@@ -617,7 +639,7 @@ impl Video<'_> {
                 }
             }
             profile::mark(1);
-            for &num in line_sprites.iter().rev() {
+            for &num in line_sprites {
                 let sprite = &sprites[num as usize];
                 if sprite.prio == prio {
                     self.draw_sprite(sprite, scanline, obj_1d, &mut line);
