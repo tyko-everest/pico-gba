@@ -353,8 +353,10 @@ pub struct Video<'a> {
     pub vram: &'a mut VRAM,
     pub oam: &'a mut OAM,
     sprite_cache: SpriteCache,
-    // palette RAM as plain colours, BG then OBJ
+    // palette RAM converted to the output format, BG then OBJ
     palette_cache: [u16; 512],
+    // converts a GBA colour (BGR555) to the format render_scanline_into outputs
+    colour_format: fn(u16) -> u16,
 }
 
 impl<'a> Video<'a> {
@@ -371,7 +373,14 @@ impl<'a> Video<'a> {
             oam,
             sprite_cache: SpriteCache::new(),
             palette_cache: [0; 512],
+            colour_format: |colour| colour,
         }
+    }
+
+    // Output colours in another format, such as the one a display expects. Colours are converted
+    // once per frame in begin_frame, so this costs nothing per pixel. The default is BGR555.
+    pub fn set_colour_format(&mut self, colour_format: fn(u16) -> u16) {
+        self.colour_format = colour_format;
     }
 
     // Snapshot the state that only needs reading once per frame; call before rendering scanline 0
@@ -380,10 +389,11 @@ impl<'a> Video<'a> {
     pub fn begin_frame(&mut self) {
         profile::start();
 
-        // bit 15 of a palette entry is unused on the GBA, clear it so it never reads as transparent
+        // bit 15 of a palette entry is unused on the GBA
+        let convert = self.colour_format;
         for i in 0..256 {
-            self.palette_cache[i] = u16::from(self.palette.bg[i]) & 0x7FFF;
-            self.palette_cache[OBJ_PALETTE + i] = u16::from(self.palette.obj[i]) & 0x7FFF;
+            self.palette_cache[i] = convert(u16::from(self.palette.bg[i]) & 0x7FFF);
+            self.palette_cache[OBJ_PALETTE + i] = convert(u16::from(self.palette.obj[i]) & 0x7FFF);
         }
 
         let cache = &mut self.sprite_cache;
@@ -576,7 +586,7 @@ impl Video<'_> {
         }
     }
 
-    // Render a scanline as GBA colours (BGR555)
+    // Render a scanline in the colour format set by set_colour_format (BGR555 by default)
     // on the microcontroller this runs from RAM, flash is slow and its cache is shared with the game
     #[inline(never)]
     #[cfg_attr(all(target_arch = "arm", target_os = "none"), unsafe(link_section = ".data.ram_func"))]
@@ -586,7 +596,7 @@ impl Video<'_> {
 
         // forced blank shows a white screen
         if display_control.forced_blank() {
-            out.fill(0x7FFF);
+            out.fill((self.colour_format)(0x7FFF));
             profile::mark(3);
             return;
         }
