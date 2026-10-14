@@ -271,6 +271,45 @@ fn gba_to_display(colour: u16) -> u16 {
 // Scanlines are rendered into one buffer while DMA sends the other to the display
 static mut LINE_BUFFERS: [[u16; SCREEN_WIDTH]; 2] = [[0; SCREEN_WIDTH]; 2];
 
+// GBA display timing: the clock is 2^24 Hz, every line is 1232 cycles of which the first 1006
+// draw pixels and the rest are HBlank, and a frame is 160 visible lines then 68 lines of VBlank
+const LINE_CYCLES: u32 = 1232;
+const HBLANK_START_CYCLES: u32 = 1006;
+const LINES_PER_FRAME: usize = 228;
+
+// GBA cycles to microseconds, exact to within a quarter of a microsecond for anything up to
+// a whole frame without overflowing a u32
+const fn gba_cycles_to_us(cycles: u32) -> u32 {
+    ((cycles >> 2) * 15_625) >> 16
+}
+
+const FRAME_US: u32 = gba_cycles_to_us(LINE_CYCLES * LINES_PER_FRAME as u32);
+
+// DISPSTAT flags, which only the hardware writes
+const DISPSTAT_VBLANK: u16 = 1 << 0;
+const DISPSTAT_HBLANK: u16 = 1 << 1;
+const DISPSTAT_VCOUNT: u16 = 1 << 2;
+
+// Update the DISPSTAT flags for this point in the frame. The game may write the other bits
+// (interrupt enables and the V-count setting) at any time so only the flags are replaced.
+fn set_display_status(disp_status: *mut u16, line: usize, hblank: bool) {
+    unsafe {
+        let status = core::ptr::read_volatile(disp_status);
+        // the VBlank flag is set on lines 160-226, but not on the last line
+        let mut flags = 0;
+        if line >= SCREEN_HEIGHT && line < LINES_PER_FRAME - 1 {
+            flags |= DISPSTAT_VBLANK;
+        }
+        if hblank {
+            flags |= DISPSTAT_HBLANK;
+        }
+        if line as u16 == status >> 8 {
+            flags |= DISPSTAT_VCOUNT;
+        }
+        core::ptr::write_volatile(disp_status, (status & !0b111) | flags);
+    }
+}
+
 fn video_loop<SPI, DC, CH>(
     mut spi: SPI,
     mut dc: DC,
@@ -283,15 +322,18 @@ where
     DC: OutputPin,
     CH: SingleChannel,
 {
-    let mut stat = video.registers.disp_status;
     video.set_colour_format(gba_to_display);
+
+    // the game polls these from the other core, so they are written with single 16 bit stores
+    let disp_status = core::ptr::addr_of_mut!(video.registers.disp_status) as *mut u16;
+    let vert_counter = core::ptr::addr_of_mut!(video.registers.vert_counter) as *mut u16;
+    assert!(disp_status as usize % 2 == 0 && vert_counter as usize % 2 == 0);
 
     rtt_init_print!();
     // this is using the 1MHz reference clock right now
     systick.enable_counter();
     // SysTick is a 24-bit down counter; invert it to count up and shift so it wraps at 2^32
     profile::set_timer(|| (!SYST::get_current()) << 8);
-    const CYCLES_PER_FRAME: u32 = 1_000_000 / 60;
     let elapsed = |start: u32| start.wrapping_sub(SYST::get_current()) & 0x00FF_FFFF;
 
     // every frame covers the whole screen, so the window only needs setting once
@@ -301,83 +343,114 @@ where
     send_command(&mut spi, &mut dc, RASET, &[0, 0, (last_y >> 8) as u8, last_y as u8]);
 
     let mut idle = Some((dma_channel, Spi1Tx));
+    let mut sending = None;
 
+    // stats printed once a second
+    const REPORT_FRAMES: u32 = 60;
+    let mut frames: u32 = 0;
+    let mut render_total: u32 = 0;
+    let mut render_max: u32 = 0;
+    // how late the last visible line finished sending, compared to when VBlank should start
+    let mut vblank_late_max: u32 = 0;
+    let mut late_frames: u32 = 0;
+    let mut report_start = SYST::get_current();
+
+    let mut frame_start = SYST::get_current();
     loop {
-        let render_start = SYST::get_current();
-        // time spent only rendering, excluding the display transfer
-        let mut scanline_total: u32 = 0;
-        let mut scanline_max: u32 = 0;
-        // time spent waiting for DMA to finish sending the previous line
-        let mut dma_wait: u32 = 0;
+        let mut render_time: u32 = 0;
 
-        let prep_start = SYST::get_current();
-        video.begin_frame();
-        scanline_total += elapsed(prep_start);
+        for line in 0..LINES_PER_FRAME {
+            // wait for the line to start, a line that is already late starts right away
+            let line_start = gba_cycles_to_us(line as u32 * LINE_CYCLES);
+            while elapsed(frame_start) < line_start {}
 
-        // the display's write position goes back to the top left of the window
-        send_command(&mut spi, &mut dc, RAMWR, &[]);
+            unsafe { core::ptr::write_volatile(vert_counter, line as u16) };
+            set_display_status(disp_status, line, false);
 
-        let mut sending = None;
-        for y in 0..SCREEN_HEIGHT {
-            // the other buffer is the one DMA may still be reading
-            let buffer = unsafe { &mut LINE_BUFFERS[y % 2] };
+            if line == 0 {
+                let prep_start = SYST::get_current();
+                video.begin_frame();
+                render_time += elapsed(prep_start);
+                // the display's write position goes back to the top left of the window
+                send_command(&mut spi, &mut dc, RAMWR, &[]);
+            }
 
-            let scanline_start = SYST::get_current();
-            video.render_scanline_into(y, buffer);
-            let scanline_time = elapsed(scanline_start);
-            scanline_total += scanline_time;
-            scanline_max = scanline_max.max(scanline_time);
+            if line < SCREEN_HEIGHT {
+                // the other buffer is the one DMA may still be reading
+                let buffer = unsafe { &mut LINE_BUFFERS[line % 2] };
+                let render_start = SYST::get_current();
+                video.render_scanline_into(line, buffer);
+                render_time += elapsed(render_start);
 
-            let wait_start = SYST::get_current();
-            let (channel, tx) = match sending.take() {
-                Some(transfer) => {
+                let (channel, tx) = match sending.take() {
+                    Some(transfer) => {
+                        let (channel, _, tx) = single_buffer::Transfer::wait(transfer);
+                        (channel, tx)
+                    }
+                    None => idle.take().unwrap(),
+                };
+                let bytes: &'static [u8] = unsafe {
+                    core::slice::from_raw_parts(buffer.as_ptr() as *const u8, SCREEN_WIDTH * 2)
+                };
+                sending = Some(single_buffer::Config::new(channel, bytes, tx).start());
+            } else if line == SCREEN_HEIGHT {
+                // the whole frame has to be on the display before the next RAMWR
+                if let Some(transfer) = sending.take() {
                     let (channel, _, tx) = single_buffer::Transfer::wait(transfer);
-                    (channel, tx)
+                    idle = Some((channel, tx));
                 }
-                None => idle.take().unwrap(),
-            };
-            dma_wait += elapsed(wait_start);
+                spi1_flush();
+                vblank_late_max = vblank_late_max.max(elapsed(frame_start).saturating_sub(line_start));
 
-            let bytes: &'static [u8] = unsafe {
-                core::slice::from_raw_parts(buffer.as_ptr() as *const u8, SCREEN_WIDTH * 2)
-            };
-            sending = Some(single_buffer::Config::new(channel, bytes, tx).start());
+                frames += 1;
+                render_total += render_time;
+                render_max = render_max.max(render_time);
+                if frames == REPORT_FRAMES {
+                    let report_time = elapsed(report_start);
+                    report_start = SYST::get_current();
+                    rprintln!(
+                        "{} frames in {} us ({} us/frame, target {}), {} late",
+                        frames,
+                        report_time,
+                        report_time / frames,
+                        FRAME_US,
+                        late_frames
+                    );
+                    rprintln!(
+                        "  render avg {} us, max {} us, last line sent up to {} us into VBlank",
+                        render_total / frames,
+                        render_max,
+                        vblank_late_max
+                    );
+                    let phases = profile::take();
+                    for (name, time) in profile::PHASE_NAMES.iter().zip(phases) {
+                        rprintln!("  {:>12}: {:>6} us/frame", name, (time >> 8) / frames);
+                    }
+                    frames = 0;
+                    render_total = 0;
+                    render_max = 0;
+                    vblank_late_max = 0;
+                    late_frames = 0;
+                }
+            }
+
+            let hblank_start = gba_cycles_to_us(line as u32 * LINE_CYCLES + HBLANK_START_CYCLES);
+            while elapsed(frame_start) < hblank_start {}
+            set_display_status(disp_status, line, true);
         }
 
-        let wait_start = SYST::get_current();
-        let (channel, _, tx) = sending.take().unwrap().wait();
-        idle = Some((channel, tx));
-        spi1_flush();
-        dma_wait += elapsed(wait_start);
-
-        stat.set_vblank_flag(true);
-        video.registers.disp_status = stat;
-
-        let render_end = SYST::get_current();
-        let render_time = render_start.wrapping_sub(render_end) & 0x00FF_FFFF;
-        rprintln!("frame took {} us, {} us of it waiting for DMA", render_time, dma_wait);
-        rprintln!(
-            "render only (begin_frame + scanlines): {} us total, {} us avg/line, {} us max line",
-            scanline_total,
-            scanline_total / SCREEN_HEIGHT as u32,
-            scanline_max
-        );
-        let phases = profile::take();
-        for (name, time) in profile::PHASE_NAMES.iter().zip(phases) {
-            let us = time >> 8;
-            rprintln!("  {:>10}: {:>6} us ({}%)", name, us, us * 100 / scanline_total.max(1));
+        // the next frame starts a whole frame after this one did, so lateness does not add up
+        let frame_time = elapsed(frame_start);
+        if frame_time > FRAME_US {
+            late_frames += 1;
         }
-
-        if render_time >= CYCLES_PER_FRAME {
-            rprintln!("rendering took too long! cannot delay")
+        while elapsed(frame_start) < FRAME_US {}
+        if frame_time > 2 * FRAME_US {
+            // more than a frame behind, give up on catching up
+            frame_start = SYST::get_current();
         } else {
-            let vblank_end = render_start - CYCLES_PER_FRAME;
-            let delay = render_end - vblank_end;
-            rprintln!("delaying for {}", delay);
+            frame_start = frame_start.wrapping_sub(FRAME_US) & 0x00FF_FFFF;
         }
-
-        stat.set_vblank_flag(false);
-        video.registers.disp_status = stat;
     }
 }
 
