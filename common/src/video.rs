@@ -1,7 +1,8 @@
+use crate::profile;
 use crate::registers::*;
 use arbitrary_int::prelude::*;
 use bilge::*;
-use core::{ops::Deref, ptr::read_volatile, usize};
+use core::ops::Deref;
 
 // tiles are 8x8 pixels
 const TILE_SIZE_LOG: usize = 3;
@@ -17,12 +18,20 @@ pub struct DisplayColour {
     red: u5,
     green: u5,
     blue: u5,
-    opaque: bool,
+    _transparent: bool,
 }
 
 impl DisplayColour {
     pub fn init(r: u8, g: u8, b: u8) -> Self {
         Self::new(u5::new(r), u5::new(g), u5::new(b), false)
+    }
+
+    pub fn transparent() -> Self {
+        Self::new(u5::new(0), u5::new(0), u5::new(0), true)
+    }
+
+    pub fn is_transparent(&self) -> bool {
+        self._transparent()
     }
 
     pub fn to_minifb_format(&self) -> u32 {
@@ -33,58 +42,6 @@ impl DisplayColour {
 
     pub fn to_rgb565_format(&self) -> u16 {
         self.red().as_u16() << 11 | self.green().as_u16() << 6 | self.blue().as_u16()
-    }
-
-    pub fn is_transparent(&self) -> bool {
-        !self.opaque()
-    }
-}
-
-// One line of pixels in 4-bit colour mode
-#[derive(Copy, Clone)]
-struct Tile4Line {
-    data: u32,
-}
-
-impl Tile4Line {
-    fn get_pixel(&self, x: usize) -> u4 {
-        u4::from_u32((self.data >> (x * 4)) & 0xF)
-    }
-}
-
-// One tile in 4-bit colour mode
-#[derive(Copy, Clone)]
-struct Tile4 {
-    data: [Tile4Line; 8],
-}
-
-impl Tile4 {
-    pub fn get_line(&self, y: usize) -> Tile4Line {
-        unsafe { read_volatile(&self.data[y]) }
-    }
-}
-
-// One line of pixels in 8-bit colour mode
-#[derive(Copy, Clone)]
-struct Tile8Line {
-    data: [u8; 8],
-}
-
-impl Tile8Line {
-    fn get_tile(&self, x: usize) -> u8 {
-        self.data[x]
-    }
-}
-
-// One tile in 8-bit colour mode
-#[derive(Copy, Clone)]
-struct Tile8 {
-    data: [Tile8Line; 8],
-}
-
-impl Tile8 {
-    pub fn get_line(&self, y: usize) -> Tile8Line {
-        self.data[y]
     }
 }
 
@@ -117,6 +74,8 @@ impl MapTextLine {
 
 struct MapRotScaleEntry(u8);
 
+// align(4) keeps the size the same but lets tile rows be read as whole words
+#[repr(C, align(4))]
 pub struct VRAM {
     _data: [u8; 96 * 1024],
 }
@@ -129,6 +88,24 @@ impl VRAM {
     pub fn data(&self) -> *mut u8 {
         self._data.as_ptr().cast_mut()
     }
+
+    pub fn bytes_mut(&mut self) -> &mut [u8] {
+        &mut self._data
+    }
+
+    // offset must be 2 byte aligned and inside VRAM
+    #[inline(always)]
+    fn read_u16(&self, offset: usize) -> u16 {
+        debug_assert!(offset % 2 == 0 && offset + 2 <= self._data.len());
+        unsafe { (self._data.as_ptr().add(offset) as *const u16).read() }
+    }
+
+    // offset must be 4 byte aligned and inside VRAM
+    #[inline(always)]
+    fn read_u32(&self, offset: usize) -> u32 {
+        debug_assert!(offset % 4 == 0 && offset + 4 <= self._data.len());
+        unsafe { (self._data.as_ptr().add(offset) as *const u32).read() }
+    }
 }
 
 #[repr(C, packed)]
@@ -140,37 +117,6 @@ pub struct Palette {
 impl Palette {
     pub const fn zeroed() -> Self {
         unsafe { core::mem::zeroed() }
-    }
-    fn get_bg_colour_256(&self, palette_colour: usize) -> DisplayColour {
-        let mut colour = self.bg[palette_colour];
-        if palette_colour != 0 {
-            colour.set_opaque(true);
-        };
-        colour
-    }
-
-    fn get_bg_colour_16(&self, palette_num: usize, palette_colour: usize) -> DisplayColour {
-        let mut colour = self.bg[palette_num * 16 + palette_colour];
-        if palette_colour != 0 {
-            colour.set_opaque(true);
-        };
-        colour
-    }
-
-    fn get_obj_colour_256(&self, palette_colour: usize) -> DisplayColour {
-        let mut colour = self.obj[palette_colour];
-        if palette_colour != 0 {
-            colour.set_opaque(true);
-        };
-        colour
-    }
-
-    fn get_obj_colour_16(&self, palette_num: usize, palette_colour: usize) -> DisplayColour {
-        let mut colour = self.obj[palette_num * 16 + palette_colour];
-        if palette_colour != 0 {
-            colour.set_opaque(true);
-        };
-        colour
     }
 }
 
@@ -343,56 +289,57 @@ impl Deref for OAM {
     }
 }
 
-#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
-struct Priority {
-    prio: u8,
-    is_bg: bool,
-    num: u8,
-}
+// BG tiles and maps can only use the first 64K of VRAM
+const BG_VRAM_SIZE: usize = 0x10000;
+// OBJ tiles live in the last 32K of VRAM in BG modes 0-2
+const OBJ_VRAM_BASE: usize = 0x10000;
+const OBJ_VRAM_MASK: usize = 0x7FFF;
 
-impl Priority {
-    fn new(prio: u8, is_bg: bool, num: u8) -> Self {
-        Self { prio, is_bg, num }
-    }
-}
+// The palette cache holds the BG palette followed by the OBJ palette
+const OBJ_PALETTE: usize = 256;
 
-#[bitsize(8)]
-#[derive(FromBits, Copy, Clone)]
-pub struct Palette16Colour {
-    palette: u4,
-    colour: u4,
-}
+// Lines are drawn into a buffer with a margin on each side, so tiles that are partly off
+// screen can be drawn whole instead of being clipped
+const LINE_MARGIN: usize = TILE_SIZE;
+const LINE_BUFFER: usize = LINE_MARGIN + (SCREEN_WIDTH / TILE_SIZE + 1) * TILE_SIZE;
 
-impl Palette16Colour {
-    fn is_transparent(&self) -> bool {
-        self.colour().as_usize() == 0
-    }
-}
+const SPRITE_8BPP: u8 = 1 << 0;
+const SPRITE_HFLIP: u8 = 1 << 1;
+const SPRITE_VFLIP: u8 = 1 << 2;
 
-#[derive(Copy, Clone, Debug)]
-pub struct Palette256Colour {
-    colour: u8,
-}
-
-impl Palette256Colour {
-    fn new(colour: u8) -> Self {
-        Self { colour }
-    }
-    fn is_transparent(&self) -> bool {
-        self.colour == 0
-    }
-}
-
+// A sprite decoded from OAM once per frame, so scanlines don't re-read OAM
 #[derive(Copy, Clone)]
-union PaletteColour {
-    p16: Palette16Colour,
-    p256: Palette256Colour,
+struct CachedSprite {
+    // screen x of the left edge, negative when partly off the left of the screen
+    x: i16,
+    y: u8,
+    width: u8,
+    height: u8,
+    // first tile number, in 32 byte units
+    tile: u16,
+    // palette cache index of colour 0 for this sprite
+    palette: u16,
+    prio: u8,
+    flags: u8,
 }
 
-impl PaletteColour {
-    fn zeroed() -> Self {
+impl CachedSprite {
+    const fn zeroed() -> Self {
+        unsafe { core::mem::zeroed() }
+    }
+}
+
+// The sprites that can appear on screen this frame, in OAM order
+struct SpriteCache {
+    sprites: [CachedSprite; 128],
+    count: usize,
+}
+
+impl SpriteCache {
+    const fn new() -> Self {
         Self {
-            p256: Palette256Colour::new(0),
+            sprites: [CachedSprite::zeroed(); 128],
+            count: 0,
         }
     }
 }
@@ -402,265 +349,326 @@ pub struct Video<'a> {
     pub palette: &'a mut Palette,
     pub vram: &'a mut VRAM,
     pub oam: &'a mut OAM,
+    sprite_cache: SpriteCache,
+    // palette RAM as plain colours, BG then OBJ
+    palette_cache: [u16; 512],
+}
+
+impl<'a> Video<'a> {
+    pub fn new(
+        registers: &'a mut DisplayRegisters,
+        palette: &'a mut Palette,
+        vram: &'a mut VRAM,
+        oam: &'a mut OAM,
+    ) -> Self {
+        Self {
+            registers,
+            palette,
+            vram,
+            oam,
+            sprite_cache: SpriteCache::new(),
+            palette_cache: [0; 512],
+        }
+    }
+
+    // Snapshot the state that only needs reading once per frame; call before rendering scanline 0
+    pub fn begin_frame(&mut self) {
+        profile::start();
+
+        // bit 15 of a palette entry is unused on the GBA, clear it so it never reads as transparent
+        for i in 0..256 {
+            self.palette_cache[i] = u16::from(self.palette.bg[i]) & 0x7FFF;
+            self.palette_cache[OBJ_PALETTE + i] = u16::from(self.palette.obj[i]) & 0x7FFF;
+        }
+
+        let cache = &mut self.sprite_cache;
+        cache.count = 0;
+        for obj in self.oam.iter() {
+            // todo! rotscale sprites are drawn as normal sprites, without rotation or double size
+            let obj = unsafe { obj.normal };
+            let attr0 = obj.attr0;
+            let attr1 = obj.attr1;
+            let attr2 = obj.attr2;
+            let rot_scale = attr0.rot_scale();
+
+            // without rotscale bit 9 hides the sprite, with rotscale it is the double size flag
+            if !rot_scale && attr0.disable() {
+                continue;
+            }
+            // mode 2 is the OBJ window which is never drawn, mode 3 and shape 3 are prohibited
+            if attr0.mode().as_u8() >= 2 || attr0.shape().as_u8() == 3 {
+                continue;
+            }
+
+            let width = obj.width();
+            let height = obj.height();
+
+            // y wraps at 256, so a sprite is on a line when (line - y) & 0xFF < height
+            let y = attr0.y().as_u8();
+            if y as usize >= SCREEN_HEIGHT && y as usize + height <= 256 {
+                continue;
+            }
+
+            // x is 9 bits and wraps at 512, anything from 240 up starts left of the screen
+            let mut x = attr1.x().as_u16() as i16;
+            if x >= SCREEN_WIDTH as i16 {
+                x -= 512;
+            }
+            if x + width as i16 <= 0 {
+                continue;
+            }
+
+            let mut flags = 0;
+            if !rot_scale && attr1.horiz_flip() {
+                flags |= SPRITE_HFLIP;
+            }
+            if !rot_scale && attr1.vert_flip() {
+                flags |= SPRITE_VFLIP;
+            }
+            let palette = if attr0.enable_256_colour() {
+                flags |= SPRITE_8BPP;
+                OBJ_PALETTE
+            } else {
+                OBJ_PALETTE + attr2.palette().as_usize() * 16
+            };
+
+            cache.sprites[cache.count] = CachedSprite {
+                x,
+                y,
+                width: width as u8,
+                height: height as u8,
+                tile: attr2.tile().as_u16(),
+                palette: palette as u16,
+                prio: attr2.prio().as_u8(),
+                flags,
+            };
+            cache.count += 1;
+        }
+        profile::mark(4);
+    }
 }
 
 impl Video<'_> {
-    // Get the base address of a tile set given the current status of the control registers
-    fn get_tileset_base_addr(&self, offset: usize) -> *const u8 {
-        const TILESET_OFFSET: usize = 16 * 1024;
-        unsafe { self.vram.data().add(offset * TILESET_OFFSET) }
-    }
+    // Draw one line of a text mode BG over the line buffer
+    fn draw_text_bg(&self, bg: usize, scanline: usize, line: &mut [u16; LINE_BUFFER]) {
+        let control = self.registers.bg_control[bg];
+        let offset = self.registers.bg_offset[bg];
+        let (offset_x, offset_y) = (offset.x, offset.y);
 
-    // Get the base address of a tile map given the current status of the control registers
-    fn get_map_base_addr(&self, bg: usize) -> *const u8 {
-        const MAP_OFFSET: usize = 2 * 1024;
-        let bg_control = self.registers.bg_control[bg];
-        unsafe {
-            self.vram
-                .data()
-                .add(bg_control.tilemap_base().as_usize() * MAP_OFFSET)
+        // text BGs always wrap around at the edges of the map
+        let bg_x = offset_x.offset().as_usize() & control.width_mask_pixels();
+        let bg_y = (offset_y.offset().as_usize() + scanline) & control.height_mask_pixels();
+        let tile_y = bg_y >> TILE_SIZE_LOG;
+        let row = bg_y & TILE_MASK;
+
+        // maps are made of 32x32 tile screenblocks of 2K, SC0 SC1 on the top row and SC2 SC3 below
+        const SCREENBLOCK: usize = 0x800;
+        let mut map_row = control.tilemap_base().as_usize() * SCREENBLOCK + (tile_y & 31) * 64;
+        if tile_y >= 32 {
+            map_row += if control.is_wide() { 2 * SCREENBLOCK } else { SCREENBLOCK };
+        }
+        let tileset = control.tileset_base().as_usize() * 0x4000;
+        let width_mask_tiles = control.width_mask_tiles();
+
+        let mut tile_x = bg_x >> TILE_SIZE_LOG;
+        // the first tile starts up to 7 pixels left of the screen, inside the margin
+        let mut pos = LINE_MARGIN - (bg_x & TILE_MASK);
+        let p256 = control.palette_mode();
+
+        for _ in 0..(SCREEN_WIDTH / TILE_SIZE + 1) {
+            let column = tile_x & width_mask_tiles;
+            let mut entry_addr = map_row + (column & 31) * 2;
+            if column >= 32 {
+                entry_addr += SCREENBLOCK;
+            }
+            let entry = self.vram.read_u16(entry_addr) as usize;
+            let tile = entry & 0x3FF;
+            let hflip = entry & (1 << 10) != 0;
+            let tile_row = if entry & (1 << 11) != 0 { TILE_MASK - row } else { row };
+            let dst = (&mut line[pos..pos + TILE_SIZE]).try_into().unwrap();
+
+            if p256 {
+                let addr = tileset + tile * 64 + tile_row * 8;
+                if addr < BG_VRAM_SIZE {
+                    let low = self.vram.read_u32(addr);
+                    let high = self.vram.read_u32(addr + 4);
+                    let palette = (&self.palette_cache[..256]).try_into().unwrap();
+                    draw_tile_row_8bpp(dst, low, high, palette, hflip);
+                }
+            } else {
+                let addr = tileset + tile * 32 + tile_row * 4;
+                if addr < BG_VRAM_SIZE {
+                    let pixels = self.vram.read_u32(addr);
+                    let base = (entry >> 12) * 16;
+                    let palette = (&self.palette_cache[base..base + 16]).try_into().unwrap();
+                    draw_tile_row_4bpp(dst, pixels, palette, hflip);
+                }
+            }
+
+            pos += TILE_SIZE;
+            tile_x += 1;
         }
     }
 
-    fn get_sprite_tile4_line(&self, index: usize, y: usize) -> Tile4Line {
-        // let tiles_ptr = self.get_tileset_base_addr(4) as *const [Tile4; 2048];
-        // let tiles = unsafe { &*tiles_ptr };
-        // tiles[index].get_line(y)
-
-        let base_ptr = self.get_tileset_base_addr(4) as *const Tile4;
-        let ptr = unsafe { base_ptr.add(index) };
-        unsafe { ptr.read().get_line(y) }
-    }
-
-    fn get_sprite_tile8_line(&self, index: usize, y: usize) -> Tile8Line {
-        let tiles_ptr = self.get_tileset_base_addr(4) as *const [Tile8; 1024];
-        let tiles = unsafe { &*tiles_ptr };
-        tiles[index].get_line(y)
-    }
-
-    fn get_bg_tileset_offset(&self, bg: usize) -> usize {
-        let register = self.registers.bg_control[bg];
-        register.tileset_base().as_usize()
-    }
-
-    // Get a specific 4-bit colour depth tile
-    fn get_bg_tile4_line(&self, bg: usize, index: usize, y: usize) -> Tile4Line {
-        let offset = self.get_bg_tileset_offset(bg);
-        let tiles_ptr = self.get_tileset_base_addr(offset) as *const [Tile4; 1024];
-        let tiles = unsafe { &*tiles_ptr };
-        tiles[index].get_line(y)
-    }
-
-    fn get_bg_tile8_line(&self, bg: usize, index: usize, y: usize) -> Tile8Line {
-        let offset = self.get_bg_tileset_offset(bg);
-        let tiles_ptr = self.get_tileset_base_addr(offset) as *const [Tile8; 1024];
-        let tiles = unsafe { &*tiles_ptr };
-        tiles[index].get_line(y)
-    }
-
-    // Get info about a tile map entry assuming this BG is in text mode
-    fn get_map_text_entry(&self, bg: usize, tile_x: usize, tile_y: usize) -> MapTextEntry {
-        let bg_control = self.registers.bg_control[bg];
-        let index = tile_y * bg_control.width_in_tiles() + tile_x;
-
-        let entries_ptr = self.get_map_base_addr(bg) as *const [MapTextEntry; 4096];
-        let entries = unsafe { &*entries_ptr };
-        entries[index]
-    }
-
-    // For a background in a text-based mode, render that scanline
-    fn render_bg_scanline(
+    // Draw one line of a sprite over the line buffer
+    fn draw_sprite(
         &self,
-        bg: usize,
+        sprite: &CachedSprite,
         scanline: usize,
-        colours: &mut [PaletteColour; SCREEN_WIDTH],
-    ) -> PaletteType {
-        let bg_control = self.registers.bg_control[bg];
-        let bg_offset = self.registers.bg_offset[bg];
+        obj_1d: bool,
+        line: &mut [u16; LINE_BUFFER],
+    ) {
+        let mut row = (scanline as u8).wrapping_sub(sprite.y) as usize;
+        if sprite.flags & SPRITE_VFLIP != 0 {
+            row = sprite.height as usize - 1 - row;
+        }
+        let tiles_wide = sprite.width as usize >> TILE_SIZE_LOG;
+        let p256 = sprite.flags & SPRITE_8BPP != 0;
+        let hflip = sprite.flags & SPRITE_HFLIP != 0;
+        // 256 colour tiles take two tile numbers
+        let tile_step = if p256 { 2 } else { 1 };
 
-        // coordinate (bg_x) of the background at screen_x = 0
-        let mut bg_x = {
-            let reg = bg_offset.x;
-            reg.offset().as_usize()
+        // 1D mapping places a sprite's tiles one after another, 2D uses a 32 tile wide matrix
+        let row_stride = if obj_1d { tiles_wide * tile_step } else { 32 };
+        let row_tile = sprite.tile as usize + (row >> TILE_SIZE_LOG) * row_stride;
+        let tile_row = row & TILE_MASK;
+
+        for tile_index_x in 0..tiles_wide {
+            let screen_x = sprite.x as isize + (tile_index_x << TILE_SIZE_LOG) as isize;
+            if screen_x <= -(TILE_SIZE as isize) || screen_x >= SCREEN_WIDTH as isize {
+                continue;
+            }
+            let pos = (screen_x + LINE_MARGIN as isize) as usize;
+            let dst = (&mut line[pos..pos + TILE_SIZE]).try_into().unwrap();
+
+            let source_x = if hflip { tiles_wide - 1 - tile_index_x } else { tile_index_x };
+            let tile = row_tile + source_x * tile_step;
+            let palette = sprite.palette as usize;
+
+            // tile numbers wrap within the 32K OBJ area
+            if p256 {
+                let addr = OBJ_VRAM_BASE + ((tile * 32 + tile_row * 8) & OBJ_VRAM_MASK);
+                let low = self.vram.read_u32(addr);
+                let high = self.vram.read_u32(addr + 4);
+                let palette = (&self.palette_cache[palette..palette + 256]).try_into().unwrap();
+                draw_tile_row_8bpp(dst, low, high, palette, hflip);
+            } else {
+                let addr = OBJ_VRAM_BASE + ((tile * 32 + tile_row * 4) & OBJ_VRAM_MASK);
+                let pixels = self.vram.read_u32(addr);
+                let palette = (&self.palette_cache[palette..palette + 16]).try_into().unwrap();
+                draw_tile_row_4bpp(dst, pixels, palette, hflip);
+            }
+        }
+    }
+
+    // Render a scanline as GBA colours (BGR555)
+    pub fn render_scanline_into(&self, scanline: usize, out: &mut [u16; SCREEN_WIDTH]) {
+        profile::start();
+        let display_control = self.registers.disp_ctrl;
+
+        // forced blank shows a white screen
+        if display_control.forced_blank() {
+            out.fill(0x7FFF);
+            profile::mark(3);
+            return;
+        }
+
+        // colour 0 of BG palette 0 shows wherever every layer is transparent
+        let mut line = [self.palette_cache[0]; LINE_BUFFER];
+
+        // todo! affine BGs (modes 1 and 2) and bitmap modes (3-5) are not drawn
+        let text_bgs: u8 = match display_control.bg_mode().as_u8() {
+            0 => 0b1111,
+            1 => 0b0011,
+            _ => 0,
         };
-        // coordinate (bg_y) of the background at screen_x = 0
-        let bg_y = {
-            let reg = bg_offset.y;
-            reg.offset().as_usize() + scanline
-        };
+        let mut bgs = 0u8;
+        for bg in 0..4 {
+            if display_control.screen_disp_bg_at(bg) {
+                bgs |= 1 << bg;
+            }
+        }
+        bgs &= text_bgs;
+        let bg_control = self.registers.bg_control;
 
-        // keep track of which output screen_x we are generating right now
-        let mut screen_x = 0;
-
-        // iterate through the tiles we need to get to render this scanline
-        for _ in 0..=31 {
-            // x and y index of the tile in the background (not the pixel)
-            // i.e. the coordinate in the background divided by tile size of 8
-            let bg_tile_x = bg_x >> TILE_SIZE_LOG;
-            let bg_tile_y = bg_y >> TILE_SIZE_LOG;
-
-            // y index within that tile we are currently drawing (i.e. 0-7)
-            let tile_y = bg_y & TILE_MASK;
-            let entry = self.get_map_text_entry(bg, bg_tile_x, bg_tile_y);
-            let tile4_line = self.get_bg_tile4_line(bg, entry.tile().as_usize(), tile_y);
-            let tile8_line = self.get_bg_tile8_line(bg, entry.tile().as_usize(), tile_y);
-
-            for tile_x in (bg_x & TILE_MASK)..TILE_SIZE {
-                match bg_control.palette_type() {
-                    PaletteType::P16 => {
-                        colours[screen_x] = PaletteColour {
-                            p16: Palette16Colour::new(
-                                entry.palette(),
-                                tile4_line.get_pixel(tile_x),
-                            ),
-                        }
-                    }
-                    PaletteType::P256 => {
-                        colours[screen_x] = PaletteColour {
-                            p256: Palette256Colour::new(tile8_line.get_tile(tile_x)),
-                        }
-                    }
-                }
-
-                bg_x += 1;
-                if bg_x >= bg_control.width_in_pixels() {
-                    bg_x = bg_control.width_in_pixels();
-                }
-
-                screen_x += 1;
-                if screen_x >= SCREEN_WIDTH {
-                    return bg_control.palette_type();
+        // the sprites on this line, in OAM order
+        let sprites = &self.sprite_cache.sprites[..self.sprite_cache.count];
+        let mut line_sprites = [0u8; 128];
+        let mut line_sprite_count = 0;
+        if display_control.screen_disp_obj() {
+            for (num, sprite) in sprites.iter().enumerate() {
+                if (scanline as u8).wrapping_sub(sprite.y) < sprite.height {
+                    line_sprites[line_sprite_count] = num as u8;
+                    line_sprite_count += 1;
                 }
             }
         }
-        bg_control.palette_type()
+        let line_sprites = &line_sprites[..line_sprite_count];
+        let obj_1d = display_control.obj_char_mapping();
+        profile::mark(0);
+
+        // draw back to front: at each priority BGs go from BG3 to BG0 then sprites go from the
+        // highest OAM number to the lowest, so BG0 beats other BGs and sprites beat BGs on ties
+        // todo! the hardware picks between overlapping sprites by OAM number before priority
+        for prio in (0..4).rev() {
+            for bg in (0..4).rev() {
+                if bgs & (1 << bg) != 0 && bg_control[bg].bg_prio().as_u8() == prio {
+                    self.draw_text_bg(bg, scanline, &mut line);
+                }
+            }
+            profile::mark(1);
+            for &num in line_sprites.iter().rev() {
+                let sprite = &sprites[num as usize];
+                if sprite.prio == prio {
+                    self.draw_sprite(sprite, scanline, obj_1d, &mut line);
+                }
+            }
+            profile::mark(2);
+        }
+
+        out.copy_from_slice(&line[LINE_MARGIN..LINE_MARGIN + SCREEN_WIDTH]);
+        profile::mark(3);
     }
 
     pub fn render_scanline(&self, scanline: usize) -> [DisplayColour; SCREEN_WIDTH] {
-        let display_control = self.registers.disp_ctrl;
-        let bg_control = self.registers.bg_control;
+        let mut line = [0; SCREEN_WIDTH];
+        self.render_scanline_into(scanline, &mut line);
+        line.map(DisplayColour::from)
+    }
+}
 
-        let mut prio_list_raw = [Priority::new(0, false, 0); 128 + 4];
-        let mut prio_item_count = 0;
+// Draw the 8 pixels of a 4 bit tile row, colour 0 is transparent
+#[inline(always)]
+fn draw_tile_row_4bpp(dst: &mut [u16; TILE_SIZE], mut pixels: u32, palette: &[u16; 16], hflip: bool) {
+    if pixels == 0 {
+        return;
+    }
+    for i in 0..TILE_SIZE {
+        let colour = (pixels & 0xF) as usize;
+        if colour != 0 {
+            dst[if hflip { TILE_MASK - i } else { i }] = palette[colour];
+        }
+        pixels >>= 4;
+    }
+}
 
-        let mut sprite_x = [0u16; 240];
-        let mut sprite_widths = [0u8; 240];
-
-        for (num, obj) in self.oam.iter().enumerate() {
-            unsafe {
-                // todo! this does not handle rotscale sprites, it assumes all are normal
-                if obj.normal.is_on_scanline(scanline) {
-                    prio_list_raw[prio_item_count] =
-                        Priority::new(obj.get_prio().as_u8(), false, num as u8);
-                    prio_item_count += 1;
-
-                    sprite_widths[num] = obj.normal.width() as u8;
-                    let attr1 = obj.normal.attr1;
-                    sprite_x[num] = attr1.x().as_u16();
-                }
+// Draw the 8 pixels of an 8 bit tile row given as two words, colour 0 is transparent
+#[inline(always)]
+fn draw_tile_row_8bpp(
+    dst: &mut [u16; TILE_SIZE],
+    low: u32,
+    high: u32,
+    palette: &[u16; 256],
+    hflip: bool,
+) {
+    for (half, mut pixels) in [low, high].into_iter().enumerate() {
+        for i in 0..4 {
+            let colour = (pixels & 0xFF) as usize;
+            if colour != 0 {
+                let x = half * 4 + i;
+                dst[if hflip { TILE_MASK - x } else { x }] = palette[colour];
             }
+            pixels >>= 8;
         }
-        for bg in 0..4 {
-            if display_control.screen_disp_bg_at(bg) {
-                prio_list_raw[prio_item_count] =
-                    Priority::new(bg_control[bg].bg_prio().as_u8(), true, bg as u8);
-                prio_item_count += 1;
-            }
-        }
-
-        let prio_list = &mut prio_list_raw[0..prio_item_count];
-        prio_list.sort_unstable();
-
-        // calculate the sprite pixels
-        let mut sprite_pixels = [DisplayColour::init(0, 0, 0); SCREEN_WIDTH];
-        for item in &mut *prio_list {
-            if !item.is_bg {
-                let sprite_num = item.num as usize;
-                let oam = unsafe { self.oam[sprite_num].normal };
-                let attr0 = oam.attr0;
-                let attr1 = oam.attr1;
-                let attr2 = oam.attr2;
-
-                // location of sprite in pixels in screen-space
-                let sprite_x = attr1.x().as_usize();
-                let sprite_y = attr0.y().as_usize();
-                // sprite dimensions in pixels
-                let sprite_width = oam.width();
-                let sprite_height = oam.height();
-
-                // y in pixels in sprite-space
-                let sprite_tile_y = scanline - sprite_y;
-
-                // x and y in tiles (not pixels) in sprite-space
-                let sprite_tile_index_y = sprite_tile_y >> TILE_SIZE_LOG;
-                for sprite_tile_index_x in 0..(sprite_width >> TILE_SIZE_LOG) {
-                    // linear sprite mapping
-                    let tile_index = attr2.tile().as_usize()
-                        + sprite_tile_index_y * (sprite_width >> TILE_SIZE_LOG)
-                        + sprite_tile_index_x;
-                    let tile4_line =
-                        self.get_sprite_tile4_line(tile_index, sprite_tile_y & TILE_MASK);
-                    for tile_x in 0..TILE_SIZE {
-                        let palette_colour = tile4_line.get_pixel(tile_x).as_usize();
-                        let colour = self
-                            .palette
-                            .get_obj_colour_16(attr2.palette().as_usize(), palette_colour);
-                        let screen_x = sprite_x + (sprite_tile_index_x << TILE_SIZE_LOG) + tile_x;
-                        if screen_x < SCREEN_WIDTH && colour.opaque() {
-                            sprite_pixels[screen_x] = colour;
-                        }
-                    }
-                }
-            }
-        }
-
-        // start every pixel as the default colour if every other layer is transparent
-        let default_colour = self.palette.get_bg_colour_16(0, 0);
-        let mut pixels = [default_colour; SCREEN_WIDTH];
-
-        let mut bg_colours = [[PaletteColour::zeroed(); SCREEN_WIDTH]; 4];
-        let mut bg_palette_modes = [PaletteType::P16; 4];
-        for bg in 0..4 {
-            bg_palette_modes[bg] = self.render_bg_scanline(bg, scanline, &mut bg_colours[bg]);
-        }
-
-        'pixel_loop: for x in 0..SCREEN_WIDTH {
-            for item in &mut *prio_list {
-                if item.is_bg {
-                    let bg = item.num as usize;
-                    let colour = bg_colours[bg][x];
-                    let mode = bg_palette_modes[bg];
-
-                    match mode {
-                        PaletteType::P16 => {
-                            let colour16 = unsafe { colour.p16 };
-                            if !colour16.is_transparent() {
-                                pixels[x] = self.palette.get_bg_colour_16(
-                                    colour16.palette().as_usize(),
-                                    colour16.colour().as_usize(),
-                                );
-                                continue 'pixel_loop;
-                            }
-                        }
-                        PaletteType::P256 => {
-                            let colour256 = unsafe { colour.p256 };
-                            if !colour256.is_transparent() {
-                                pixels[x] =
-                                    self.palette.get_bg_colour_256(colour256.colour as usize);
-                                continue 'pixel_loop;
-                            }
-                        }
-                    }
-                } else {
-                    let colour = sprite_pixels[x];
-                    if colour.opaque() {
-                        pixels[x] = colour;
-                        continue 'pixel_loop;
-                    }
-                }
-            }
-        }
-
-        pixels
     }
 }

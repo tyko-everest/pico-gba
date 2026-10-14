@@ -1,7 +1,7 @@
 #![no_std]
 #![no_main]
 #![allow(static_mut_refs)]
-use common::{registers::*, video::*};
+use common::{profile, registers::*, video::*};
 use core::{
     arch::{asm, naked_asm},
     panic::PanicInfo,
@@ -200,7 +200,7 @@ extern "C" fn hard_fault(frame: &mut ExceptionFrame, other_regs: &mut Reg4_7) {
 
 fn video_loop<DI, MODEL, RST>(
     mut display: Display<DI, MODEL, RST>,
-    video: Video,
+    mut video: Video,
     mut systick: SYST,
 ) -> !
 where
@@ -214,13 +214,26 @@ where
     rtt_init_print!();
     // this is using the 1MHz reference clock right now
     systick.enable_counter();
+    // SysTick is a 24-bit down counter; invert it to count up and shift so it wraps at 2^32
+    profile::set_timer(|| (!SYST::get_current()) << 8);
     const CYCLES_PER_FRAME: u32 = 1_000_000 / 60;
 
     loop {
         let render_start = SYST::get_current();
+        // time spent only inside render_scanline, excluding the display transfer
+        let mut scanline_total: u32 = 0;
+        let mut scanline_max: u32 = 0;
+
+        let prep_start = SYST::get_current();
+        video.begin_frame();
+        scanline_total += prep_start.wrapping_sub(SYST::get_current()) & 0x00FF_FFFF;
 
         for y in 0..SCREEN_HEIGHT {
+            let scanline_start = SYST::get_current();
             let scanline = video.render_scanline(y);
+            let scanline_time = scanline_start.wrapping_sub(SYST::get_current()) & 0x00FF_FFFF;
+            scanline_total += scanline_time;
+            scanline_max = scanline_max.max(scanline_time);
             let colours = scanline.map(|c| c.to_rgb565_format());
             display.set_pixels(
                 0,
@@ -237,8 +250,19 @@ where
         video.registers.disp_status = stat;
 
         let render_end = SYST::get_current();
-        let render_time = render_start - render_end;
+        let render_time = render_start.wrapping_sub(render_end) & 0x00FF_FFFF;
         rprintln!("rendering took {} us", render_time);
+        rprintln!(
+            "render only (begin_frame + scanlines): {} us total, {} us avg/line, {} us max line",
+            scanline_total,
+            scanline_total / SCREEN_HEIGHT as u32,
+            scanline_max
+        );
+        let phases = profile::take();
+        for (name, time) in profile::PHASE_NAMES.iter().zip(phases) {
+            let us = time >> 8;
+            rprintln!("  {:>10}: {:>6} us ({}%)", name, us, us * 100 / scanline_total.max(1));
+        }
 
         if render_time >= CYCLES_PER_FRAME {
             rprintln!("rendering took too long! cannot delay")
@@ -327,12 +351,7 @@ fn main() -> ! {
     // let disp_status = unsafe { NEW_REG.disp_status };
 
     let video = unsafe {
-        Video {
-            registers: &mut NEW_REG,
-            palette: &mut NEW_PALETTE,
-            vram: &mut NEW_VRAM,
-            oam: &mut NEW_OAM,
-        }
+        Video::new(&mut NEW_REG, &mut NEW_PALETTE, &mut NEW_VRAM, &mut NEW_OAM)
     };
 
     display.clear(RgbColor::BLACK);

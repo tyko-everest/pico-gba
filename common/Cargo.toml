@@ -6,3 +6,6 @@ edition = "2024"
 [dependencies]
 arbitrary-int = "2.1.1"
 bilge = "0.3.0"
+
+[features]
+profile = []

@@ -32,10 +32,10 @@ fn main() {
     let mut registers = unsafe { &mut *registers_ptr };
 
     let mut vram_file = File::open(format!("{dump_base}/vram")).unwrap();
-    let mut vram_mem = [0; 96 * 1024];
-    vram_file.read_exact(&mut vram_mem).unwrap();
-    let vram_ptr = vram_mem.as_mut_ptr() as *mut VRAM;
-    let mut vram = unsafe { &mut *vram_ptr };
+    // VRAM is read a word at a time so it needs its own aligned storage
+    let mut vram_mem = Box::new(VRAM::zeroed());
+    vram_file.read_exact(vram_mem.bytes_mut()).unwrap();
+    let mut vram = &mut *vram_mem;
 
     let mut palette_file = File::open(format!("{dump_base}/palette")).unwrap();
     let mut palette_mem = [0; 1024];
@@ -50,17 +50,13 @@ fn main() {
     let mut oam = unsafe { &mut *oam_ptr };
 
     // create the control struct with the setup mock ram contents
-    let video = Video {
-        registers: &mut registers,
-        palette: &mut palette,
-        vram: &mut vram,
-        oam: &mut oam,
-    };
+    let mut video = Video::new(&mut registers, &mut palette, &mut vram, &mut oam);
 
     let mut frame = 0;
     while window.is_open() && !window.is_key_down(Key::Escape) {
         let mut x = 0;
         let mut y = 0;
+        video.begin_frame();
         let mut scanline = video.render_scanline(0);
 
         for i in buffer.iter_mut() {
