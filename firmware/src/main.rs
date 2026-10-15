@@ -3,7 +3,12 @@
 #![allow(static_mut_refs)]
 mod controls;
 
-use common::{profile, registers::*, video::*};
+use common::{
+    jit::{Jit, MapEntry, TRAP},
+    profile,
+    registers::*,
+    video::*,
+};
 use controls::{
     BUTTONS, DPAD_CENTRE, GLYPH_HEIGHT, GLYPH_WIDTH, Glyph, KEYS_RELEASED, PANEL, Rect, Touch,
 };
@@ -56,6 +61,19 @@ const VRAM_LEN: u32 = KB(96);
 const OAM_START: u32 = 0x0700_0000;
 const OAM_LEN: u32 = KB(1);
 
+// Only the start of EWRAM exists, the real 256 KiB does not fit next to everything else. The
+// game's heap grows up from the bottom of it.
+const EWRAM_START: u32 = 0x0200_0000;
+const EWRAM_LEN: u32 = KB(48);
+
+const IWRAM_START: u32 = 0x0300_0000;
+const IWRAM_LEN: u32 = KB(32);
+const IWRAM_MIRRORS: u32 = MB(16);
+
+// Cartridge save memory. Only a small window of it exists and it starts out blank.
+const SRAM_START: u32 = 0x0E00_0000;
+const SRAM_LEN: u32 = KB(4);
+
 const ROM_START: u32 = 0x0800_0000;
 const ROM_LEN: u32 = MB(20);
 
@@ -80,9 +98,98 @@ fn keyinput_register() -> *mut u16 {
 static mut NEW_PALETTE: Palette = Palette::zeroed();
 static mut NEW_VRAM: VRAM = VRAM::zeroed();
 static mut NEW_OAM: OAM = OAM::zeroed();
+static mut NEW_SRAM: [u8; SRAM_LEN as usize] = [0xFF; SRAM_LEN as usize];
+static mut NEW_EWRAM: [u32; EWRAM_LEN as usize / 4] = [0; EWRAM_LEN as usize / 4];
+static mut NEW_IWRAM: [u32; IWRAM_LEN as usize / 4] = [0; IWRAM_LEN as usize / 4];
 
 // part of the rom loaded in
-const ROM_CODE: &[u8] = include_bytes!("pong.gba");
+// The ROM runs from where it is stored, so it has to keep the GBA's word alignment or every
+// pc relative load in it reads the wrong word
+#[repr(C, align(4))]
+struct Aligned<T: ?Sized>(T);
+static ROM_ALIGNED: &Aligned<[u8]> = &Aligned(*include_bytes!("Google-Dino-Advance.gba"));
+static ROM_CODE: &[u8] = &ROM_ALIGNED.0;
+
+// Translated ARM code. The game's ARM mode code cannot run on the Cortex-M0+, the fault handler
+// translates it to Thumb the first time it is reached and runs it from this cache.
+const JIT_CODE_HW: usize = 12 * 1024;
+const JIT_MAP_LEN: usize = 1024;
+
+#[repr(C, align(4))]
+struct JitCode([u16; JIT_CODE_HW]);
+
+static mut JIT_CODE: JitCode = JitCode([0; JIT_CODE_HW]);
+static mut JIT_MAP: [MapEntry; JIT_MAP_LEN] = [Jit::empty_map_entry(); JIT_MAP_LEN];
+static mut JIT: Option<Jit<'static>> = None;
+
+fn jit_init() {
+    unsafe {
+        let base = JIT_CODE.0.as_ptr() as u32;
+        JIT = Some(Jit::new(&mut JIT_CODE.0, base, &mut JIT_MAP));
+    }
+}
+
+// the GBA address of something stored in the ROM or IWRAM copies, for code that runs in place
+fn native_to_gba(native: u32) -> Option<u32> {
+    let rom = ROM_CODE.as_ptr() as u32;
+    let iwram = unsafe { &raw const NEW_IWRAM as u32 };
+    if native >= rom && native < rom + ROM_CODE.len() as u32 {
+        Some(native - rom + ROM_START)
+    } else if native >= iwram && native < iwram + IWRAM_LEN {
+        Some(native - iwram + IWRAM_START)
+    } else {
+        None
+    }
+}
+
+// Reads a word of GBA memory for the translator
+fn gba_read_word(addr: u32) -> Option<u32> {
+    fix_addr(addr).map(|native| unsafe { core::ptr::read_volatile(native as *const u32) })
+}
+
+// Handles the faults caused by translated code: unresolved exits and jumps into ARM code.
+// Returns true when the fault was dealt with.
+fn jit_fault(frame: &mut ExceptionFrame) -> bool {
+    let Some(jit) = (unsafe { JIT.as_mut() }) else {
+        return false;
+    };
+    let pc = frame.pc();
+    const THUMB_BIT: u32 = 1 << 24;
+    let target = if jit.contains(pc) && jit.halfword(pc) == TRAP {
+        jit.resolve_slot(pc, &mut gba_read_word)
+    } else if native_to_gba(pc & !1).is_some() && unsafe { *((pc & !1) as *const u16) } == 0x4778 {
+        // bx pc, the Thumb to ARM veneer. Cortex-M0+ does not allow it, the ARM code follows
+        // the next instruction.
+        match native_to_gba((pc + 4) & !3) {
+            Some(gba) => jit.translate(gba, &mut gba_read_word),
+            None => return false,
+        }
+    } else if frame.xpsr() & THUMB_BIT == 0 {
+        // a bx to an even address, which is ARM code. ROM code runs from where it is stored, so
+        // the address may be in the flash copy of the ROM.
+        let gba = match native_to_gba(pc) {
+            Some(gba) => gba,
+            None if fix_addr(pc).is_some() => pc,
+            None => return false,
+        };
+        jit.translate(gba, &mut gba_read_word)
+    } else {
+        return false;
+    };
+    match target {
+        Ok(thumb) => unsafe {
+            frame.set_pc(thumb & !1);
+            // the stacked status register must be in Thumb state for the exception return
+            let raw = frame as *mut ExceptionFrame as *mut u32;
+            *raw.add(7) |= THUMB_BIT;
+            true
+        },
+        Err(e) => {
+            rprintln!("cannot translate ARM code at 0x{:x}: {:?}", pc, e);
+            panic!()
+        }
+    }
+}
 
 #[panic_handler]
 fn panic_handler(_info: &PanicInfo) -> ! {
@@ -116,6 +223,31 @@ extern "C" fn HardFault() {
     );
 }
 
+// EWRAM is 256 KiB that repeats up to IWRAM, far more than there is RAM for. Games touch only part
+// of it, so it is handed out in small pages the first time a page is used.
+const EWRAM_PAGE: u32 = 512;
+const EWRAM_MIRROR: u32 = KB(256);
+
+static mut EWRAM_TABLE: [u8; (EWRAM_MIRROR / EWRAM_PAGE) as usize] =
+    [0xFF; (EWRAM_MIRROR / EWRAM_PAGE) as usize];
+static mut EWRAM_PAGES_USED: u32 = 0;
+
+fn ewram_native(gba_addr: u32) -> Option<u32> {
+    unsafe {
+        let offset = (gba_addr - EWRAM_START) & (EWRAM_MIRROR - 1);
+        let page = (offset / EWRAM_PAGE) as usize;
+        if EWRAM_TABLE[page] == 0xFF {
+            if EWRAM_PAGES_USED * EWRAM_PAGE >= EWRAM_LEN {
+                return None;
+            }
+            EWRAM_TABLE[page] = EWRAM_PAGES_USED as u8;
+            EWRAM_PAGES_USED += 1;
+        }
+        let pool = &raw const NEW_EWRAM as u32;
+        Some(pool + EWRAM_TABLE[page] as u32 * EWRAM_PAGE + offset % EWRAM_PAGE)
+    }
+}
+
 #[allow(static_mut_refs)]
 fn fix_addr(gba_addr: u32) -> Option<u32> {
     if gba_addr >= REG_START && gba_addr < REG_START + REG_LEN {
@@ -130,6 +262,16 @@ fn fix_addr(gba_addr: u32) -> Option<u32> {
     } else if gba_addr >= OAM_START && gba_addr < OAM_START + OAM_LEN {
         let new_oam_start = unsafe { &NEW_OAM as *const OAM as u32 };
         Some(gba_addr + new_oam_start - OAM_START)
+    } else if gba_addr >= SRAM_START && gba_addr < SRAM_START + SRAM_LEN {
+        let new_sram_start = unsafe { &raw const NEW_SRAM as u32 };
+        Some(gba_addr + new_sram_start - SRAM_START)
+    } else if gba_addr >= EWRAM_START && gba_addr < IWRAM_START {
+        ewram_native(gba_addr)
+    } else if gba_addr >= IWRAM_START && gba_addr < IWRAM_START + IWRAM_MIRRORS {
+        // the 32 KiB of IWRAM repeats all the way up to the IO registers, games use the mirror
+        // at the top for the interrupt vector
+        let new_iwram_start = unsafe { &raw const NEW_IWRAM as u32 };
+        Some(new_iwram_start + ((gba_addr - IWRAM_START) & (IWRAM_LEN - 1)))
     } else if gba_addr >= ROM_START && gba_addr < ROM_START + ROM_LEN {
         let new_rom_start = ROM_CODE.as_ptr() as u32;
         Some(gba_addr + new_rom_start - ROM_START)
@@ -138,13 +280,136 @@ fn fix_addr(gba_addr: u32) -> Option<u32> {
     }
 }
 
+// GBA BIOS calls are SWIs, which the RP2040 runs natively as SVC. The BIOS is not present, so
+// the SVCall exception implements the calls the game uses.
+#[unsafe(no_mangle)]
+#[unsafe(naked)]
+extern "C" fn SVCall() {
+    // r0 is the stacked exception frame. r4 is pushed only to keep the stack 8 byte aligned.
+    naked_asm!(
+        "mov r0, sp",
+        "push {{r4, lr}}",
+        "bl {func}",
+        "pop {{r4, pc}}",
+        func = sym svc_call
+    );
+}
+
+// Registers hold GBA addresses unless a faulting load or store already swapped in the native
+// address, so anything that is not a GBA address is assumed to be native already
+fn native_addr(addr: u32) -> u32 {
+    fix_addr(addr).unwrap_or(addr)
+}
+
+// SWI 0x0B CpuSet and SWI 0x0C CpuFastSet, a memcpy/memset in 16 or 32 bit units.
+// r0 = source, r1 = destination, r2 = bits 0-20 unit count, bit 24 fill, bit 26 32 bit (CpuSet).
+// CpuFastSet is always 32 bit and rounds the count up to a multiple of 8.
+fn cpu_set(frame: &ExceptionFrame, fast: bool) {
+    let control = frame.r2();
+    let mut count = (control & 0x1F_FFFF) as usize;
+    let fill = control & (1 << 24) != 0;
+    let word = fast || control & (1 << 26) != 0;
+    if fast {
+        count = (count + 7) & !7;
+    }
+    if count == 0 {
+        return;
+    }
+
+    let align = if word { !3 } else { !1 };
+    let (src, dst) = (frame.r0() & align, frame.r1() & align);
+    let unit = if word { 4 } else { 2 };
+
+    // Every unit is translated on its own, the memory behind an address range is not contiguous
+    // (EWRAM is paged). Volatile so the loop is not turned into a memcpy call.
+    unsafe {
+        let first = native_addr(src);
+        let value_at = |i: usize| {
+            let from = native_addr(src + if fill { 0 } else { i as u32 * unit });
+            let from = if fill && i == 0 { first } else { from };
+            if word {
+                (from as *const u32).read_volatile()
+            } else {
+                (from as *const u16).read_volatile() as u32
+            }
+        };
+        for i in 0..count {
+            let value = value_at(i);
+            let to = native_addr(dst + i as u32 * unit);
+            if word {
+                (to as *mut u32).write_volatile(value);
+            } else {
+                (to as *mut u16).write_volatile(value as u16);
+            }
+        }
+    }
+}
+
+// pc, call number and r0-r2 of the last BIOS call, for debugging
+static mut LAST_SVC: [u32; 5] = [0; 5];
+static mut SVC_COUNTS: [u32; 16] = [0; 16];
+static mut FAULT_COUNT: u32 = 0;
+
+#[unsafe(no_mangle)]
+extern "C" fn svc_call(frame: &mut ExceptionFrame) {
+    // the stacked pc is the instruction after the svc, whose low byte is the BIOS call number
+    let instr = unsafe { *((frame.pc() - 2) as *const u16) };
+    unsafe {
+        SVC_COUNTS[(instr & 0xF) as usize] += 1;
+        LAST_SVC = [
+            frame.pc(),
+            instr as u32 & 0xFF,
+            frame.r0(),
+            frame.r1(),
+            frame.r2(),
+        ];
+    }
+    match instr & 0xFF {
+        // Div: r0 = quotient, r1 = remainder, r3 = abs(quotient)
+        0x06 => {
+            let (num, den) = (frame.r0() as i32, frame.r1() as i32);
+            // the real BIOS hangs on a zero divisor, here the registers are left alone
+            if den != 0 {
+                let quotient = num.wrapping_div(den);
+                let remainder = num.wrapping_rem(den);
+                unsafe {
+                    frame.set_r0(quotient as u32);
+                    frame.set_r1(remainder as u32);
+                    frame.set_r3(quotient.unsigned_abs());
+                }
+            }
+        }
+        0x0B => cpu_set(frame, false),
+        0x0C => cpu_set(frame, true),
+        // Halt: nothing to save power on
+        0x02 => {}
+        // IntrWait(discard in r0, flags in r1)
+        0x04 => intr_wait(frame, frame.r0() != 0, frame.r1() as u16),
+        // VBlankIntrWait
+        0x05 => intr_wait(frame, true, 1),
+        // nothing else handled currently
+        n => {
+            rprintln!("unhandled BIOS call 0x{:x} at 0x{:x}", n, frame.pc());
+            panic!()
+        }
+    }
+    // this is a good place to let an interrupt in, a game waiting in a loop of calls would
+    // otherwise keep the exception tail-chaining
+    try_inject(frame);
+}
+
 #[unsafe(no_mangle)]
 extern "C" fn hard_fault(frame: &mut ExceptionFrame, other_regs: &mut Reg4_7) {
     static mut HF_COUNT: usize = 0;
+    unsafe { FAULT_COUNT += 1 };
     let hf_count: usize;
     unsafe {
         HF_COUNT += 1;
         hf_count = HF_COUNT;
+    }
+
+    if jit_fault(frame) {
+        return;
     }
 
     if let Some(pc) = fix_addr(frame.pc()) {
@@ -178,47 +443,360 @@ extern "C" fn hard_fault(frame: &mut ExceptionFrame, other_regs: &mut Reg4_7) {
         || instr >> 11 == 0b10001   // LDRH imm
         || instr >> 9 == 0b0101101  // LDRH reg
         || instr >> 9 == 0b0101011  // LDRSB reg
-        || instr >> 9 == 0b0101111
-        // LDRSH reg
+        || instr >> 9 == 0b0101111  // LDRSH reg
+        || instr >> 11 == 0b11000   // STMIA
+        || instr >> 11 == 0b11001
+        // LDMIA
     ) {
         // nothing else handled currently
+        rprintln!("cannot handle opcode 0x{:x}", instr);
         panic!()
     }
 
-    // this register is always encoded here
-    let base_reg = (instr >> 3) & 0b111;
-
-    let base_addr: u32;
-    match base_reg {
-        0 => base_addr = frame.r0(),
-        1 => base_addr = frame.r1(),
-        2 => base_addr = frame.r2(),
-        3 => base_addr = frame.r3(),
-        4 => base_addr = other_regs.r4,
-        5 => base_addr = other_regs.r5,
-        6 => base_addr = other_regs.r6,
-        7 => base_addr = other_regs.r7,
-        _ => unreachable!(),
+    let get = |frame: &ExceptionFrame, other: &Reg4_7, reg: u16| -> u32 {
+        match reg {
+            0 => frame.r0(),
+            1 => frame.r1(),
+            2 => frame.r2(),
+            3 => frame.r3(),
+            4 => other.r4,
+            5 => other.r5,
+            6 => other.r6,
+            _ => other.r7,
+        }
     };
-
-    let Some(new_base_addr) = fix_addr(base_addr) else {
-        // we did not know how to translate this address, not recoverable
+    let set = |frame: &mut ExceptionFrame, other: &mut Reg4_7, reg: u16, value: u32| unsafe {
+        match reg {
+            0 => frame.set_r0(value),
+            1 => frame.set_r1(value),
+            2 => frame.set_r2(value),
+            3 => frame.set_r3(value),
+            4 => other.r4 = value,
+            5 => other.r5 = value,
+            6 => other.r6 = value,
+            _ => other.r7 = value,
+        }
+    };
+    let fail = |frame: &ExceptionFrame, other: &Reg4_7, address: u32| -> ! {
+        rprintln!("last svc {:x?}", unsafe { LAST_SVC });
+        rprintln!(
+            "r0-r7 {:x} {:x} {:x} {:x} {:x} {:x} {:x} {:x}",
+            frame.r0(),
+            frame.r1(),
+            frame.r2(),
+            frame.r3(),
+            { other.r4 },
+            { other.r5 },
+            { other.r6 },
+            { other.r7 }
+        );
+        rprintln!(
+            "cannot handle address 0x{:x} (instr 0x{:x}, pc 0x{:x}, lr 0x{:x}, rom offset 0x{:x}, rn 0x{:x}, rm 0x{:x})",
+            address,
+            instr,
+            frame.pc(),
+            frame.lr(),
+            diff,
+            get(frame, other, (instr >> 3) & 7),
+            get(frame, other, (instr >> 6) & 7)
+        );
         panic!()
     };
 
-    unsafe {
-        match base_reg {
-            0 => frame.set_r0(new_base_addr),
-            1 => frame.set_r1(new_base_addr),
-            2 => frame.set_r2(new_base_addr),
-            3 => frame.set_r3(new_base_addr),
-            4 => other_regs.r4 = new_base_addr,
-            5 => other_regs.r5 = new_base_addr,
-            6 => other_regs.r6 = new_base_addr,
-            7 => other_regs.r7 = new_base_addr,
-            _ => unreachable!(),
+    // The access is done here and the registers keep the GBA addresses: code compares pointers
+    // it loaded from memory against ones it computed, a loop that copies up to an end pointer
+    // never ends when the two are different kinds. That goes for ROM pointers too.
+    let block = instr >> 12 == 0b1100;
+    let reg_offset = instr >> 12 == 0b0101;
+    let rn = if block {
+        (instr >> 8) & 7
+    } else {
+        (instr >> 3) & 7
+    };
+    let rm = (instr >> 6) & 7;
+    let base_value = get(frame, other_regs, rn);
+
+    if block {
+        let load = instr & (1 << 11) != 0;
+        let list = instr & 0xFF;
+        let mut address = base_value;
+        for r in 0..8u16 {
+            if list & (1 << r) == 0 {
+                continue;
+            }
+            let Some(native) = fix_addr(address) else {
+                fail(frame, other_regs, address)
+            };
+            if load {
+                let value = unsafe { read_native(native, 4) };
+                set(frame, other_regs, r, value);
+            } else {
+                let value = get(frame, other_regs, r);
+                unsafe { write_native(native, 4, value) };
+            }
+            address = address.wrapping_add(4);
+        }
+        // a loaded base register keeps the loaded value
+        if !(load && list & (1 << rn) != 0) {
+            set(frame, other_regs, rn, address);
+        }
+    } else {
+        let rt = instr & 7;
+        // size in bytes, whether it loads, whether it sign extends
+        let (size, load, signed, address) = if reg_offset {
+            let address = get(frame, other_regs, rn).wrapping_add(get(frame, other_regs, rm));
+            match (instr >> 9) & 7 {
+                0b000 => (4, false, false, address),
+                0b001 => (2, false, false, address),
+                0b010 => (1, false, false, address),
+                0b011 => (1, true, true, address),
+                0b100 => (4, true, false, address),
+                0b101 => (2, true, false, address),
+                0b110 => (1, true, false, address),
+                _ => (2, true, true, address),
+            }
+        } else {
+            let imm = ((instr >> 6) & 0x1F) as u32;
+            let base = get(frame, other_regs, rn);
+            let load = instr & (1 << 11) != 0;
+            match instr >> 12 {
+                0b0110 => (4, load, false, base.wrapping_add(imm * 4)),
+                0b0111 => (1, load, false, base.wrapping_add(imm)),
+                _ => (2, load, false, base.wrapping_add(imm * 2)),
+            }
+        };
+        let Some(native) = fix_addr(address) else {
+            fail(frame, other_regs, address)
+        };
+        if load {
+            let mut value = unsafe { read_native(native, size) };
+            if signed {
+                value = match size {
+                    1 => value as u8 as i8 as i32 as u32,
+                    _ => value as u16 as i16 as i32 as u32,
+                };
+            }
+            set(frame, other_regs, rt, value);
+        } else {
+            let value = get(frame, other_regs, rt);
+            unsafe { write_native(native, size, value) };
         }
     }
+    // the instruction is done, continue after it
+    unsafe { frame.set_pc(frame.pc() + 2) };
+}
+
+// Memory accesses on behalf of the faulting code. They go a byte at a time when unaligned, a
+// misaligned access would fault inside the fault handler.
+unsafe fn read_native(native: u32, size: u32) -> u32 {
+    unsafe {
+        if native % size == 0 {
+            match size {
+                1 => core::ptr::read_volatile(native as *const u8) as u32,
+                2 => core::ptr::read_volatile(native as *const u16) as u32,
+                _ => core::ptr::read_volatile(native as *const u32),
+            }
+        } else {
+            let mut value = 0;
+            for i in 0..size {
+                value |= (core::ptr::read_volatile((native + i) as *const u8) as u32) << (8 * i);
+            }
+            value
+        }
+    }
+}
+
+unsafe fn write_native(native: u32, size: u32, value: u32) {
+    unsafe {
+        if native % size == 0 {
+            match size {
+                1 => core::ptr::write_volatile(native as *mut u8, value as u8),
+                2 => core::ptr::write_volatile(native as *mut u16, value as u16),
+                _ => core::ptr::write_volatile(native as *mut u32, value),
+            }
+        } else {
+            for i in 0..size {
+                core::ptr::write_volatile((native + i) as *mut u8, (value >> (8 * i)) as u8);
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Interrupts
+//
+// The display loop on core 1 raises VBlank, which reaches core 0 as a SIO FIFO interrupt. The
+// handler there does not run the game's interrupt handler itself, it makes the interrupted code
+// call a trampoline instead: the game's handler can be translated ARM code and may fault, and the
+// game expects it to run like any other code. The trampoline saves every register, calls the
+// handler whose address the game stored at the top of IWRAM, and resumes where it was.
+
+const IME_OFFSET: usize = 0x208;
+const IE_OFFSET: usize = 0x200;
+const IF_OFFSET: usize = 0x202;
+const DISPSTAT_OFFSET: usize = 0x004;
+const IRQ_VECTOR_OFFSET: usize = 0x7FFC;
+
+// where the game was at the last few interrupts, for debugging
+static mut PC_SAMPLES: [u32; 8] = [0; 8];
+static mut PC_SAMPLE_COUNT: usize = 0;
+static mut IN_IRQ: bool = false;
+static mut IRQ_RETURN_PC: u32 = 0;
+
+fn io_reg(offset: usize) -> *mut u16 {
+    unsafe { (&raw mut NEW_REG as *mut u8).add(offset) as *mut u16 }
+}
+
+// Called by core 1 when VBlank starts
+fn raise_vblank_irq() {
+    unsafe {
+        if core::ptr::read_volatile(io_reg(DISPSTAT_OFFSET)) & (1 << 3) == 0 {
+            return;
+        }
+        let flags = io_reg(IF_OFFSET);
+        core::ptr::write_volatile(flags, core::ptr::read_volatile(flags) | 1);
+        (*pac::SIO::ptr()).fifo_wr().write(|w| w.bits(1));
+    }
+}
+
+#[unsafe(no_mangle)]
+#[unsafe(naked)]
+extern "C" fn SIO_IRQ_PROC0() {
+    // r0 is the frame the hardware stacked, the interrupted code runs in thread mode
+    naked_asm!(
+        "mov r0, sp",
+        "push {{r4, lr}}",
+        "bl {func}",
+        "pop {{r4, pc}}",
+        func = sym irq_inject
+    );
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn irq_inject(frame: &mut ExceptionFrame) {
+    unsafe {
+        let sio = &*pac::SIO::ptr();
+        while sio.fifo_st().read().vld().bit() {
+            let _ = sio.fifo_rd().read();
+        }
+        PC_SAMPLES[PC_SAMPLE_COUNT % 8] = frame.pc();
+        PC_SAMPLE_COUNT += 1;
+    }
+    try_inject(frame);
+}
+
+// If an enabled interrupt is pending, make the code that frame returns to run the game's handler
+// first
+fn try_inject(frame: &mut ExceptionFrame) {
+    unsafe {
+        if IN_IRQ {
+            return;
+        }
+        let enabled = core::ptr::read_volatile(io_reg(IME_OFFSET)) & 1 != 0;
+        let pending = core::ptr::read_volatile(io_reg(IE_OFFSET))
+            & core::ptr::read_volatile(io_reg(IF_OFFSET));
+        if !enabled || pending == 0 || irq_vector() == 0 {
+            return;
+        }
+        IN_IRQ = true;
+        // the return has to be a Thumb address
+        IRQ_RETURN_PC = frame.pc() | 1;
+        frame.set_pc(irq_trampoline as usize as u32 & !1);
+    }
+}
+
+// The BIOS keeps the flags of the interrupts that happened in the last word but one of IWRAM,
+// the game's handler sets them
+fn bios_if() -> *mut u16 {
+    unsafe { (&raw mut NEW_IWRAM as *mut u8).add(0x7FF8) as *mut u16 }
+}
+
+static mut INTR_WAITING: bool = false;
+
+// IntrWait and VBlankIntrWait. The BIOS halts until one of the interrupts in mask has been
+// handled. Waiting inside this exception would keep the interrupt away from the game, so the
+// call is run again until it is done, the interrupt happens in between.
+fn intr_wait(frame: &mut ExceptionFrame, discard: bool, mask: u16) {
+    unsafe {
+        let flags = bios_if();
+        if !INTR_WAITING {
+            INTR_WAITING = true;
+            core::ptr::write_volatile(io_reg(IME_OFFSET), 1);
+            if discard {
+                core::ptr::write_volatile(flags, core::ptr::read_volatile(flags) & !mask);
+            }
+        }
+        if core::ptr::read_volatile(flags) & mask != 0 {
+            core::ptr::write_volatile(flags, core::ptr::read_volatile(flags) & !mask);
+            INTR_WAITING = false;
+        } else {
+            frame.set_pc(frame.pc() - 2);
+        }
+    }
+}
+
+// the game's interrupt handler, stored in the last word of IWRAM
+extern "C" fn irq_vector() -> u32 {
+    unsafe {
+        core::ptr::read_volatile(
+            (&raw const NEW_IWRAM as *const u8).add(IRQ_VECTOR_OFFSET) as *const u32
+        )
+    }
+}
+
+extern "C" fn irq_return_pc() -> u32 {
+    unsafe { IRQ_RETURN_PC }
+}
+
+// The game's handler has acknowledged what it handled, the flag register is plain memory here so
+// the VBlank flag is cleared for it.
+extern "C" fn irq_finish() {
+    unsafe {
+        let flags = io_reg(IF_OFFSET);
+        core::ptr::write_volatile(flags, core::ptr::read_volatile(flags) & !1);
+        IN_IRQ = false;
+    }
+}
+
+#[unsafe(naked)]
+extern "C" fn irq_trampoline() {
+    // Runs in thread mode with every register as the interrupted code left it, only the pc is
+    // different. The stack ends up as: r12, flags, lr, r8-r11, r0-r7, return pc.
+    naked_asm!(
+        "sub sp, #4",
+        "push {{r0-r7}}",
+        "mov r0, r8",
+        "mov r1, r9",
+        "mov r2, r10",
+        "mov r3, r11",
+        "push {{r0-r3}}",
+        "mov r0, r12",
+        "mrs r1, apsr",
+        "mov r2, lr",
+        "push {{r0-r2}}",
+        "bl {ret_pc}",
+        "str r0, [sp, #60]",
+        "bl {vector}",
+        "mov r1, r0",
+        "movs r0, #1",
+        "lsls r0, r0, #26",
+        "blx r1",
+        "bl {finish}",
+        "pop {{r0-r2}}",
+        "mov r12, r0",
+        "msr apsr_nzcvq, r1",
+        "mov lr, r2",
+        "pop {{r4-r7}}",
+        "mov r8, r4",
+        "mov r9, r5",
+        "mov r10, r6",
+        "mov r11, r7",
+        "pop {{r0-r7}}",
+        "pop {{pc}}",
+        ret_pc = sym irq_return_pc,
+        vector = sym irq_vector,
+        finish = sym irq_finish,
+    );
 }
 
 // The display is the only device on the SPI bus, so its CS pin is held low for good and the
@@ -530,6 +1108,9 @@ where
 
             unsafe { core::ptr::write_volatile(vert_counter, line as u16) };
             set_display_status(disp_status, line, false);
+            if line == SCREEN_HEIGHT {
+                raise_vblank_irq();
+            }
 
             if line == 0 {
                 let prep_start = SYST::get_current();
@@ -606,6 +1187,24 @@ where
                 render_total += render_time;
                 render_max = render_max.max(render_time);
                 if frames == REPORT_FRAMES {
+                    unsafe {
+                        rprintln!(
+                            "ewram pages {}, faults {}, svc counts {:?}, jit blocks {} ({} bytes), last svc {:x?}, game pc samples {:x?} (count {}), dispcnt {:x} dispstat {:x} ie {:x} if {:x} ime {:x}",
+                            EWRAM_PAGES_USED,
+                            FAULT_COUNT,
+                            SVC_COUNTS,
+                            JIT.as_ref().map(|j| j.block_count()).unwrap_or(0),
+                            JIT.as_ref().map(|j| j.code_used_bytes()).unwrap_or(0),
+                            LAST_SVC,
+                            PC_SAMPLES,
+                            PC_SAMPLE_COUNT,
+                            core::ptr::read_volatile(io_reg(0)),
+                            core::ptr::read_volatile(io_reg(DISPSTAT_OFFSET)),
+                            core::ptr::read_volatile(io_reg(IE_OFFSET)),
+                            core::ptr::read_volatile(io_reg(IF_OFFSET)),
+                            core::ptr::read_volatile(io_reg(IME_OFFSET))
+                        );
+                    }
                     let report_time = elapsed(report_start);
                     report_start = SYST::get_current();
                     rprintln!(
@@ -751,6 +1350,7 @@ fn main() -> ! {
     let (spi_device, dc_pin) = di.release();
     let dma = pac.DMA.split(&mut pac.RESETS);
 
+    jit_init();
     let mut mc = multicore::Multicore::new(&mut pac.PSM, &mut pac.PPB, &mut sio.fifo);
     let cores = mc.cores();
     let core1 = &mut cores[1];
@@ -775,6 +1375,8 @@ fn main() -> ! {
             })
             .unwrap();
     };
+
+    unsafe { cortex_m::peripheral::NVIC::unmask(pac::Interrupt::SIO_IRQ_PROC0) };
 
     let rom_addr = ROM_CODE.as_ptr() as u32;
     let thumb_start = rom_addr + 0xdc | 1; // last bit needs to be 1 for thumb mode

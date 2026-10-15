@@ -1,0 +1,16 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "build firmware (release)",
+            "type": "shell",
+            "command": "cargo build --release",
+            "options": {
+                // the thumbv6m target is set by firmware/.cargo/config.toml
+                "cwd": "${workspaceFolder}/firmware"
+            },
+            "problemMatcher": "$rustc",
+            "group": "build"
+        }
+    ]
+}

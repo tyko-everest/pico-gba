@@ -1,3 +1,10 @@
 {
     "nixEnvSelector.nixFile": "${workspaceFolder}/shell.nix",
+    "python-envs.pythonProjects": [
+        {
+            "path": "firmware/src",
+            "envManager": "ms-python.python:venv",
+            "packageManager": "ms-python.python:pip"
+        }
+    ],
 }

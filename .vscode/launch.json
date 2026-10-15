@@ -5,7 +5,7 @@
             "name": "pico core 0",
             "type": "probe-rs-debug",
             "request": "launch",
-            //"preLaunchTask": "rust: cargo build",
+            "preLaunchTask": "build firmware (release)",
             "flashingConfig": {
                 "flashingEnabled": true,
                 "haltAfterReset": false
