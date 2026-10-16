@@ -122,10 +122,37 @@ static mut JIT_CODE: JitCode = JitCode([0; JIT_CODE_HW]);
 static mut JIT_MAP: [MapEntry; JIT_MAP_LEN] = [Jit::empty_map_entry(); JIT_MAP_LEN];
 static mut JIT: Option<Jit<'static>> = None;
 
+// Translated loads and stores find the native address of a GBA address through this table,
+// indexed by the top byte: an even entry is an offset to add, an odd one is a page table (minus
+// the bit) for the regions that are paged or mirrored. 0 leaves the address alone, it faults.
+static mut JIT_REGIONS: [u32; 256] = [0; 256];
+// IWRAM in 512 byte pages, repeated so the table covers the 256 KiB the lookup indexes
+static mut IWRAM_PAGE_TABLE: [u32; PAGE_TABLE_LEN] = [0; PAGE_TABLE_LEN];
+
+#[allow(static_mut_refs)]
 fn jit_init() {
     unsafe {
+        let iwram = &raw const NEW_IWRAM as u32;
+        for (i, page) in IWRAM_PAGE_TABLE.iter_mut().enumerate() {
+            *page = iwram + (i as u32 * EWRAM_PAGE) % IWRAM_LEN;
+        }
+        let flat = |gba: u32, native: u32| native.wrapping_sub(gba);
+        JIT_REGIONS[0x02] = EWRAM_PAGE_TABLE.as_ptr() as u32 | 1;
+        JIT_REGIONS[0x03] = IWRAM_PAGE_TABLE.as_ptr() as u32 | 1;
+        JIT_REGIONS[0x04] = flat(REG_START, &raw const NEW_REG as u32);
+        JIT_REGIONS[0x05] = flat(PALETTE_START, &raw const NEW_PALETTE as u32);
+        JIT_REGIONS[0x06] = flat(VRAM_START, &raw const NEW_VRAM as u32);
+        JIT_REGIONS[0x07] = flat(OAM_START, &raw const NEW_OAM as u32);
+        // the 32 MiB of ROM space and its two wait state mirrors
+        let rom = ROM_CODE.as_ptr() as u32;
+        for top in 0x08..0x0E {
+            JIT_REGIONS[top] = flat(ROM_START + (top as u32 - 0x08) / 2 * MB(32), rom);
+        }
+        JIT_REGIONS[0x0E] = flat(SRAM_START, &raw const NEW_SRAM as u32);
+
         let base = JIT_CODE.0.as_ptr() as u32;
-        JIT = Some(Jit::new(&mut JIT_CODE.0, base, &mut JIT_MAP));
+        let regions = JIT_REGIONS.as_ptr() as u32;
+        JIT = Some(Jit::new(&mut JIT_CODE.0, base, &mut JIT_MAP, regions));
     }
 }
 
@@ -142,9 +169,18 @@ fn native_to_gba(native: u32) -> Option<u32> {
     }
 }
 
-// Reads a word of GBA memory for the translator
+// Reads a word of GBA memory for the translator. It also reads the region and page tables
+// (native addresses) to resolve loads and stores through known constant addresses.
+#[allow(static_mut_refs)]
 fn gba_read_word(addr: u32) -> Option<u32> {
-    fix_addr(addr).map(|native| unsafe { core::ptr::read_volatile(native as *const u32) })
+    let table = |start: u32, len: usize| addr >= start && addr < start + 4 * len as u32;
+    let native = unsafe {
+        table(JIT_REGIONS.as_ptr() as u32, JIT_REGIONS.len())
+            || table(IWRAM_PAGE_TABLE.as_ptr() as u32, PAGE_TABLE_LEN)
+            || table(EWRAM_PAGE_TABLE.as_ptr() as u32, PAGE_TABLE_LEN)
+    };
+    let addr = if native { Some(addr) } else { fix_addr(addr) };
+    addr.map(|native| unsafe { core::ptr::read_volatile(native as *const u32) })
 }
 
 // Handles the faults caused by translated code: unresolved exits and jumps into ARM code.
@@ -228,23 +264,34 @@ extern "C" fn HardFault() {
 const EWRAM_PAGE: u32 = 512;
 const EWRAM_MIRROR: u32 = KB(256);
 
-static mut EWRAM_TABLE: [u8; (EWRAM_MIRROR / EWRAM_PAGE) as usize] =
-    [0xFF; (EWRAM_MIRROR / EWRAM_PAGE) as usize];
+const PAGE_TABLE_LEN: usize = (EWRAM_MIRROR / EWRAM_PAGE) as usize;
+
+// The native address of every EWRAM page. A page that is not handed out yet holds its own GBA
+// address, so translated code that reaches it through this table faults and ends up here.
+static mut EWRAM_PAGE_TABLE: [u32; PAGE_TABLE_LEN] = {
+    let mut t = [0; PAGE_TABLE_LEN];
+    let mut i = 0;
+    while i < PAGE_TABLE_LEN {
+        t[i] = EWRAM_START + i as u32 * EWRAM_PAGE;
+        i += 1;
+    }
+    t
+};
 static mut EWRAM_PAGES_USED: u32 = 0;
 
 fn ewram_native(gba_addr: u32) -> Option<u32> {
     unsafe {
         let offset = (gba_addr - EWRAM_START) & (EWRAM_MIRROR - 1);
         let page = (offset / EWRAM_PAGE) as usize;
-        if EWRAM_TABLE[page] == 0xFF {
+        if EWRAM_PAGE_TABLE[page] == EWRAM_START + page as u32 * EWRAM_PAGE {
             if EWRAM_PAGES_USED * EWRAM_PAGE >= EWRAM_LEN {
                 return None;
             }
-            EWRAM_TABLE[page] = EWRAM_PAGES_USED as u8;
+            let pool = &raw const NEW_EWRAM as u32;
+            EWRAM_PAGE_TABLE[page] = pool + EWRAM_PAGES_USED * EWRAM_PAGE;
             EWRAM_PAGES_USED += 1;
         }
-        let pool = &raw const NEW_EWRAM as u32;
-        Some(pool + EWRAM_TABLE[page] as u32 * EWRAM_PAGE + offset % EWRAM_PAGE)
+        Some(EWRAM_PAGE_TABLE[page] + offset % EWRAM_PAGE)
     }
 }
 
@@ -398,8 +445,21 @@ extern "C" fn svc_call(frame: &mut ExceptionFrame) {
     try_inject(frame);
 }
 
+// total time spent in the fault handler in microseconds and how many faults it was over
+static mut FAULT_TICKS: u32 = 0;
+
 #[unsafe(no_mangle)]
 extern "C" fn hard_fault(frame: &mut ExceptionFrame, other_regs: &mut Reg4_7) {
+    // the 1 MHz timer, individual readings are coarse but the sum over many faults is not
+    let timer = unsafe { &*pac::TIMER::ptr() };
+    let start = timer.timerawl().read().bits();
+    hard_fault_inner(frame, other_regs);
+    unsafe {
+        FAULT_TICKS = FAULT_TICKS.wrapping_add(timer.timerawl().read().bits().wrapping_sub(start))
+    };
+}
+
+fn hard_fault_inner(frame: &mut ExceptionFrame, other_regs: &mut Reg4_7) {
     static mut HF_COUNT: usize = 0;
     unsafe { FAULT_COUNT += 1 };
     let hf_count: usize;
@@ -1189,7 +1249,8 @@ where
                 if frames == REPORT_FRAMES {
                     unsafe {
                         rprintln!(
-                            "ewram pages {}, faults {}, svc counts {:?}, jit blocks {} ({} bytes), last svc {:x?}, game pc samples {:x?} (count {}), dispcnt {:x} dispstat {:x} ie {:x} if {:x} ime {:x}",
+                            "fault us {}, ewram pages {}, faults {}, svc counts {:?}, jit blocks {} ({} bytes), last svc {:x?}, game pc samples {:x?} (count {}), dispcnt {:x} dispstat {:x} ie {:x} if {:x} ime {:x}",
+                            FAULT_TICKS,
                             EWRAM_PAGES_USED,
                             FAULT_COUNT,
                             SVC_COUNTS,

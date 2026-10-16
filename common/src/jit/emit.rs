@@ -5,6 +5,9 @@ use super::{JitError, thumb};
 const MAX_USES: usize = 48;
 const MAX_POOL: usize = 48;
 
+// the error for a conditional branch that does not reach, translate retries with long skips
+pub const COND_RANGE: &str = "conditional branch out of range";
+
 // An exit slot is six halfwords starting on a word boundary
 pub const SLOT_HW: usize = 6;
 
@@ -27,6 +30,9 @@ pub struct Emit<'a> {
     npool: usize,
     // pool entries whose value is set after the load is emitted, these are never shared
     late: u64,
+    // the last position something was bound to or jumped over, code before it can not be
+    // changed by what is emitted after it
+    barrier: usize,
 }
 
 impl<'a> Emit<'a> {
@@ -43,7 +49,13 @@ impl<'a> Emit<'a> {
             pool: [0; MAX_POOL],
             npool: 0,
             late: 0,
+            barrier: len,
         }
+    }
+
+    // is the current position a branch target, or was code just placed that must stay
+    pub fn at_barrier(&self) -> bool {
+        self.barrier == self.len
     }
 
     pub fn fail(&mut self, err: JitError) {
@@ -141,6 +153,11 @@ impl<'a> Emit<'a> {
         }
     }
 
+    // How many more literal uses and pool entries fit before the pool must be flushed
+    pub fn pool_room(&self) -> usize {
+        (MAX_USES - self.nuses).min(MAX_POOL - self.npool)
+    }
+
     // Place the pending literals here and point their loads at them. When code can fall into
     // this spot it is branched over.
     pub fn flush_pool(&mut self, branch_over: bool) {
@@ -181,6 +198,7 @@ impl<'a> Emit<'a> {
         self.nuses = 0;
         self.npool = 0;
         self.late = 0;
+        self.barrier = self.len;
     }
 
     // Emit a placeholder conditional branch to patch with bind_cond
@@ -191,14 +209,34 @@ impl<'a> Emit<'a> {
     }
 
     pub fn bind_cond(&mut self, at: usize) {
+        self.barrier = self.len;
         let imm = self.len as i32 - (at as i32 + 2);
         if imm > 127 {
-            self.fail(JitError::Internal("conditional branch out of range"));
+            self.fail(JitError::Internal(COND_RANGE));
             return;
         }
         if let Some(h) = self.code.get_mut(at) {
             *h = (*h & 0xFF00) | (imm as u16 & 0xFF);
         }
+    }
+
+    // Branch back to the halfword to, if it is in reach
+    pub fn back_cond(&mut self, cond: u8, to: usize) -> bool {
+        let imm = to as i32 - (self.len as i32 + 2);
+        if imm < -128 {
+            return false;
+        }
+        self.put(thumb::b_cond(cond, imm));
+        true
+    }
+
+    pub fn back(&mut self, to: usize) -> bool {
+        let imm = to as i32 - (self.len as i32 + 2);
+        if imm < -1024 {
+            return false;
+        }
+        self.put(thumb::b(imm));
+        true
     }
 
     pub fn fwd(&mut self) -> usize {
@@ -208,6 +246,7 @@ impl<'a> Emit<'a> {
     }
 
     pub fn bind(&mut self, at: usize) {
+        self.barrier = self.len;
         let imm = self.len as i32 - (at as i32 + 2);
         if imm > 1023 {
             self.fail(JitError::Internal("branch out of range"));
@@ -229,6 +268,7 @@ impl<'a> Emit<'a> {
         self.put_word(target);
         self.put(thumb::NOP);
         self.put(thumb::NOP);
+        self.barrier = self.len;
         at
     }
 }

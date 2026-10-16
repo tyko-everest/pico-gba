@@ -6,12 +6,23 @@
 // handler then translates the target block (if needed) and rewrites the slot into a direct jump.
 // Everything here is no_std and allocation free so it can run inside the fault handler.
 //
+// Loads and stores translate their address inline through a table of offsets indexed by the top
+// byte of the address (the `regions` argument of Jit::new), so GBA memory that the embedder can
+// map flat is reached without a fault. Entry 0 leaves an address alone, such addresses fault and
+// the embedder emulates the access. An odd entry is the address of a page table (512 native page
+// addresses, indexed by bits 9-17 of the address) | 1, for memory that is mirrored or paged in.
+// A page that is not there points at its own GBA address, so the access faults.
+//
+// The memory callback of translate reads the ARM code, and also the words of the region table and
+// the page tables it points to (native addresses), which lets a load or store through a register
+// with a known value skip the lookup. An embedder that answers None for those loses that
+// optimisation and nothing else. Only pages that are there are used, they must stay where they are.
+//
 // Known gaps: the translator is verified against Unicorn for every ARM block reachable in the
 // Dino ROM (decoding/jit_diff.py, zero mismatches), but not for ARM in general. Running
 // `jit_diff.py random 800` generates random instructions of every supported kind and still shows
-// mismatches, for example `mvns rd, rm, asr #n` with a high rm, S-bit compares with shifted
-// operands, `muls` with high registers and `strh rt, [rn, #-0]` style forms. They are not
-// understood yet. Unsupported: long multiplies, swap, coprocessors, MRS/MSR, RRX, S-bit LDM/STM.
+// mismatches. Unsupported: long multiplies, swap, coprocessors, RRX, S-bit LDM/STM, sp in an
+// LDM/STM list, register offsets from sp with writeback.
 mod decode;
 mod emit;
 mod thumb;
@@ -45,9 +56,13 @@ pub struct Jit<'a> {
     // halfwords used
     used: usize,
     map: &'a mut [MapEntry],
+    // native address of the 256 entry region offset table, 0 for none
+    regions: u32,
     blocks: usize,
     // the ARM address after the last block translated
     pub last_arm_end: u32,
+    // the registers (bit r for rN) and flags (N Z C V from bit 3) the code after it may read
+    pub last_live_out: (u16, u8),
 }
 
 // the halfword an unresolved exit slot starts with
@@ -56,8 +71,11 @@ pub const TRAP: u16 = thumb::TRAP;
 pub const MAP_ENTRY_SIZE: usize = core::mem::size_of::<MapEntry>();
 
 impl<'a> Jit<'a> {
-    // base must be the address code will be executed at, and word aligned
-    pub fn new(code: &'a mut [u16], base: u32, map: &'a mut [MapEntry]) -> Self {
+    // base must be the address code will be executed at, and word aligned. regions is the native
+    // address of a table of 256 u32 offsets: a load or store through a register holding the GBA
+    // address a goes to a + table[a >> 24] (or through a page table, see the top). The embedder
+    // fills it, 0 entries leave the address alone. With regions == 0 nothing is translated.
+    pub fn new(code: &'a mut [u16], base: u32, map: &'a mut [MapEntry], regions: u32) -> Self {
         for m in map.iter_mut() {
             m.arm = 0;
         }
@@ -66,8 +84,10 @@ impl<'a> Jit<'a> {
             base,
             used: 0,
             map,
+            regions,
             blocks: 0,
             last_arm_end: 0,
+            last_live_out: (0xFFFF, 0xF),
         }
     }
 
@@ -141,20 +161,27 @@ impl<'a> Jit<'a> {
         let start = self.used;
         // blocks start on a word boundary so literal pools stay aligned
         let start = start + (start & 1);
-        let e = Emit::new(self.code, self.base, start);
-        let mut tr = translate::Tr::new(e, mem);
-        let end = tr.block(arm);
-        let overflow = tr.e.overflowed();
-        let len = tr.e.len;
-        let err = tr.e.err;
-        if overflow {
-            return Err(JitError::CacheFull);
-        }
-        if let Some(e) = err {
-            return Err(e);
-        }
+        // a conditional skip that is too long to branch over makes a second try without sharing
+        let mut long_skips = false;
+        let (end, len, live_out) = loop {
+            let e = Emit::new(self.code, self.base, start);
+            let mut tr = translate::Tr::new(e, mem, self.regions, long_skips);
+            let end = tr.block(arm);
+            if tr.e.overflowed() {
+                return Err(JitError::CacheFull);
+            }
+            match tr.e.err {
+                Some(JitError::At {
+                    msg: emit::COND_RANGE,
+                    ..
+                }) if !long_skips => long_skips = true,
+                Some(e) => return Err(e),
+                None => break (end, tr.e.len, tr.live_out),
+            }
+        };
         self.used = len;
         self.last_arm_end = end;
+        self.last_live_out = live_out;
         let thumb = self.base + 2 * start as u32 + 1;
         self.insert(arm, thumb)?;
         Ok(thumb)

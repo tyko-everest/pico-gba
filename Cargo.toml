@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["common", "firmware", "simulation"]
+members = ["common", "firmware", "simulation", "jitbench"]
 default-members = ["simulation"]
 
 [profile.release]

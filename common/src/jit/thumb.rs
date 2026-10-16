@@ -104,6 +104,14 @@ pub fn asrs_imm(rd: u8, rm: u8, imm5: u16) -> u16 {
     0x1000 | imm5 << 6 | (rm as u16) << 3 | rd as u16
 }
 
+pub fn uxtb(rd: u8, rm: u8) -> u16 {
+    0xB2C0 | (rm as u16) << 3 | rd as u16
+}
+
+pub fn uxth(rd: u8, rm: u8) -> u16 {
+    0xB280 | (rm as u16) << 3 | rd as u16
+}
+
 pub fn sxtb(rd: u8, rm: u8) -> u16 {
     0xB240 | (rm as u16) << 3 | rd as u16
 }
@@ -137,18 +145,8 @@ pub fn ldrh_imm(rt: u8, rn: u8, imm5: u16) -> u16 {
     0x8800 | imm5 << 6 | (rn as u16) << 3 | rt as u16
 }
 
-// load and store with a register offset
-pub const STR_REG: u16 = 0x5000;
-pub const STRH_REG: u16 = 0x5200;
-pub const STRB_REG: u16 = 0x5400;
-pub const LDRSB_REG: u16 = 0x5600;
-pub const LDR_REG: u16 = 0x5800;
-pub const LDRH_REG: u16 = 0x5A00;
-pub const LDRB_REG: u16 = 0x5C00;
-pub const LDRSH_REG: u16 = 0x5E00;
-
-pub fn mem_reg(op: u16, rt: u8, rn: u8, rm: u8) -> u16 {
-    op | (rm as u16) << 6 | (rn as u16) << 3 | rt as u16
+pub fn ldr_reg(rt: u8, rn: u8, rm: u8) -> u16 {
+    0x5800 | (rm as u16) << 6 | (rn as u16) << 3 | rt as u16
 }
 
 pub fn str_sp(rt: u8, words: u16) -> u16 {

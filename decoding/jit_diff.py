@@ -7,6 +7,15 @@ Setup (once):  python3 -m venv /tmp/jitvenv && /tmp/jitvenv/bin/pip install unic
 Run:           cargo build -p common --example jit_dump
                /tmp/jitvenv/bin/python decoding/jit_diff.py IMAGE IMAGE_BASE [ENTRY...]
 
+The translated code translates load and store addresses inline through a table of offsets, set
+with JIT_REGIONS: "alias" (default) maps the IO, palette, VRAM, OAM, IWRAM and ROM regions a
+second time at +0x40000000 and points the table there (IWRAM and EWRAM through page tables,
+EWRAM pages pointing at themselves), "zero" has an all zero table so the
+sequence runs but addresses do not change, "none" translates nothing.
+
+`jit_diff.py random N` tests N random snippets, SEQ=k makes each k instructions long with mostly
+one shared condition (the translator groups those).
+
 IMAGE is a raw memory image of ARM code mapped at IMAGE_BASE (for example the IWRAM code blob
 of a ROM at 0x03000000).
 """
@@ -21,6 +30,9 @@ from unicorn import *
 from unicorn.arm_const import *
 
 CACHE_BASE = 0x20010000
+TABLE_BASE = 0x20300000
+ALIAS = 0x40000000
+REGIONS_MODE = __import__("os").environ.get("JIT_REGIONS", "alias")
 DATA_BASE = 0x02000000
 DATA_SIZE = 0x40000
 EXTRA_REGIONS = [(0x08000000, 0x20000), (0x04000000, 0x1000), (0x05000000, 0x1000), (0x06000000, 0x18000), (0x07000000, 0x1000)]
@@ -31,9 +43,30 @@ EDGE = [0, 1, 2, 3, 0x7F, 0x80, 0xFF, 0x100, 0xFFFF, 0x7FFFFFFF, 0x80000000, 0xF
         0xFFFFFF80, 0x12345678, 0x80000001]
 
 
+def region_table():
+    # 256 offsets, then the page tables of EWRAM and IWRAM (512 entries each, odd table entries
+    # point at them). EWRAM pages point at themselves, the paged lookup runs and the address is
+    # unchanged. IWRAM pages point at the alias window, which repeats the 32 KiB.
+    t = [0] * 256
+    ew = [DATA_BASE + i * 512 for i in range(512)]
+    iw = [ALIAS + 0x03000000 + (i % 64) * 512 for i in range(512)]
+    if REGIONS_MODE == "alias":
+        for top in range(4, 9):
+            t[top] = ALIAS
+        t[2] = TABLE_BASE + 0x400 | 1
+        t[3] = TABLE_BASE + 0xC00 | 1
+    else:
+        ew = iw = [0] * 512
+    return struct.pack("<%dI" % (256 + 1024), *t, *ew, *iw)
+
+
+LIVE = {}
+
+
 def run_dump(image, base, entries):
+    table = 0 if REGIONS_MODE == "none" else TABLE_BASE
     res = subprocess.run(
-        ["target/debug/examples/jit_dump", image, "%x" % base, "%x" % CACHE_BASE]
+        ["target/debug/examples/jit_dump", image, "%x" % base, "%x" % CACHE_BASE, "%x" % table]
         + ["%x" % e for e in entries],
         capture_output=True, text=True)
     if res.returncode:
@@ -44,6 +77,9 @@ def run_dump(image, base, entries):
         parts = line.split()
         if parts[0] == "BLOCK":
             blocks.append(tuple(int(p, 16) for p in parts[1:4]))
+        elif parts[0] == "LIVEOUT":
+            # the registers and flags the translator says the code after the block may read
+            LIVE[int(parts[1], 16)] = (int(parts[2], 16), int(parts[3], 16))
         elif parts[0] in ("UNPATCHED", "PATCHED"):
             code[parts[0]] = bytes.fromhex(parts[1])
         elif parts[0] == "ERR":
@@ -64,15 +100,28 @@ class Machine:
         img_size = (len(image) + 0xFFF) & ~0xFFF
         self.mu.mem_map(base, img_size)
         self.mu.mem_write(base, image)
+        maps = [(base, img_size)]
         # the rest of the GBA memory map that code might touch through absolute addresses
         for rb, rs in EXTRA_REGIONS:
             if not (base <= rb < base + img_size):
                 self.mu.mem_map(rb, rs)
+                maps.append((rb, rs))
         if base == 0x03000000 and img_size < 0x8000:
             self.mu.mem_map(base + img_size, 0x8000 - img_size)
+            maps.append((base + img_size, 0x8000 - img_size))
         if not arm:
             self.mu.mem_map(CACHE_BASE, (len(code) + 0xFFF) & ~0xFFF)
             self.mu.mem_write(CACHE_BASE, code)
+            if REGIONS_MODE != "none":
+                self.mu.mem_map(TABLE_BASE, 0x2000)
+                self.mu.mem_write(TABLE_BASE, region_table())
+        # the translated code reaches the regions through the alias windows, the test compares
+        # those with the regions of the ARM run
+        self.alias = ALIAS if (not arm and REGIONS_MODE == "alias") else 0
+        if self.alias:
+            for rb, rs in maps:
+                self.mu.mem_map(rb + ALIAS, rs)
+            self.mu.mem_write(base + ALIAS, image)
         self.base, self.img_size = base, img_size
         self.stop = None
         self.slots = {}
@@ -90,6 +139,8 @@ def set_state(m, regs, flags, mem):
     m.mu.mem_write(DATA_BASE, mem)
     for rb, blob in EXTRA_MEM:
         m.mu.mem_write(rb, blob)
+        if m.alias:
+            m.mu.mem_write(rb + m.alias, blob)
     # the mode first, sp and lr are banked per mode
     if m.arm:
         m.mu.reg_write(UC_ARM_REG_CPSR, 0x1F | (flags << 28))
@@ -102,7 +153,7 @@ def set_state(m, regs, flags, mem):
 def get_state(m):
     regs = [m.mu.reg_read(r) for r in REGS]
     psr = m.mu.reg_read(UC_ARM_REG_CPSR if m.arm else UC_ARM_REG_XPSR)
-    extra = b"".join(bytes(m.mu.mem_read(rb, len(blob))) for rb, blob in EXTRA_MEM)
+    extra = b"".join(bytes(m.mu.mem_read(rb + m.alias, len(blob))) for rb, blob in EXTRA_MEM)
     return regs, psr >> 28, bytes(m.mu.mem_read(DATA_BASE, DATA_SIZE)) + extra
 
 
@@ -142,12 +193,17 @@ def run_arm(m, start, end):
     return st["next"], err, st["state"]
 
 
-def run_thumb(m, start, slots):
+def run_thumb(m, start, slots, arm_start=None):
     st = {"next": None, "n": 0}
 
     def hook(uc, addr, size, ud):
         st["n"] += 1
-        if addr in slots:
+        if addr == start & ~1 and st["n"] > 1:
+            # a loop over the whole block jumps straight back, which is the exit to itself
+            st["next"] = arm_start
+            st["state"] = get_state(m)
+            uc.emu_stop()
+        elif addr in slots:
             st["next"] = slots[addr]
             st["slot"] = addr
             st["state"] = get_state(m)
@@ -235,14 +291,15 @@ def random_state(rng):
     return regs, rng.getrandbits(4), mem
 
 
-def gen_instruction(rng):
+def gen_instruction(rng, cond=None):
     """A random ARMv4T instruction of the kinds the translator supports, avoiding encodings that
     are architecturally unpredictable."""
-    cond = rng.choice([14] * 6 + list(range(14)))
+    if cond is None:
+        cond = rng.choice([14] * 6 + list(range(14)))
     reg = lambda: rng.randrange(15)  # no pc
     def reg_pc():
         return 15 if rng.random() < 0.04 else reg()
-    kind = rng.random()
+    kind = rng.random() * float(__import__('os').environ.get('KINDMAX', '1'))
     if kind < 0.40:  # data processing
         op = rng.randrange(16)
         s = rng.random() < 0.5
@@ -251,6 +308,10 @@ def gen_instruction(rng):
         rd, rn = reg(), reg_pc()
         if rng.random() < 0.15:
             rd = rng.choice([8, 9, 10, 11, 12, 14])
+        if 8 <= op <= 11:
+            rd = 0  # the register field of the compares must be zero
+        if op in (13, 15):
+            rn = 0  # and the one of mov and mvn
         form = rng.random()
         if form < 0.3:
             op2 = (rng.randrange(16) << 8) | rng.choice([0, 1, 2, 0x7F, 0x80, 0xFF, rng.randrange(256)])
@@ -268,6 +329,8 @@ def gen_instruction(rng):
         while rm == rd:
             rm = reg()
         acc, s = rng.random() < 0.5, rng.random() < 0.5
+        if not acc:
+            rn = 0  # should be zero
         return cond << 28 | acc << 21 | s << 20 | rd << 16 | rn << 12 | rs << 8 | 0x90 | rm
     if kind < 0.77:  # ldr str ldrb strb
         load, byte = rng.random() < 0.5, rng.random() < 0.4
@@ -325,16 +388,20 @@ def gen_instruction(rng):
 
 def main():
     if sys.argv[1] == "random":
-        # a snippet is a random instruction and a bx lr
+        # a snippet is SEQ random instructions and a bx lr, with SEQ > 1 most of the snippets
+        # share one condition so the translator groups them
         count = int(sys.argv[2])
+        seq = int(__import__("os").environ.get("SEQ", "1"))
         r = random.Random(int(__import__("os").environ.get("SEED", "1")))
         words = []
         for _ in range(count):
-            words += [gen_instruction(r), 0xE12FFF1E]
+            shared = r.choice([14] + list(range(14))) if r.random() < 0.7 else None
+            words += [gen_instruction(r, shared if seq > 1 else None) for _ in range(seq)]
+            words.append(0xE12FFF1E)
         image_path = "/tmp/jit_random.img"
         open(image_path, "wb").write(struct.pack("<%dI" % len(words), *words))
         base = 0x03000000
-        entries = [base + 8 * k for k in range(count)]
+        entries = [base + 4 * (seq + 1) * k for k in range(count)]
     else:
         image_path, base = sys.argv[1], int(sys.argv[2], 16)
         entries = [int(a, 16) for a in sys.argv[3:]] or [base]
@@ -361,6 +428,7 @@ def main():
     if base == 0x03000000 and img_size < 0x8000:
         EXTRA_MEM.append((base + img_size, pointer_rich(rng, 0x8000 - img_size)))
     fails = Counter()
+    kinds = __import__('collections').defaultdict(set)
     shown = 0
     trials = int(__import__("os").environ.get("TRIALS", "25"))
     skipped = Counter()
@@ -375,12 +443,14 @@ def main():
         if any((w >> 24) & 0xF == 0xF for w in words):
             skipped["swi"] += 1
             continue
+        # the states of a block do not depend on which other blocks translated
+        brng = random.Random(a)
         for _ in range(trials):
-            regs, flags, mem = random_state(rng)
+            regs, flags, mem = random_state(brng)
             set_state(arm, regs, flags, mem)
             set_state(thumb, regs, flags, mem)
             anext, aerr, (ar, af, am) = run_arm(arm, a, end)
-            tnext, terr, (tr, tf, tm) = run_thumb(thumb, t, slots)
+            tnext, terr, (tr, tf, tm) = run_thumb(thumb, t, slots, a)
             # running into the next block (bx, pop pc, ...) is not a fault
             if aerr in EXIT_ERRORS:
                 aerr = None
@@ -399,12 +469,13 @@ def main():
             problems = []
             if anext is not None and tnext is not None and anext != tnext:
                 problems.append("next pc arm=%#x thumb=%#x" % (anext, tnext))
+            live_regs, live_flags = LIVE.get(a, (0xFFFF, 0xF))
             for i in range(15):
-                if ar[i] != tr[i]:
+                if ar[i] != tr[i] and live_regs >> i & 1:
                     if i == 14 and tr[i] & 1 and (tr[i] - 1) in slots and slots[tr[i] - 1] == ar[i]:
                         continue  # bl: lr points at the slot for the return
                     problems.append("r%d arm=%#x thumb=%#x" % (i, ar[i], tr[i]))
-            if af != tf:
+            if (af ^ tf) & live_flags:
                 problems.append("flags arm=%s thumb=%s" % (bin(af), bin(tf)))
             # translated code pushes scratch registers below sp, which is dead space for the ARM code
             lo = max(0, ar[13] - 256 - DATA_BASE)
@@ -414,7 +485,8 @@ def main():
                 problems.append("memory differs at %s" % [hex(DATA_BASE + x) for x in d[:4]])
             if problems:
                 fails[a] += 1
-                if shown < 12 and fails[a] == 1:
+                kinds[a].update(x.split()[0] if x[0] != "r" else x.split("=")[0].split()[0] for x in problems)
+                if shown < int(__import__("os").environ.get("SHOW", "12")) and fails[a] == 1:
                     shown += 1
                     print("MISMATCH block %#x:" % a)
                     for o in range(a, end, 4):
@@ -445,6 +517,11 @@ def main():
                 ins = next(md.disasm(image[o - base:o - base + 4], o), None)
                 print("    %x: %s" % (o, (ins.mnemonic + " " + ins.op_str) if ins else ".word"))
     print("blocks with mismatches: %d of %d" % (len(fails), len(blocks)))
+    out = __import__("os").environ.get("FAILS_OUT")
+    if out:
+        with open(out, "w") as f:
+            for a in sorted(fails):
+                f.write("%x %s\n" % (a, ",".join(sorted(kinds[a]))))
 
 
 main()

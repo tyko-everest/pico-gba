@@ -5,4 +5,5 @@
 *.bin
 *.o
 *.objdump
+*.txt
 profile.json.gz
