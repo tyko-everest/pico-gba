@@ -21,6 +21,8 @@ struct Args {
     png: Option<String>,
     top: usize,
     rom: String,
+    // where the game starts executing (Thumb, past the crt0), default ROM + 0xdc
+    entry: Option<u32>,
     translate_bench: bool,
     trace: bool,
     // write the code cache and the cycles spent on every halfword of it
@@ -38,6 +40,7 @@ fn parse_args() -> Args {
             "/../firmware/src/Google-Dino-Advance.gba"
         )
         .into(),
+        entry: None,
         translate_bench: false,
         trace: false,
         dump_cache: None,
@@ -56,6 +59,9 @@ fn parse_args() -> Args {
             "--png" => a.png = Some(value()),
             "--top" => a.top = value().parse().unwrap(),
             "--rom" => a.rom = value(),
+            "--entry" => {
+                a.entry = Some(u32::from_str_radix(value().trim_start_matches("0x"), 16).unwrap())
+            }
             "--trace" => a.trace = true,
             "--dump-cache" => a.dump_cache = Some(value()),
             "--translate-bench" => a.translate_bench = true,
@@ -336,6 +342,9 @@ fn main() {
     let args = parse_args();
     let rom = std::fs::read(&args.rom).unwrap_or_else(|e| panic!("cannot read {}: {e}", args.rom));
     let mut m = Machine::new(&rom, args.input);
+    if let Some(entry) = args.entry {
+        m.cpu.r[15] = entry;
+    }
     m.trace = args.trace;
     let t0 = Instant::now();
     m.run(args.frames);

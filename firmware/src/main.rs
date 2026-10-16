@@ -107,7 +107,7 @@ static mut NEW_IWRAM: [u32; IWRAM_LEN as usize / 4] = [0; IWRAM_LEN as usize / 4
 // pc relative load in it reads the wrong word
 #[repr(C, align(4))]
 struct Aligned<T: ?Sized>(T);
-static ROM_ALIGNED: &Aligned<[u8]> = &Aligned(*include_bytes!("Google-Dino-Advance.gba"));
+static ROM_ALIGNED: &Aligned<[u8]> = &Aligned(*include_bytes!("nobot.gba"));
 static ROM_CODE: &[u8] = &ROM_ALIGNED.0;
 
 // Translated ARM code. The game's ARM mode code cannot run on the Cortex-M0+, the fault handler
@@ -279,11 +279,49 @@ static mut EWRAM_PAGE_TABLE: [u32; PAGE_TABLE_LEN] = {
 };
 static mut EWRAM_PAGES_USED: u32 = 0;
 
+// A page that has not been handed out holds its own GBA address in the table
+fn ewram_page_empty(gba_addr: u32) -> bool {
+    let page = ((gba_addr - EWRAM_START) & (EWRAM_MIRROR - 1)) / EWRAM_PAGE;
+    unsafe { EWRAM_PAGE_TABLE[page as usize] == EWRAM_START + page * EWRAM_PAGE }
+}
+
+// The pages nothing but zero has been stored to share this one: a read of it gives zeros and a
+// store of zero leaves it zero. The crt0 of a ROM clears all 256 KiB of EWRAM, which would use up
+// the pool for nothing. The extra bytes are for an unaligned access at the end of the page.
+static mut EWRAM_ZERO: [u8; EWRAM_PAGE as usize + 4] = [0; EWRAM_PAGE as usize + 4];
+
+// The BIOS is not here. Code outside it reads the last word the BIOS fetched, the same value at
+// every address, and writes do nothing. C++ code that follows a null pointer relies on this: both
+// ends of an empty std::vector read the same word, the RP2040 boot rom there has different words.
+const BIOS_LEN: u32 = KB(16);
+const BIOS_OPEN_BUS: u32 = 0xE129_F000;
+static BIOS_BUS: [u32; 2] = [BIOS_OPEN_BUS; 2];
+static mut BIOS_SINK: [u32; 2] = [0; 2];
+
+// Like fix_addr, for a load or store the handler does itself. store is the value written.
+fn access_addr(gba_addr: u32, store: Option<u32>, size: u32) -> Option<u32> {
+    if gba_addr < BIOS_LEN {
+        let word = if store.is_some() {
+            &raw const BIOS_SINK as u32
+        } else {
+            BIOS_BUS.as_ptr() as u32
+        };
+        // an access across words reads the same word again, the buffer repeats it
+        return Some(word + gba_addr % 4);
+    }
+    let mask = u32::MAX >> (32 - 8 * size);
+    let in_ewram = gba_addr >= EWRAM_START && gba_addr < IWRAM_START;
+    if in_ewram && ewram_page_empty(gba_addr) && store.is_none_or(|v| v & mask == 0) {
+        return Some(&raw const EWRAM_ZERO as u32 + gba_addr % EWRAM_PAGE);
+    }
+    fix_addr(gba_addr)
+}
+
 fn ewram_native(gba_addr: u32) -> Option<u32> {
     unsafe {
         let offset = (gba_addr - EWRAM_START) & (EWRAM_MIRROR - 1);
         let page = (offset / EWRAM_PAGE) as usize;
-        if EWRAM_PAGE_TABLE[page] == EWRAM_START + page as u32 * EWRAM_PAGE {
+        if ewram_page_empty(gba_addr) {
             if EWRAM_PAGES_USED * EWRAM_PAGE >= EWRAM_LEN {
                 return None;
             }
@@ -584,15 +622,16 @@ fn hard_fault_inner(frame: &mut ExceptionFrame, other_regs: &mut Reg4_7) {
             if list & (1 << r) == 0 {
                 continue;
             }
-            let Some(native) = fix_addr(address) else {
+            let store = (!load).then(|| get(frame, other_regs, r));
+            let Some(native) = access_addr(address, store, 4) else {
                 fail(frame, other_regs, address)
             };
-            if load {
-                let value = unsafe { read_native(native, 4) };
-                set(frame, other_regs, r, value);
-            } else {
-                let value = get(frame, other_regs, r);
-                unsafe { write_native(native, 4, value) };
+            match store {
+                None => {
+                    let value = unsafe { read_native(native, 4) };
+                    set(frame, other_regs, r, value);
+                }
+                Some(value) => unsafe { write_native(native, 4, value) },
             }
             address = address.wrapping_add(4);
         }
@@ -625,7 +664,8 @@ fn hard_fault_inner(frame: &mut ExceptionFrame, other_regs: &mut Reg4_7) {
                 _ => (2, load, false, base.wrapping_add(imm * 2)),
             }
         };
-        let Some(native) = fix_addr(address) else {
+        let store = (!load).then(|| get(frame, other_regs, rt));
+        let Some(native) = access_addr(address, store, size) else {
             fail(frame, other_regs, address)
         };
         if load {
@@ -638,8 +678,7 @@ fn hard_fault_inner(frame: &mut ExceptionFrame, other_regs: &mut Reg4_7) {
             }
             set(frame, other_regs, rt, value);
         } else {
-            let value = get(frame, other_regs, rt);
-            unsafe { write_native(native, size, value) };
+            unsafe { write_native(native, size, store.unwrap()) };
         }
     }
     // the instruction is done, continue after it
@@ -1439,8 +1478,29 @@ fn main() -> ! {
 
     unsafe { cortex_m::peripheral::NVIC::unmask(pac::Interrupt::SIO_IRQ_PROC0) };
 
+    // The game's idea of the BIOS is address 0, which on the RP2040 is its boot rom. Reads of it
+    // do not fault, so make it no access on this core and let the fault handler answer for it.
+    // The handler itself is exempt (HFNMIENA is off).
+    unsafe {
+        let mpu = &*cortex_m::peripheral::MPU::PTR;
+        const SIZE_16K: u32 = 13 << 1;
+        const NO_ACCESS: u32 = 0 << 24;
+        const EXECUTE_NEVER: u32 = 1 << 28;
+        mpu.rnr.write(0);
+        mpu.rbar.write(0);
+        mpu.rasr.write(EXECUTE_NEVER | NO_ACCESS | SIZE_16K | 1);
+        // enable, and keep the default memory map for everything else
+        mpu.ctrl.write(1 | 1 << 2);
+        asm!("dsb", "isb");
+    }
+
     let rom_addr = ROM_CODE.as_ptr() as u32;
-    let thumb_start = rom_addr + 0xdc | 1; // last bit needs to be 1 for thumb mode
+    // the crt0 of the ROM is ARM code that sets up stacks, skip to where it enters Thumb
+    let Some(entry) = common::rom::thumb_entry(ROM_CODE) else {
+        rprintln!("cannot find where the ROM switches to Thumb");
+        panic!()
+    };
+    let thumb_start = rom_addr + entry as u32 | 1; // last bit needs to be 1 for thumb mode
     unsafe { asm!("bx {}", in(reg) thumb_start) };
 
     loop {}

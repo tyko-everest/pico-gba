@@ -9,6 +9,9 @@ use std::time::Instant;
 // native RAM: the code cache is at its start, the stack at its end
 pub const NATIVE_BASE: u32 = 0x2000_0000;
 pub const NATIVE_LEN: u32 = 0x42000;
+const BIOS_SIZE: usize = 0x4000;
+// what the last BIOS fetch leaves on the bus after startup
+const BIOS_OPEN_BUS: u32 = 0xE129_F000;
 pub const CACHE_BASE: u32 = NATIVE_BASE;
 // as in the firmware: 24 KiB of code and a 1024 entry block map
 pub const CACHE_HW: usize = 12 * 1024;
@@ -71,6 +74,7 @@ impl Region {
 
 #[derive(Clone, Copy)]
 enum Which {
+    Bios,
     Ewram,
     Iwram,
     Io,
@@ -82,6 +86,10 @@ enum Which {
 }
 
 pub struct Mem {
+    // The BIOS is not there. Code outside it reads the last word the BIOS fetched, which is the
+    // same value for every address, and games that follow a null pointer rely on that: both ends
+    // of an empty std::vector read the same word.
+    bios: Vec<u8>,
     pub ewram: Region,
     pub iwram: Region,
     pub io: Region,
@@ -97,6 +105,7 @@ impl Mem {
     fn new(rom: &[u8]) -> Self {
         let mut m = Mem {
             ewram: Region::new(EWRAM_SIZE),
+            bios: BIOS_OPEN_BUS.to_le_bytes().repeat(BIOS_SIZE / 4),
             iwram: Region::new(IWRAM_SIZE),
             io: Region::new(0x400),
             palette: Region::new(0x400),
@@ -128,6 +137,7 @@ impl Mem {
     fn locate(addr: u32) -> Option<(Which, usize)> {
         let off = (addr & 0x00FF_FFFF) as usize;
         match addr >> 24 {
+            0 if off < BIOS_SIZE => Some((Which::Bios, off)),
             2 => Some((Which::Ewram, off & (EWRAM_SIZE - 1))),
             3 => Some((Which::Iwram, off & (IWRAM_SIZE - 1))),
             4 if off < 0x400 => Some((Which::Io, off)),
@@ -145,6 +155,7 @@ impl Mem {
 
     fn bytes(&self, w: Which) -> &[u8] {
         match w {
+            Which::Bios => &self.bios,
             Which::Ewram => self.ewram.bytes(),
             Which::Iwram => self.iwram.bytes(),
             Which::Io => self.io.bytes(),
@@ -165,7 +176,7 @@ impl Mem {
             Which::Palette => self.palette.bytes_mut(),
             Which::Vram => self.vram.bytes_mut(),
             Which::Oam => self.oam.bytes_mut(),
-            Which::Rom => return None,
+            Which::Rom | Which::Bios => return None,
             Which::Sram => self.sram.bytes_mut(),
         })
     }
@@ -351,8 +362,12 @@ impl Sys {
                 at = format!(", in the block for ARM {:#x}-{:#x}", b.arm, b.arm_end);
             }
         }
-        if let Some(path) = std::env::var_os("JITBENCH_DUMP_IWRAM") {
-            let _ = std::fs::write(path, self.mem.iwram.bytes());
+        // JITBENCH_DUMP_DIR gets ewram, iwram and native (the stack) as they were when the run died
+        if let Some(dir) = std::env::var_os("JITBENCH_DUMP_DIR") {
+            let dir = std::path::Path::new(&dir);
+            let _ = std::fs::write(dir.join("ewram"), self.mem.ewram.bytes());
+            let _ = std::fs::write(dir.join("iwram"), self.mem.iwram.bytes());
+            let _ = std::fs::write(dir.join("native"), &self.mem.native);
         }
         panic!("{msg} (pc {:#x}{at}, frame {})", self.cur_pc, self.frame_no);
     }
@@ -603,8 +618,9 @@ impl Machine {
             ..Default::default()
         };
         let mut cpu = Cpu::new();
-        // main starts the game in Thumb at ROM + 0xdc on the native stack
-        cpu.r[15] = ROM_BASE + 0xdc;
+        // main starts the game in Thumb past the crt0, on the native stack
+        let entry = common::rom::thumb_entry(rom).expect("no Thumb entry in the ROM");
+        cpu.r[15] = ROM_BASE + entry as u32;
         cpu.r[13] = NATIVE_BASE + NATIVE_LEN;
         Machine {
             cpu,
