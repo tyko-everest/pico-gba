@@ -38,6 +38,8 @@ pub enum JitError {
     BadRead(u32),
     // the code cache is full
     CacheFull,
+    // a conditional branch does not reach, translate then retries with long skips
+    CondRange,
     Internal(&'static str),
     // an internal limit was hit while translating the instruction at addr
     At { addr: u32, msg: &'static str },
@@ -61,8 +63,6 @@ pub struct Jit<'a> {
     blocks: usize,
     // the ARM address after the last block translated
     pub last_arm_end: u32,
-    // the registers (bit r for rN) and flags (N Z C V from bit 3) the code after it may read
-    pub last_live_out: (u16, u8),
 }
 
 // the halfword an unresolved exit slot starts with
@@ -87,7 +87,6 @@ impl<'a> Jit<'a> {
             regions,
             blocks: 0,
             last_arm_end: 0,
-            last_live_out: (0xFFFF, 0xF),
         }
     }
 
@@ -134,11 +133,12 @@ impl<'a> Jit<'a> {
         }
     }
 
-    fn insert(&mut self, arm: u32, thumb: u32) -> Result<(), JitError> {
-        // keep the table at most half full
-        if self.blocks * 2 >= self.map.len() {
-            return Err(JitError::CacheFull);
-        }
+    // keep the table at most half full
+    fn map_full(&self) -> bool {
+        self.blocks * 2 >= self.map.len()
+    }
+
+    fn insert(&mut self, arm: u32, thumb: u32) {
         let mask = self.map.len() - 1;
         let mut i = self.slot_index(arm);
         while self.map[i].arm != 0 {
@@ -146,7 +146,6 @@ impl<'a> Jit<'a> {
         }
         self.map[i] = MapEntry { arm, thumb };
         self.blocks += 1;
-        Ok(())
     }
 
     // Translate the block at an ARM address, or find it. Returns the address to run it at.
@@ -158,12 +157,15 @@ impl<'a> Jit<'a> {
         if let Some(t) = self.lookup(arm) {
             return Ok(t);
         }
+        if self.map_full() {
+            return Err(JitError::CacheFull);
+        }
         let start = self.used;
         // blocks start on a word boundary so literal pools stay aligned
         let start = start + (start & 1);
         // a conditional skip that is too long to branch over makes a second try without sharing
         let mut long_skips = false;
-        let (end, len, live_out) = loop {
+        let (end, len) = loop {
             let e = Emit::new(self.code, self.base, start);
             let mut tr = translate::Tr::new(e, mem, self.regions, long_skips);
             let end = tr.block(arm);
@@ -171,19 +173,15 @@ impl<'a> Jit<'a> {
                 return Err(JitError::CacheFull);
             }
             match tr.e.err {
-                Some(JitError::At {
-                    msg: emit::COND_RANGE,
-                    ..
-                }) if !long_skips => long_skips = true,
+                Some(JitError::CondRange) if !long_skips => long_skips = true,
                 Some(e) => return Err(e),
-                None => break (end, tr.e.len, tr.live_out),
+                None => break (end, tr.e.pos()),
             }
         };
+        let thumb = self.base + 2 * start as u32 + 1;
+        self.insert(arm, thumb);
         self.used = len;
         self.last_arm_end = end;
-        self.last_live_out = live_out;
-        let thumb = self.base + 2 * start as u32 + 1;
-        self.insert(arm, thumb)?;
         Ok(thumb)
     }
 

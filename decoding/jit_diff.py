@@ -60,9 +60,6 @@ def region_table():
     return struct.pack("<%dI" % (256 + 1024), *t, *ew, *iw)
 
 
-LIVE = {}
-
-
 def run_dump(image, base, entries):
     table = 0 if REGIONS_MODE == "none" else TABLE_BASE
     res = subprocess.run(
@@ -77,9 +74,6 @@ def run_dump(image, base, entries):
         parts = line.split()
         if parts[0] == "BLOCK":
             blocks.append(tuple(int(p, 16) for p in parts[1:4]))
-        elif parts[0] == "LIVEOUT":
-            # the registers and flags the translator says the code after the block may read
-            LIVE[int(parts[1], 16)] = (int(parts[2], 16), int(parts[3], 16))
         elif parts[0] in ("UNPATCHED", "PATCHED"):
             code[parts[0]] = bytes.fromhex(parts[1])
         elif parts[0] == "ERR":
@@ -469,13 +463,12 @@ def main():
             problems = []
             if anext is not None and tnext is not None and anext != tnext:
                 problems.append("next pc arm=%#x thumb=%#x" % (anext, tnext))
-            live_regs, live_flags = LIVE.get(a, (0xFFFF, 0xF))
             for i in range(15):
-                if ar[i] != tr[i] and live_regs >> i & 1:
+                if ar[i] != tr[i]:
                     if i == 14 and tr[i] & 1 and (tr[i] - 1) in slots and slots[tr[i] - 1] == ar[i]:
                         continue  # bl: lr points at the slot for the return
                     problems.append("r%d arm=%#x thumb=%#x" % (i, ar[i], tr[i]))
-            if (af ^ tf) & live_flags:
+            if (af ^ tf) & 0xF:
                 problems.append("flags arm=%s thumb=%s" % (bin(af), bin(tf)))
             # translated code pushes scratch registers below sp, which is dead space for the ARM code
             lo = max(0, ar[13] - 256 - DATA_BASE)

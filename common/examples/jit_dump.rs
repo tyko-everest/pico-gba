@@ -52,7 +52,7 @@ fn main() {
             continue;
         }
         match jit.translate(t, &mut mem) {
-            Ok(th) => blocks.push((t, th, jit.last_arm_end, jit.last_live_out)),
+            Ok(th) => blocks.push((t, th, jit.last_arm_end)),
             Err(e) => {
                 failed.insert(t);
                 println!("ERR {t:#x} {e:?}");
@@ -68,9 +68,8 @@ fn main() {
             }
         }
     }
-    for (arm, th, end, live) in &blocks {
+    for (arm, th, end) in &blocks {
         println!("BLOCK {arm:#x} {th:#x} {end:#x}");
-        println!("LIVEOUT {arm:#x} {:x} {:x}", live.0, live.1);
     }
     let dump = |jit: &Jit| {
         let mut s = String::new();

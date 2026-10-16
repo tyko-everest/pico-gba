@@ -13,21 +13,16 @@
 // and registers are needed comes from a backward pass over the block.
 use super::{
     JitError,
-    decode::{COND_AL, Decoded, DpOp, Insn, MemKind, MsrSrc, Offset, Op2, Shift, decode},
+    decode::{
+        BlockOp, COND_AL, Decoded, DpOp, Insn, MemKind, MemOp, MsrSrc, MulOp, Offset, Op2, Shift,
+        decode,
+    },
     emit::Emit,
     thumb::{self, LR, PC, SP, is_low},
 };
 
 // Longest run of ARM instructions translated into a single block
 const MAX_BLOCK: usize = 48;
-
-// How many instructions after a block are looked at to see which registers they read
-const LOOKAHEAD: usize = 16;
-
-// Look at the code a block exits to, so registers it does not read are free scratch registers at
-// the end of the block. The differential check against Unicorn compares every register at the end
-// of a block, so it reports the clobbered dead ones as mismatches: off until that knows about it.
-const EXIT_LOOKAHEAD: bool = false;
 
 // Flag sets, as masks
 const FN: u8 = 8;
@@ -38,13 +33,8 @@ const FNZ: u8 = FN | FZ;
 const FNZC: u8 = FNZ | FC;
 const FALL: u8 = FNZC | FV;
 
-// The pool gets flushed when it has this little room left for the next instruction
-const POOL_RESERVE: usize = 8;
-
 pub struct Tr<'a, 'm> {
     pub e: Emit<'a>,
-    // the registers and flags the code after the last block translated may read
-    pub live_out: (u16, u8),
     mem: &'m mut dyn FnMut(u32) -> Option<u32>,
     // native address of the region offset table, 0 translates nothing
     regions: u32,
@@ -61,8 +51,8 @@ pub struct Tr<'a, 'm> {
     // low registers the instruction being translated may use as scratch without saving them: they
     // are dead after it and it does not read them
     free: u8,
-    // the destination register when it is free (it is written anyway), taken first by frames
-    pref: u8,
+    // the destination register when it is free (it is written anyway), what frames take first
+    dest: u8,
     // low registers the instruction reads and nothing after it does
     dying: u8,
     // the flags the instruction reads, apart from its condition
@@ -72,34 +62,25 @@ pub struct Tr<'a, 'm> {
     start: u32,
     // registers known to hold a constant at this point of the block
     kc: [Option<u32>; 16],
-    // the frame that was closed last, to open the next one without a pop and a push in between
-    closed: Option<Closed>,
-}
-
-// where the code that closed a frame starts and ends, and what it popped
-#[derive(Clone, Copy)]
-struct Closed {
-    start: usize,
-    end: usize,
-    mask: u8,
-    flags: Option<u8>,
 }
 
 // The scratch registers of one instruction
 #[derive(Clone, Copy)]
 struct Frame {
-    regs: [u8; 6],
     mask: u8,
     flags: Option<u8>,
     // put the flags back when the frame closes
     restore: bool,
 }
 
-impl Frame {
-    fn t(&self, i: usize) -> u8 {
-        self.regs[i]
-    }
+// the register of a temp that was not asked for, which is not a register
+const NO_REG: u8 = 0xFF;
 
+// Or'd into the flags a frame clobbers: the sequence puts the flags back itself halfway through,
+// so they are saved even when nothing needs them after the instruction.
+const RESTORE_MID: u8 = 16;
+
+impl Frame {
     fn is_temp(&self, r: u8) -> bool {
         r < 8 && self.mask & (1 << r) != 0
     }
@@ -111,8 +92,23 @@ impl Frame {
     }
 }
 
-fn bit(r: u8) -> u8 {
+fn low_bit(r: u8) -> u8 {
     if is_low(r) { 1 << r } else { 0 }
+}
+
+// how a block transfer's frame looks
+struct Plan {
+    to: bool,
+    rr: bool,
+    td: bool,
+    fast: bool,
+    demand: usize,
+}
+
+// do n scratch registers fit among the low registers outside avoid, so that none of the
+// registers the instruction uses has to be borrowed
+fn fits(avoid: u8, n: usize) -> bool {
+    n <= 8 - avoid.count_ones() as usize
 }
 
 #[derive(Clone, Copy)]
@@ -132,7 +128,6 @@ impl<'a, 'm> Tr<'a, 'm> {
     ) -> Self {
         Tr {
             e,
-            live_out: (0xFFFF, FALL),
             mem,
             regions,
             long_skips,
@@ -141,13 +136,12 @@ impl<'a, 'm> Tr<'a, 'm> {
             live: FALL,
             own: 0,
             free: 0,
-            pref: 0,
+            dest: 0,
             dying: 0,
             flags_in: 0,
             start_hw: 0,
             start: 0,
             kc: [None; 16],
-            closed: None,
         }
     }
 
@@ -169,28 +163,35 @@ impl<'a, 'm> Tr<'a, 'm> {
     // ---------------------------------------------------------------------------------------
     // frames
 
-    // Open a frame with n scratch registers, plus one for the flags when they are saved. Free
-    // registers (see Tr::free) cost nothing, the others are pushed. Registers the instruction
-    // uses (avoid) are only taken when there is nothing else, get and set cope with that.
-    fn open(&mut self, n: usize, avoid: u8, save_flags: bool, restore_flags: bool) -> Frame {
-        let total = n + save_flags as usize;
+    // Open a frame with the scratch registers that want asks for, and return them in the same
+    // order (NO_REG for the ones not asked for). Free registers (see Tr::free) cost nothing, the
+    // others are pushed. Registers the instruction uses (avoid) are only taken when there is
+    // nothing else, get and set cope with that. clobbers are the flags the sequence changes: when
+    // any of them is still needed and not set by the instruction anyway the frame saves them in
+    // one more register and puts them back when it closes. pref is taken first.
+    fn open<const N: usize>(
+        &mut self,
+        want: [bool; N],
+        avoid: u8,
+        clobbers: u8,
+        pref: u8,
+    ) -> (Frame, [u8; N]) {
+        let save = !self.can(clobbers);
+        let total =
+            want.iter().filter(|&&w| w).count() + (save || clobbers & RESTORE_MID != 0) as usize;
         let mut f = Frame {
-            regs: [0; 6],
             mask: 0,
             flags: None,
-            restore: save_flags && restore_flags,
+            restore: save,
         };
-        if total > 6 {
-            self.e.fail(JitError::Internal("frame too big"));
-            return f;
-        }
-        let free = (self.free & !avoid) | self.pref;
+        let mut t = [NO_REG; N];
+        let free = (self.free & !avoid) | pref;
         // the destination goes first in every pass
         let mut order = [0u8; 8];
-        order[0] = self.pref.trailing_zeros().min(7) as u8;
-        let mut m = if self.pref != 0 { 1 } else { 0 };
+        order[0] = pref.trailing_zeros().min(7) as u8;
+        let mut m = if pref != 0 { 1 } else { 0 };
         for r in 0..8u8 {
-            if self.pref != 1 << r {
+            if pref != 1 << r {
                 order[m] = r;
                 m += 1;
             }
@@ -200,16 +201,15 @@ impl<'a, 'm> Tr<'a, 'm> {
             for &r in &order {
                 let is_free = free & (1 << r) != 0;
                 let avoided = avoid & (1 << r) != 0;
-                let want = match pass {
+                let take = match pass {
                     0 => is_free,
                     1 => !is_free && !avoided,
                     _ => !is_free && avoided,
                 };
-                if want && k < total {
-                    if k < n {
-                        f.regs[k] = r;
-                    } else {
-                        f.flags = Some(r);
+                if take && k < total {
+                    match (0..N).filter(|&i| want[i]).nth(k) {
+                        Some(i) => t[i] = r,
+                        None => f.flags = Some(r),
                     }
                     if !is_free {
                         f.mask |= 1 << r;
@@ -221,17 +221,9 @@ impl<'a, 'm> Tr<'a, 'm> {
         // A frame that pops and pushes the same registers right after is not needed: the values
         // are still in their slots and the registers are scratch anyway. With saved flags the
         // restore in between is not needed either, unless the instruction reads them.
-        if let Some(c) = self.closed.take()
-            && f.mask != 0
-            && c.end == self.e.len
-            && !self.e.at_barrier()
-            && c.mask == f.mask
-            && c.flags == f.flags
-            && (f.flags.is_none() || self.flags_in == 0)
-        {
-            self.e.len = c.start;
+        if (f.flags.is_none() || self.flags_in == 0) && self.e.reuse_pop(f.mask, f.flags) {
             self.pushed += f.mask.count_ones() as u16;
-            return f;
+            return (f, t);
         }
         if f.mask != 0 {
             self.e.put(thumb::push(f.mask, false));
@@ -240,24 +232,19 @@ impl<'a, 'm> Tr<'a, 'm> {
         if let Some(t) = f.flags {
             self.e.put_all(&thumb::mrs(t));
         }
-        f
+        (f, t)
     }
 
     fn close(&mut self, f: Frame) {
-        let start = self.e.len;
-        if f.restore {
-            self.restore_flags(&f);
+        let restore = f.flags.filter(|_| f.restore);
+        if f.mask == 0 {
+            if let Some(t) = restore {
+                self.e.put_all(&thumb::msr(t));
+            }
+            return;
         }
-        if f.mask != 0 {
-            self.e.put(thumb::pop(f.mask, false));
-            self.pushed -= f.mask.count_ones() as u16;
-            self.closed = Some(Closed {
-                start,
-                end: self.e.len,
-                mask: f.mask,
-                flags: f.flags.filter(|_| f.restore),
-            });
-        }
+        self.e.defer_pop(f.mask, restore);
+        self.pushed -= f.mask.count_ones() as u16;
     }
 
     fn restore_flags(&mut self, f: &Frame) {
@@ -295,7 +282,6 @@ impl<'a, 'm> Tr<'a, 'm> {
         }
     }
 
-    // ARM register r = the low register src
     fn set(&mut self, f: &Frame, r: u8, src: u8) {
         if f.is_temp(r) {
             self.e.put(thumb::str_sp(src, f.slot(r)));
@@ -323,7 +309,7 @@ impl<'a, 'm> Tr<'a, 'm> {
             self.e.put(thumb::movs_imm(t, c as u16));
         } else if !c <= 0xFF && nz_ok {
             self.e.put(thumb::movs_imm(t, !c as u16));
-            self.e.put(thumb::alu(thumb::MVN, t, t));
+            self.e.put(thumb::mvn(t, t));
         } else {
             self.e.lit(t, c);
             if set_nz {
@@ -358,7 +344,34 @@ impl<'a, 'm> Tr<'a, 'm> {
                 self.e.fail(JitError::BadRead(a));
                 return a;
             };
-            let d = decode(word, a);
+            let mut d = decode(word, a);
+            // a pc relative load reads a constant, which is known while translating
+            if let Insn::Mem(MemOp {
+                load: true,
+                kind,
+                pre: true,
+                up,
+                wb: false,
+                rd,
+                rn: PC,
+                off: Offset::Imm(imm),
+            }) = d.insn
+                && rd != PC
+            {
+                let Some(value) = self.pc_literal(a, kind, up, imm) else {
+                    return a;
+                };
+                d.insn = Insn::Dp {
+                    op: DpOp::Mov,
+                    s: false,
+                    rd,
+                    rn: 0,
+                    op2: Op2::Imm {
+                        value,
+                        rotated: false,
+                    },
+                };
+            }
             insns[n] = d;
             n += 1;
             a = a.wrapping_add(4);
@@ -377,48 +390,22 @@ impl<'a, 'm> Tr<'a, 'm> {
                 && d.cond != COND_AL
                 && d.cond == p.cond
                 && !is_terminator(d)
-                && !writes_flags(p);
+                && flags_written(p).0 == 0;
         }
-        // The flags and registers live after each instruction, one backward pass starting from
-        // what the code after the block reads. A branch back into the block adds what is live
-        // at its target and the pass is repeated.
-        let (mut out_r, mut out_f, back) = self.exit_live(start, &insns[n - 1], a, ends);
+        // The flags and registers live after each instruction, one backward pass. The code after
+        // the block may read anything.
         let mut live = [0u8; MAX_BLOCK];
         let mut rlive = [0u16; MAX_BLOCK];
-        loop {
-            let (mut l, mut rl) = (out_f, out_r);
-            let mut target = (0, 0);
-            for i in (0..n).rev() {
-                live[i] = l;
-                rlive[i] = rl;
-                let d = &insns[i];
-                let mut reads = flags_read(d);
-                if d.cond != COND_AL && !in_group[i] {
-                    reads |= cond_flags(d.cond);
-                }
-                let (kills, rkills) = if d.cond == COND_AL {
-                    (flags_written(d).0, regs_written(d))
-                } else {
-                    (0, 0)
-                };
-                l = reads | (l & !kills);
-                rl = regs_read(d) | (rl & !rkills);
-                if back == Some(i) {
-                    target = (rl, l);
-                }
-            }
-            if back.is_none() || (target.0 & !out_r == 0 && target.1 & !out_f == 0) {
-                break;
-            }
-            out_r |= target.0;
-            out_f |= target.1;
+        let (mut l, mut rl) = (FALL, 0xFFFF);
+        for i in (0..n).rev() {
+            (live[i], rlive[i]) = (l, rl);
+            (l, rl) = step(&insns[i], !in_group[i], l, rl);
         }
-        self.live_out = (out_r, out_f);
 
         self.kc = [None; 16];
-        self.start_hw = self.e.len;
+        self.start_hw = self.e.pos();
         self.start = start;
-        let mut skip: Option<(usize, bool)> = None;
+        let mut skip = None;
         for i in 0..n {
             let d = insns[i];
             self.addr = start.wrapping_add(4 * i as u32);
@@ -426,14 +413,14 @@ impl<'a, 'm> Tr<'a, 'm> {
             self.own = flags_written(&d).0 | flags_written(&d).1;
             let read = regs_read(&d);
             // the destination of these is written whatever it held
-            self.pref = match d.insn {
+            self.dest = match d.insn {
                 Insn::Dp { .. }
-                | Insn::Mul { .. }
-                | Insn::Mem { load: true, .. }
+                | Insn::Mul(_)
+                | Insn::Mem(MemOp { load: true, .. })
                 | Insn::Mrs { .. } => (regs_written(&d) & !read) as u8,
                 _ => 0,
             };
-            self.free = !(rlive[i] | read) as u8 | self.pref;
+            self.free = !(rlive[i] | read) as u8 | self.dest;
             self.dying = (read & !rlive[i]) as u8;
             self.flags_in = flags_read(&d);
             let grouped = d.cond != COND_AL && !is_terminator(&d);
@@ -443,7 +430,7 @@ impl<'a, 'm> Tr<'a, 'm> {
             self.insn(d);
             self.track(&d);
             if grouped && (i + 1 == n || !in_group[i + 1]) {
-                self.skip_close(skip.take().unwrap());
+                self.e.bind(skip.take().unwrap());
             }
             if let Some(err) = self.e.err {
                 if let JitError::Internal(msg) = err {
@@ -454,90 +441,16 @@ impl<'a, 'm> Tr<'a, 'm> {
                 }
                 return a;
             }
-            if skip.is_none()
-                && i + 1 < n
-                && (self.e.pool_pressure() > 240 || self.e.pool_room() < POOL_RESERVE)
-            {
+            if skip.is_none() && i + 1 < n && self.e.pool_due() {
                 self.e.flush_pool(true);
             }
         }
         if !ends {
             self.e.slot(a);
         }
+        self.e.settle();
         self.e.flush_pool(false);
         a
-    }
-
-    // The registers and flags the code after a block of n instructions reads, and the index of
-    // the instruction its last branch goes back to when that is inside the block.
-    fn exit_live(
-        &mut self,
-        start: u32,
-        last: &Decoded,
-        next: u32,
-        ends: bool,
-    ) -> (u16, u8, Option<usize>) {
-        if !EXIT_LOOKAHEAD {
-            return (0xFFFF, FALL, None);
-        }
-        if !ends {
-            let (r, f) = self.scan_live(next);
-            return (r, f, None);
-        }
-        let Insn::Branch {
-            link: false,
-            target,
-        } = last.insn
-        else {
-            return (0xFFFF, FALL, None);
-        };
-        let (mut r, mut f) = (0, 0);
-        let mut back = None;
-        if (start..next).contains(&target) && target & 3 == start & 3 {
-            back = Some(((target - start) / 4) as usize);
-        } else {
-            (r, f) = self.scan_live(target);
-        }
-        if last.cond != COND_AL {
-            let (r2, f2) = self.scan_live(next);
-            (r, f) = (r | r2, f | f2);
-        }
-        (r, f, back)
-    }
-
-    // The registers and flags the straight line code from addr reads before it writes them.
-    // Anything it cannot see (branches, unreadable memory) counts as read.
-    fn scan_live(&mut self, addr: u32) -> (u16, u8) {
-        let mut insns = [Decoded {
-            cond: 0,
-            insn: Insn::Unsupported,
-        }; LOOKAHEAD];
-        let mut n = 0;
-        let mut a = addr;
-        while n < LOOKAHEAD {
-            let Some(word) = (self.mem)(a) else {
-                break;
-            };
-            insns[n] = decode(word, a);
-            n += 1;
-            a = a.wrapping_add(4);
-            if is_terminator(&insns[n - 1]) {
-                break;
-            }
-        }
-        let (mut r, mut f) = (0xFFFF, FALL);
-        for d in insns[..n].iter().rev() {
-            let (mut reads, mut kills, mut rkills) = (flags_read(d), 0, 0);
-            if d.cond == COND_AL {
-                kills = flags_written(d).0;
-                rkills = regs_written(d);
-            } else {
-                reads |= cond_flags(d.cond);
-            }
-            f = reads | (f & !kills);
-            r = regs_read(d) | (r & !rkills);
-        }
-        (r, f)
     }
 
     fn insn(&mut self, d: Decoded) {
@@ -547,32 +460,9 @@ impl<'a, 'm> Tr<'a, 'm> {
             Insn::Bx { rm } => self.bx(d.cond, rm),
             _ if writes_pc(&d.insn) => self.pc_write(d),
             Insn::Dp { op, s, rd, rn, op2 } => self.dp(op, s, rd, rn, op2),
-            Insn::Mul {
-                acc,
-                s,
-                rd,
-                rm,
-                rs,
-                rn,
-            } => self.mul(acc, s, rd, rm, rs, rn),
-            Insn::Mem {
-                load,
-                kind,
-                pre,
-                up,
-                wb,
-                rd,
-                rn,
-                off,
-            } => self.mem_access(load, kind, pre, up, wb, rd, rn, off),
-            Insn::Block {
-                load,
-                pre,
-                up,
-                wb,
-                rn,
-                list,
-            } => self.block_transfer(load, pre, up, wb, rn, list),
+            Insn::Mul(m) => self.mul(&m),
+            Insn::Mem(m) => self.mem_access(&m),
+            Insn::Block(b) => self.block_transfer(&b),
             Insn::Swi { num } => self.e.put(thumb::svc(num)),
             Insn::Mrs { rd, spsr } => self.mrs_insn(rd, spsr),
             Insn::Msr { spsr, flags, src } => self.msr_insn(spsr, flags, src),
@@ -580,22 +470,26 @@ impl<'a, 'm> Tr<'a, 'm> {
     }
 
     // Branch over the translation of conditional instructions when the condition fails
-    fn skip_open(&mut self, cond: u8) -> (usize, bool) {
+    fn skip_open(&mut self, cond: u8) -> usize {
         if self.long_skips {
             // b<cond> over the following long branch, b skips the instruction
             self.e.put(thumb::b_cond(cond, 0));
-            (self.e.fwd(), true)
+            self.e.fwd()
         } else {
-            (self.e.fwd_cond(cond ^ 1), false)
+            self.e.fwd_cond(cond ^ 1)
         }
     }
 
-    fn skip_close(&mut self, (at, long): (usize, bool)) {
-        if long {
-            self.e.bind(at);
-        } else {
-            self.e.bind_cond(at);
-        }
+    // Branch over the code that follows when the condition fails. cond_close ends it and gives
+    // the instruction after this one an exit for the case it was skipped, returning that slot.
+    fn cond_open(&mut self, cond: u8) -> Option<usize> {
+        (cond != COND_AL).then(|| self.e.fwd_cond(cond ^ 1))
+    }
+
+    fn cond_close(&mut self, skip: Option<usize>) -> Option<usize> {
+        let at = skip?;
+        self.e.bind(at);
+        Some(self.e.slot(self.addr.wrapping_add(4)))
     }
 
     // ---------------------------------------------------------------------------------------
@@ -605,7 +499,8 @@ impl<'a, 'm> Tr<'a, 'm> {
         let next = self.addr.wrapping_add(4);
         if !link {
             // a loop over the whole block jumps back inside it, if that is in reach
-            let back = |ahead: usize| self.start_hw as i32 - (self.e.len + ahead + 2) as i32;
+            let here = self.e.pos();
+            let back = |ahead: usize| self.start_hw as i32 - (here + ahead + 2) as i32;
             if target == self.start && cond == COND_AL && back(0) >= -1024 {
                 self.e.back(self.start_hw);
             } else if target == self.start && back(0) >= -128 {
@@ -624,26 +519,22 @@ impl<'a, 'm> Tr<'a, 'm> {
                 }
                 let at = self.e.fwd_cond(cond);
                 self.e.slot(next);
-                self.e.bind_cond(at);
+                self.e.bind(at);
                 self.e.slot(target);
             }
             return;
         }
-        let skip = if cond != COND_AL {
-            Some(self.e.fwd_cond(cond ^ 1))
-        } else {
-            None
-        };
+        let skip = self.cond_open(cond);
         // lr = the translated code after the call, which is the slot for the next instruction
         self.e.put(thumb::push(1, false));
         let lit = self.e.lit_late(0);
         self.e.put(thumb::mov(LR, 0));
         self.e.put(thumb::pop(1, false));
         self.e.slot(target);
-        if let Some(s) = skip {
-            self.e.bind_cond(s);
-        }
-        let ret = self.e.slot(next);
+        let ret = match self.cond_close(skip) {
+            Some(ret) => ret,
+            None => self.e.slot(next),
+        };
         let ret_addr = self.e.addr_of(ret) | 1;
         self.e.set_pool(lit, ret_addr);
     }
@@ -653,39 +544,27 @@ impl<'a, 'm> Tr<'a, 'm> {
             self.unsupported();
             return;
         }
-        if cond == COND_AL {
-            self.e.put(thumb::bx(rm));
-        } else {
-            let at = self.e.fwd_cond(cond ^ 1);
-            self.e.put(thumb::bx(rm));
-            self.e.bind_cond(at);
-            let next = self.addr.wrapping_add(4);
-            self.e.slot(next);
-        }
+        let skip = self.cond_open(cond);
+        self.e.put(thumb::bx(rm));
+        self.cond_close(skip);
     }
 
     // Instructions that load the pc: jump through the stack with a pop so no register is lost
     fn pc_write(&mut self, d: Decoded) {
-        let next = self.addr.wrapping_add(4);
-        let skip = if d.cond != COND_AL {
-            Some(self.e.fwd_cond(d.cond ^ 1))
-        } else {
-            None
-        };
+        let skip = self.cond_open(d.cond);
         match d.insn {
-            Insn::Block {
+            Insn::Block(BlockOp {
                 load: true,
                 pre: false,
                 up: true,
                 wb: true,
                 rn: SP,
                 list,
-            } => {
+            }) => {
                 let rest = list & 0x7FFF;
                 if rest & (1 << SP) != 0 {
                     self.unsupported();
                 } else if rest & !0xFF == 0 {
-                    // pop {low registers, pc}
                     self.e.put(thumb::pop(rest as u8, true));
                 } else {
                     // high registers as well: pop those first, then the pc
@@ -693,7 +572,7 @@ impl<'a, 'm> Tr<'a, 'm> {
                     self.e.put(thumb::pop(0, true));
                 }
             }
-            Insn::Mem {
+            Insn::Mem(MemOp {
                 load: true,
                 kind: MemKind::Word,
                 pre: true,
@@ -702,20 +581,14 @@ impl<'a, 'm> Tr<'a, 'm> {
                 rn: PC,
                 off: Offset::Imm(imm),
                 ..
-            } => {
+            }) => {
                 // ldr pc, [pc, #imm], a jump through a literal
-                let a = self.pcv();
-                let a = if up {
-                    a.wrapping_add(imm)
-                } else {
-                    a.wrapping_sub(imm)
-                };
+                let a = off_addr(self.pcv(), up, imm);
                 match (self.mem)(a) {
                     Some(target) if target & 1 == 0 => {
                         self.e.slot(target);
                     }
                     Some(target) => {
-                        // Thumb target
                         self.e.put(thumb::push(1, false));
                         self.e.lit(0, target);
                         self.e.put(thumb::mov(LR, 0));
@@ -727,10 +600,7 @@ impl<'a, 'm> Tr<'a, 'm> {
             }
             _ => self.unsupported(),
         }
-        if let Some(s) = skip {
-            self.e.bind_cond(s);
-            self.e.slot(next);
-        }
+        self.cond_close(skip);
     }
 
     // ---------------------------------------------------------------------------------------
@@ -805,7 +675,7 @@ impl<'a, 'm> Tr<'a, 'm> {
         }
         // flags that are live and not set by the instruction are saved around it, otherwise the
         // lowering may change the dead ones as it likes
-        let save = cl & self.live & !self.own != 0;
+        let save = !self.can(cl);
         let nz_ok = save || self.can(FNZ);
         let all_ok = save || self.can(FALL);
         // the shift clobbers the carry the instruction reads
@@ -842,7 +712,7 @@ impl<'a, 'm> Tr<'a, 'm> {
         let inplace = match v {
             V::Shifted { rm, .. } | V::ShiftReg { rm, .. }
                 if !v_in_res
-                    && self.dying & bit(rm) != 0
+                    && self.dying & low_bit(rm) != 0
                     && (ro_test || rm != rd)
                     && !(op.uses_rn() && rm == rn) =>
             {
@@ -867,45 +737,33 @@ impl<'a, 'm> Tr<'a, 'm> {
             && is_low(rn);
         // rn as a source register of its own
         let ratmp = (ro_test || op == DpOp::Rsc) && !is_low(rn);
-        let n =
-            !(direct || ro_test || fold) as usize + vtmp as usize + aux as usize + ratmp as usize;
+        let own_res = direct || ro_test || fold;
 
-        let mut avoid = if op.uses_rn() { bit(rn) } else { 0 };
+        let mut avoid = if op.uses_rn() { low_bit(rn) } else { 0 };
         if !ro_test {
-            avoid |= bit(rd);
+            avoid |= low_bit(rd);
         }
         match v {
-            V::Reg(rm) | V::Shifted { rm, .. } => avoid |= bit(rm),
-            V::ShiftReg { rm, rs, .. } => avoid |= bit(rm) | bit(rs),
+            V::Reg(rm) | V::Shifted { rm, .. } => avoid |= low_bit(rm),
+            V::ShiftReg { rm, rs, .. } => avoid |= low_bit(rm) | low_bit(rs),
             V::Const(_) => {}
         }
-        self.pref = 0;
-        let f = self.open(n, avoid, save || hazard, save);
-        let mut k = 0;
-        let mut next = || {
-            k += 1;
-            f.t(k - 1)
-        };
-        let res_tmp = if direct || ro_test || fold {
-            rd
-        } else {
-            next()
-        };
+        let clobbers = if hazard { cl | RESTORE_MID } else { cl };
+        // rd is avoided, so it is not the destination frames favour
+        let (f, [t_res, t_v, ta, tr]) = self.open([!own_res, vtmp, aux, ratmp], avoid, clobbers, 0);
+        let res_tmp = if own_res { rd } else { t_res };
         let tv = match inplace {
             Some(rm) => rm,
-            None if vtmp => next(),
+            None if vtmp => t_v,
             None => res_tmp,
         };
         let res = if fold { tv } else { res_tmp };
-        let ta = if aux { next() } else { 0 };
-        let tr = if ratmp { next() } else { 0 };
         if direct && f.is_temp(rd) {
             return self
                 .e
                 .fail(JitError::Internal("frame took the destination"));
         }
 
-        // operand 2, in vr
         let vdst = if v_in_res { res } else { tv };
         let vr = match v {
             V::Const(c) => {
@@ -956,16 +814,7 @@ impl<'a, 'm> Tr<'a, 'm> {
             V::ShiftReg { rm, kind, rs } => {
                 self.get_copy(&f, rm, vdst);
                 let amount = self.get_ro(&f, rs, ta);
-                self.e.put(thumb::alu(
-                    match kind {
-                        Shift::Lsl => thumb::LSL,
-                        Shift::Lsr => thumb::LSR,
-                        Shift::Asr => thumb::ASR,
-                        Shift::Ror => thumb::ROR,
-                    },
-                    vdst,
-                    amount,
-                ));
+                self.e.put(thumb::alu(thumb::shift_op(kind), vdst, amount));
                 vdst
             }
         };
@@ -977,18 +826,15 @@ impl<'a, 'm> Tr<'a, 'm> {
         match op {
             // built in res, the flags of a constant, copy or shift are already set
             DpOp::Mov => {}
-            DpOp::Mvn => self.e.put(thumb::alu(thumb::MVN, res, vr)),
+            DpOp::Mvn => self.e.put(thumb::mvn(res, vr)),
             DpOp::Tst | DpOp::Cmp | DpOp::Cmn => {
                 let ra = self.get_ro(&f, rn, tr);
                 if imm_form {
                     self.e.put(thumb::cmp_imm(ra, c as u16));
                 } else {
-                    let code = match op {
-                        DpOp::Tst => thumb::TST,
-                        DpOp::Cmp => thumb::CMP,
-                        _ => thumb::CMN,
-                    };
-                    self.e.put(thumb::alu(code, ra, vr));
+                    if let Some(code) = thumb::dp_op(op) {
+                        self.e.put(thumb::alu(code, ra, vr));
+                    }
                 }
             }
             DpOp::Rsc => {
@@ -1000,7 +846,7 @@ impl<'a, 'm> Tr<'a, 'm> {
                 let ra = self.get_ro(&f, rn, res);
                 let add = op == DpOp::Add;
                 match v {
-                    V::Const(0) if op == DpOp::Rsb => self.e.put(thumb::alu(thumb::NEG, res, ra)),
+                    V::Const(0) if op == DpOp::Rsb => self.e.put(thumb::neg(res, ra)),
                     V::Const(c) if imm_form && c <= 7 => self.e.put(if add {
                         thumb::adds_imm3(res, ra, c as u16)
                     } else {
@@ -1042,14 +888,9 @@ impl<'a, 'm> Tr<'a, 'm> {
                     self.get_copy(&f, rn, res);
                     vr
                 };
-                self.e.put(match op {
-                    DpOp::And => thumb::alu(thumb::AND, res, b),
-                    DpOp::Eor | DpOp::Teq => thumb::alu(thumb::EOR, res, b),
-                    DpOp::Orr => thumb::alu(thumb::ORR, res, b),
-                    DpOp::Bic => thumb::alu(thumb::BIC, res, b),
-                    DpOp::Adc => thumb::alu(thumb::ADC, res, b),
-                    DpOp::Sbc => thumb::alu(thumb::SBC, res, b),
-                    _ => thumb::add_hi(res, b),
+                self.e.put(match thumb::dp_op(op) {
+                    Some(code) => thumb::alu(code, res, b),
+                    None => thumb::add_hi(res, b),
                 });
             }
         }
@@ -1129,8 +970,7 @@ impl<'a, 'm> Tr<'a, 'm> {
             // there is no saved status, hand out the mode bits alone
             return self.dp(DpOp::Mov, false, rd, 0, mode);
         }
-        let f = self.open(2, bit(rd), false, false);
-        let (t, m) = (f.t(0), f.t(1));
+        let (f, [t, m]) = self.open([true; 2], low_bit(rd), 0, self.dest);
         self.e.put_all(&thumb::mrs(t));
         self.e.lit(m, 0x1F);
         // the flag bits are the top of the word, adding sets the mode bits
@@ -1152,8 +992,7 @@ impl<'a, 'm> Tr<'a, 'm> {
                 return;
             }
         }
-        let f = self.open(1, 0, false, false);
-        let t = f.t(0);
+        let (f, [t]) = self.open([true], 0, 0, 0);
         match src {
             MsrSrc::Reg(rm) => self.get_copy(&f, rm, t),
             MsrSrc::Imm(v) => self.e.lit(t, v),
@@ -1165,7 +1004,15 @@ impl<'a, 'm> Tr<'a, 'm> {
     // ---------------------------------------------------------------------------------------
     // multiply
 
-    fn mul(&mut self, acc: bool, s: bool, rd: u8, rm: u8, rs: u8, rn: u8) {
+    fn mul(&mut self, m: &MulOp) {
+        let MulOp {
+            acc,
+            s,
+            rd,
+            rm,
+            rs,
+            rn,
+        } = *m;
         if rd == PC || rm == PC || rs == PC || (acc && rn == PC) || rd == SP {
             return self.unsupported();
         }
@@ -1176,19 +1023,17 @@ impl<'a, 'm> Tr<'a, 'm> {
             return;
         }
         // muls always sets N and Z
-        let clob = !self.can(FNZ);
-        let f = self.open(
-            2 + acc as usize,
-            bit(rd) | bit(rm) | bit(rs) | bit(rn),
-            clob,
-            clob,
+        let (f, [p, o, ta]) = self.open(
+            [true, true, acc],
+            low_bit(rd) | low_bit(rm) | low_bit(rs) | low_bit(rn),
+            FNZ,
+            self.dest,
         );
-        let (p, o) = (f.t(0), f.t(1));
         self.get_copy(&f, rm, p);
         let b = self.get_ro(&f, rs, o);
         self.e.put(thumb::alu(thumb::MUL, p, b));
         if acc {
-            let a = self.get_ro(&f, rn, f.t(2));
+            let a = self.get_ro(&f, rn, ta);
             self.e.put(thumb::add_hi(p, a));
             if s {
                 self.e.put(thumb::movs_reg(p, p));
@@ -1201,51 +1046,32 @@ impl<'a, 'm> Tr<'a, 'm> {
     // ---------------------------------------------------------------------------------------
     // single data transfer
 
-    #[allow(clippy::too_many_arguments)]
-    fn mem_access(
-        &mut self,
-        load: bool,
-        kind: MemKind,
-        pre: bool,
-        up: bool,
-        wb: bool,
-        rd: u8,
-        rn: u8,
-        off: Offset,
-    ) {
-        if rd == PC || (load && rd == SP) {
+    fn mem_access(&mut self, m: &MemOp) {
+        let MemOp {
+            load,
+            kind,
+            pre,
+            up,
+            rd,
+            rn,
+            off,
+            ..
+        } = *m;
+        // the pc relative loads that can be done were turned into moves by block
+        if rd == PC || rn == PC || (load && rd == SP) {
             return self.unsupported();
         }
-        if rn == PC {
-            // a pc relative load of a constant
-            let (true, true, false, Offset::Imm(imm)) = (load, pre, wb, off) else {
-                return self.unsupported();
-            };
-            let Some(value) = self.pc_literal(kind, up, imm) else {
-                return;
-            };
-            let value = Op2::Imm {
-                value,
-                rotated: false,
-            };
-            return self.dp(DpOp::Mov, false, rd, 0, value);
-        }
-        if rn == SP && self.sp_access(load, kind, pre, up, wb, rd, off) {
-            return;
-        }
-        if let (Some(base), Offset::Imm(i)) = (self.kc[rn as usize], off)
-            && rn != SP
-            && self.mem_const(load, kind, pre, up, wb, rd, rn, base, i)
-        {
+        if rn == SP && self.sp_access(m) {
             return;
         }
 
-        let size_shift = match kind {
-            MemKind::Word => 2,
-            MemKind::Half | MemKind::SignedHalf => 1,
-            MemKind::Byte | MemKind::SignedByte => 0,
-        };
-        let update = !pre || wb;
+        let size_shift = kind.size_shift();
+        let update = m.update();
+        // the base register is rewritten, unless the load of rd wins
+        let writes_base = update && !(load && rd == rn);
+        // a base with a known value gives a native address, and the new base, that are worked
+        // out now, so the access needs no lookup and no offset
+        let konst = self.const_address(m);
         // The offset is folded into the access when it fits, else it goes through a register
         // that is added to the address (pre) and to the base register (update).
         let mut imm5 = None;
@@ -1253,9 +1079,10 @@ impl<'a, 'm> Tr<'a, 'm> {
         // a post indexed immediate is added to the base register with one adds or subs
         let mut post_imm = None;
         // the flags the offset computation and the lookup change
-        let translate = self.regions != 0 && rn != SP;
+        let translate = self.regions != 0 && rn != SP && konst.is_none();
         let mut cl = if translate { FALL } else { 0 };
         match off {
+            _ if konst.is_some() => imm5 = Some(0),
             Offset::Imm(0) => imm5 = Some(0),
             Offset::Imm(i) => {
                 if !update && up && i & ((1 << size_shift) - 1) == 0 && (i >> size_shift) <= 31 {
@@ -1282,9 +1109,9 @@ impl<'a, 'm> Tr<'a, 'm> {
                 }
             }
         }
-        let clob = !self.can(cl);
+        let save = !self.can(cl);
         let rm_bit = match off {
-            Offset::Reg { rm, .. } => bit(rm),
+            Offset::Reg { rm, .. } => low_bit(rm),
             _ => 0,
         };
         // A pre indexed offset is added before the lookup, so the region is the one the access
@@ -1294,26 +1121,37 @@ impl<'a, 'm> Tr<'a, 'm> {
         // temps: the base, the offset (also the table pointer), a copy of rn or the address, the data
         let want_to = translate || need_to;
         let want_rr = translate && (ea || !is_low(rn));
-        let avoid = bit(rn) | bit(rd) | rm_bit;
+        let avoid = low_bit(rn) | low_bit(rd) | rm_bit;
         let temps = 1 + want_to as usize + want_rr as usize;
         // a data register when rd is high, or when the frame may have to borrow rd
-        let want_td = !is_low(rd) || temps + clob as usize > 8 - avoid.count_ones() as usize;
-        let f = self.open(temps + want_td as usize, avoid, clob, clob);
+        let want_td = !is_low(rd) || !fits(avoid, temps + save as usize);
+        // A known address is built in the destination of a load into a low register, else in tn.
+        // tr holds the new base when that is a high register and nothing else is free to.
+        let low_load = load && is_low(rd);
+        let (want, clobbers, pref) = if konst.is_some() {
+            let want_tr = writes_base && !is_low(rn) && low_load;
+            ([!low_load, false, want_tr, !load && !is_low(rd)], 0, 0)
+        } else {
+            ([true, want_to, want_rr, want_td], cl, self.dest)
+        };
+        let (f, [tn, to, tr, td]) = self.open(want, avoid, clobbers, pref);
+        let tn = if want[0] { tn } else { rd };
+        // rn is only borrowed when there is a td, the copy for the lookup then goes there
+        let tr = if want[2] { tr } else { td };
         // add_to would use tn, which the load has overwritten with rd
-        if (update && need_to && load && f.is_temp(rn) && f.t(0) == rd)
+        if (update && need_to && load && f.is_temp(rn) && tn == rd)
             || (post_imm.is_some() && f.is_temp(rn))
         {
             return self
                 .e
                 .fail(JitError::Internal("the pushed base is in the way"));
         }
-        let tn = f.t(0);
-        let to = f.t(1);
-        let tr = f.t(1 + want_to as usize);
-        let td = f.t(1 + want_to as usize + want_rr as usize);
 
         // the register the access goes through, and the register holding the signed offset
-        let (base, to_reg) = if ea {
+        let (base, to_reg) = if let Some((native, _)) = konst {
+            self.e.lit(tn, native);
+            (tn, to)
+        } else if ea {
             let to_reg = self.mem_offset(&f, off, up, update, to);
             let rr = self.get_ro(&f, rn, tr);
             if rr != tr {
@@ -1350,27 +1188,11 @@ impl<'a, 'm> Tr<'a, 'm> {
         let rt = if load && rt_direct {
             rd
         } else if load {
-            td
+            if konst.is_some() { tn } else { td }
         } else {
             self.get_ro(&f, rd, td)
         };
-        match (load, kind) {
-            (true, MemKind::Word) => self.e.put(thumb::ldr_imm(rt, base, i5)),
-            (false, MemKind::Word) => self.e.put(thumb::str_imm(rt, base, i5)),
-            (true, MemKind::Byte) => self.e.put(thumb::ldrb_imm(rt, base, i5)),
-            (false, MemKind::Byte) => self.e.put(thumb::strb_imm(rt, base, i5)),
-            (true, MemKind::Half) => self.e.put(thumb::ldrh_imm(rt, base, i5)),
-            (false, MemKind::Half) => self.e.put(thumb::strh_imm(rt, base, i5)),
-            (true, MemKind::SignedByte) => {
-                self.e.put(thumb::ldrb_imm(rt, base, i5));
-                self.e.put(thumb::sxtb(rt, rt));
-            }
-            (true, MemKind::SignedHalf) => {
-                self.e.put(thumb::ldrh_imm(rt, base, i5));
-                self.e.put(thumb::sxth(rt, rt));
-            }
-            _ => return self.unsupported(),
-        }
+        self.mem_op(load, kind, rt, base, i5);
         if load && !rt_direct {
             self.set(&f, rd, rt);
         }
@@ -1382,7 +1204,17 @@ impl<'a, 'm> Tr<'a, 'm> {
                     false => thumb::subs_imm8(rn, i),
                 });
             }
-        } else if update && need_to && rn != SP && !(load && rd == rn) {
+        } else if let Some((_, moved)) = konst {
+            if writes_base {
+                if is_low(rn) {
+                    self.e.lit(rn, moved);
+                } else {
+                    let tb = if want[2] { tr } else { tn };
+                    self.e.lit(tb, moved);
+                    self.e.put(thumb::mov(rn, tb));
+                }
+            }
+        } else if writes_base && need_to && rn != SP {
             if ea {
                 self.set(&f, rn, tr);
             } else {
@@ -1407,15 +1239,36 @@ impl<'a, 'm> Tr<'a, 'm> {
         }
     }
 
+    // A load or store of rt through base, the offset is already divided by the access size.
+    // The signed loads sign extend what the plain ones give.
+    fn mem_op(&mut self, load: bool, kind: MemKind, rt: u8, base: u8, imm5: u16) {
+        let e = &mut self.e;
+        match (load, kind) {
+            (true, MemKind::Word) => e.put(thumb::ldr_imm(rt, base, imm5)),
+            (false, MemKind::Word) => e.put(thumb::str_imm(rt, base, imm5)),
+            (true, MemKind::Byte) => e.put(thumb::ldrb_imm(rt, base, imm5)),
+            (false, MemKind::Byte) => e.put(thumb::strb_imm(rt, base, imm5)),
+            (true, MemKind::Half) => e.put(thumb::ldrh_imm(rt, base, imm5)),
+            (false, MemKind::Half) => e.put(thumb::strh_imm(rt, base, imm5)),
+            (true, MemKind::SignedByte) => {
+                e.put(thumb::ldrb_imm(rt, base, imm5));
+                e.put(thumb::sxtb(rt, rt));
+            }
+            (true, MemKind::SignedHalf) => {
+                e.put(thumb::ldrh_imm(rt, base, imm5));
+                e.put(thumb::sxth(rt, rt));
+            }
+            // the decoder gives no signed stores
+            (false, MemKind::SignedByte | MemKind::SignedHalf) => {
+                e.fail(JitError::Internal("signed store"))
+            }
+        }
+    }
+
     // The value of the word a pc relative load reads, as the load gives it. The pool is read
     // while translating, like the code is.
-    fn pc_literal(&mut self, kind: MemKind, up: bool, imm: u32) -> Option<u32> {
-        let pcv = self.pcv();
-        let a = if up {
-            pcv.wrapping_add(imm)
-        } else {
-            pcv.wrapping_sub(imm)
-        };
+    fn pc_literal(&mut self, at: u32, kind: MemKind, up: bool, imm: u32) -> Option<u32> {
+        let a = off_addr(at.wrapping_add(8), up, imm);
         let Some(w) = (self.mem)(a & !3) else {
             self.e.fail(JitError::BadRead(a));
             return None;
@@ -1489,20 +1342,7 @@ impl<'a, 'm> Tr<'a, 'm> {
                 } if !op.is_test() => {
                     new[0] = self.fold(op, rn, op2).map(|v| (rd, v));
                 }
-                Insn::Mem {
-                    load: true,
-                    kind,
-                    pre: true,
-                    wb: false,
-                    up,
-                    rd,
-                    rn: PC,
-                    off: Offset::Imm(imm),
-                } => {
-                    let value = self.pc_literal(kind, up, imm);
-                    new[0] = value.map(|v| (rd, v));
-                }
-                Insn::Mem {
+                Insn::Mem(MemOp {
                     load,
                     wb: true,
                     up,
@@ -1510,17 +1350,8 @@ impl<'a, 'm> Tr<'a, 'm> {
                     rn,
                     off: Offset::Imm(i),
                     ..
-                } if rn != PC && !(load && rd == rn) => {
-                    new[1] = self.known(rn).map(|v| {
-                        (
-                            rn,
-                            if up {
-                                v.wrapping_add(i)
-                            } else {
-                                v.wrapping_sub(i)
-                            },
-                        )
-                    });
+                }) if rn != PC && !(load && rd == rn) => {
+                    new[1] = self.known(rn).map(|v| (rn, off_addr(v, up, i)));
                 }
                 _ => {}
             }
@@ -1557,95 +1388,22 @@ impl<'a, 'm> Tr<'a, 'm> {
         (page >> 24 != gba >> 24).then(|| page + (gba & 0x1FF))
     }
 
-    // A load or store through a register with a known value. Returns false for the ones that
-    // need the lookup.
-    #[allow(clippy::too_many_arguments)]
-    fn mem_const(
-        &mut self,
-        load: bool,
-        kind: MemKind,
-        pre: bool,
-        up: bool,
-        wb: bool,
-        rd: u8,
-        rn: u8,
-        base: u32,
-        imm: u32,
-    ) -> bool {
-        let moved = if up {
-            base.wrapping_add(imm)
-        } else {
-            base.wrapping_sub(imm)
+    // The native address an access through a register with a known value goes to, and the value
+    // the base register gets, when the region table tells.
+    fn const_address(&mut self, m: &MemOp) -> Option<(u32, u32)> {
+        let (Some(base), Offset::Imm(imm)) = (self.kc[m.rn as usize], m.off) else {
+            return None;
         };
-        let ea = if pre { moved } else { base };
-        let size = match kind {
-            MemKind::Word => 4,
-            MemKind::Half | MemKind::SignedHalf => 2,
-            _ => 1,
-        };
+        if m.rn == SP {
+            return None;
+        }
+        let moved = off_addr(base, m.up, imm);
+        let ea = if m.pre { moved } else { base };
         // an unaligned word or halfword is not a plain access
-        if ea & (size - 1) != 0 {
-            return false;
+        if ea & ((1 << m.kind.size_shift()) - 1) != 0 {
+            return None;
         }
-        let Some(native) = self.native(ea) else {
-            return false;
-        };
-        let update = (!pre || wb) && !(load && rd == rn);
-        let low_load = load && is_low(rd);
-        // the address register (rd for a load), the data of a store from a high register, the
-        // new base register value
-        let want_ta = !low_load;
-        let want_td = !load && !is_low(rd);
-        let want_tb = update && !is_low(rn) && low_load;
-        self.pref = 0;
-        let f = self.open(
-            want_ta as usize + want_td as usize + want_tb as usize,
-            bit(rd) | bit(rn),
-            false,
-            false,
-        );
-        let mut k = 0;
-        let mut next = || {
-            k += 1;
-            f.t(k - 1)
-        };
-        let ta = if want_ta { next() } else { rd };
-        let td = if want_td { next() } else { 0 };
-        let tb = if want_tb { next() } else { ta };
-        self.e.lit(ta, native);
-        let rt = if load { ta } else { self.get_ro(&f, rd, td) };
-        match (load, kind) {
-            (true, MemKind::Word) => self.e.put(thumb::ldr_imm(rt, ta, 0)),
-            (false, MemKind::Word) => self.e.put(thumb::str_imm(rt, ta, 0)),
-            (true, MemKind::Byte) => self.e.put(thumb::ldrb_imm(rt, ta, 0)),
-            (false, MemKind::Byte) => self.e.put(thumb::strb_imm(rt, ta, 0)),
-            (true, MemKind::Half) => self.e.put(thumb::ldrh_imm(rt, ta, 0)),
-            (false, MemKind::Half) => self.e.put(thumb::strh_imm(rt, ta, 0)),
-            (true, MemKind::SignedByte) => {
-                self.e.put(thumb::ldrb_imm(rt, ta, 0));
-                self.e.put(thumb::sxtb(rt, rt));
-            }
-            (true, MemKind::SignedHalf) => {
-                self.e.put(thumb::ldrh_imm(rt, ta, 0));
-                self.e.put(thumb::sxth(rt, rt));
-            }
-            _ => {
-                self.unsupported();
-            }
-        }
-        if load && !low_load {
-            self.set(&f, rd, ta);
-        }
-        if update {
-            if is_low(rn) {
-                self.e.lit(rn, moved);
-            } else {
-                self.e.lit(tb, moved);
-                self.e.put(thumb::mov(rn, tb));
-            }
-        }
-        self.close(f);
-        true
+        Some((self.native(ea)?, moved))
     }
 
     // tn = the native address of the GBA address in rr. The table entry for its top byte is
@@ -1669,7 +1427,7 @@ impl<'a, 'm> Tr<'a, 'm> {
         self.e.put(thumb::lsrs_imm(tb, rr, 9));
         self.e.put(thumb::lsls_imm(tb, tb, 9));
         self.e.put(thumb::subs_reg(tn, tn, tb));
-        self.e.bind_cond(flat);
+        self.e.bind(flat);
         self.e.put(thumb::add_hi(tn, rr));
     }
 
@@ -1692,12 +1450,12 @@ impl<'a, 'm> Tr<'a, 'm> {
                     self.e.put(if up {
                         thumb::mov(to, src)
                     } else {
-                        thumb::alu(thumb::NEG, to, src)
+                        thumb::neg(to, src)
                     });
                 } else {
                     self.shift_imm(kind, to, src, amount);
                     if !up {
-                        self.e.put(thumb::alu(thumb::NEG, to, to));
+                        self.e.put(thumb::neg(to, to));
                     }
                 }
                 to
@@ -1706,17 +1464,17 @@ impl<'a, 'm> Tr<'a, 'm> {
     }
 
     // The sp forms that need no translation of the address. Returns false for the rest.
-    #[allow(clippy::too_many_arguments)]
-    fn sp_access(
-        &mut self,
-        load: bool,
-        kind: MemKind,
-        pre: bool,
-        up: bool,
-        wb: bool,
-        rd: u8,
-        off: Offset,
-    ) -> bool {
+    fn sp_access(&mut self, m: &MemOp) -> bool {
+        let MemOp {
+            load,
+            kind,
+            pre,
+            up,
+            wb,
+            rd,
+            off,
+            ..
+        } = *m;
         let Offset::Imm(i) = off else {
             return false;
         };
@@ -1741,8 +1499,13 @@ impl<'a, 'm> Tr<'a, 'm> {
                 return true;
             }
             self.e.put(thumb::sub_sp(words as u16));
-            let at = Offset::Imm(words * 4 - i);
-            self.mem_access(load, kind, true, true, false, rd, SP, at);
+            self.mem_access(&MemOp {
+                pre: true,
+                up: true,
+                wb: false,
+                off: Offset::Imm(words * 4 - i),
+                ..*m
+            });
             if !wb {
                 self.e.put(thumb::add_sp(words as u16));
             }
@@ -1763,7 +1526,15 @@ impl<'a, 'm> Tr<'a, 'm> {
     // ---------------------------------------------------------------------------------------
     // block data transfer
 
-    fn block_transfer(&mut self, load: bool, pre: bool, up: bool, wb: bool, rn: u8, list: u16) {
+    fn block_transfer(&mut self, b: &BlockOp) {
+        let BlockOp {
+            load,
+            pre,
+            up,
+            wb,
+            rn,
+            list,
+        } = *b;
         let n = list.count_ones();
         // the pc is only loaded by pc_write, sp can be stored through another base but not loaded
         let sp_in_list = list & (1 << SP) != 0;
@@ -1803,47 +1574,41 @@ impl<'a, 'm> Tr<'a, 'm> {
         let base_in_list = list & (1 << rn) != 0;
         let update = wb && !(load && base_in_list);
         let translate = self.regions != 0;
-        let save = translate && !self.can(FALL);
-        let used = bit(rn) | low_list;
-        let free = 8 - used.count_ones() as usize;
+        let clobbers = if translate { FALL } else { 0 };
+        let save = !self.can(clobbers);
+        let used = low_bit(rn) | low_list;
         // What the frame holds: tn, to (the lookup scratch, also the offset and the register
         // that other registers go through), a copy of rn for the lookup when it is high or moved
         // by an offset, and the flags. ldmia/stmia need every scratch register outside the list.
         let plan = |add_imm: bool| {
-            let want_to = translate || start != 0 || (update && !add_imm);
-            let fixed = 1 + want_to as usize + save as usize;
+            let to = translate || start != 0 || (update && !add_imm);
+            let fixed = 1 + to as usize + save as usize;
             let rr = translate && (!is_low(rn) || start != 0);
-            let fast = all_low && free >= fixed + rr as usize;
-            let want_td = !fast && !want_to;
+            let fast = all_low && fits(used, fixed + rr as usize);
+            let td = !fast && !to;
             // when the frame has to borrow registers rn can be one of them, the lookup then
             // reads it through a copy
-            let demand = fixed + rr as usize + want_td as usize;
-            let rr = rr || (translate && free < demand);
-            (want_to, rr, want_td, fast, demand)
+            let demand = fixed + rr as usize + td as usize;
+            let rr = rr || (translate && !fits(used, demand));
+            Plan {
+                to,
+                rr,
+                td,
+                fast,
+                demand,
+            }
         };
         // the base register moves with an adds or subs when that may set the flags and no
         // register has to be borrowed for it
         let mut add_imm = update && is_low(rn) && (save || self.can(FALL));
         let mut p = plan(add_imm);
-        if add_imm && free < p.4 {
+        if add_imm && !fits(used, p.demand) {
             add_imm = false;
             p = plan(false);
         }
-        let (want_to, want_rr, want_td, fast, _) = p;
-        let f = self.open(
-            1 + want_to as usize + want_rr as usize + want_td as usize,
-            used,
-            save,
-            save,
-        );
-        let tn = f.t(0);
-        let to = f.t(1);
-        let tr = f.t(1 + want_to as usize);
-        let td = if want_td {
-            f.t(1 + want_to as usize + want_rr as usize)
-        } else {
-            to
-        };
+        let fast = p.fast;
+        let (f, [tn, to, tr, td]) = self.open([true, p.to, p.rr, p.td], used, clobbers, self.dest);
+        let td = if p.td { td } else { to };
 
         if translate {
             // an offset moves the base before the lookup, like for a single transfer
@@ -1914,67 +1679,97 @@ impl<'a, 'm> Tr<'a, 'm> {
     // lowest low register of the list, which is free to use once stored and before it is loaded.
     // Without one r0 is borrowed and kept in an extra word under the data.
     fn push_general(&mut self, list: u16) {
-        let low = list as u8;
-        let nl = low.count_ones() as u16;
-        let nh = (list >> 8).count_ones() as u16;
-        // without a low register r0 is borrowed
-        let borrow = low == 0;
-        let t = if borrow {
-            0
-        } else {
-            low.trailing_zeros() as u8
-        };
-        self.e.put(thumb::sub_sp(nh));
-        self.e.put(thumb::push(low | borrow as u8, false));
-        let mut k = nl + borrow as u16;
+        let l = ListSplit::new(list);
+        self.e.put(thumb::sub_sp(l.nh));
+        self.e.put(thumb::push(l.pushed(), false));
+        let mut k = l.words();
         for r in 8..15u8 {
             if list & (1 << r) != 0 {
-                self.e.put(thumb::mov(t, r));
-                self.e.put(thumb::str_sp(t, k));
+                self.e.put(thumb::mov(l.t, r));
+                self.e.put(thumb::str_sp(l.t, k));
                 k += 1;
             }
         }
-        if borrow {
-            self.e.put(thumb::pop(1 << t, false));
+        if l.borrow {
+            self.e.put(thumb::pop(1 << l.t, false));
         } else {
-            self.e.put(thumb::ldr_sp(t, 0));
+            self.e.put(thumb::ldr_sp(l.t, 0));
         }
     }
 
     // ldmia sp!, {list} with registers pop cannot reach, the list has no pc
     fn pop_general(&mut self, list: u16) {
-        let low = list as u8;
-        let nl = low.count_ones() as u16;
-        let nh = (list >> 8).count_ones() as u16;
-        // without a low register r0 is borrowed
-        let borrow = low == 0;
-        let t = if borrow {
-            0
-        } else {
-            low.trailing_zeros() as u8
-        };
-        if borrow {
-            self.e.put(thumb::push(1 << t, false));
+        let l = ListSplit::new(list);
+        if l.borrow {
+            self.e.put(thumb::push(1 << l.t, false));
         }
-        let mut k = nl + borrow as u16;
+        let mut k = l.words();
         for r in 8..15u8 {
             if list & (1 << r) != 0 {
-                self.e.put(thumb::ldr_sp(t, k));
-                self.e.put(thumb::mov(r, t));
+                self.e.put(thumb::ldr_sp(l.t, k));
+                self.e.put(thumb::mov(r, l.t));
                 k += 1;
             }
         }
         // the low registers last, t gets its own value back
-        self.e.put(thumb::pop(low | borrow as u8, false));
-        self.e.put(thumb::add_sp(nh));
+        self.e.put(thumb::pop(l.pushed(), false));
+        self.e.put(thumb::add_sp(l.nh));
+    }
+}
+
+// A register list as push_general and pop_general see it
+struct ListSplit {
+    low: u8,
+    nl: u16,
+    // how many high registers
+    nh: u16,
+    // the list has no low register, so r0 is borrowed
+    borrow: bool,
+    // the low register the high ones go through
+    t: u8,
+}
+
+impl ListSplit {
+    fn new(list: u16) -> Self {
+        let low = list as u8;
+        let borrow = low == 0;
+        ListSplit {
+            low,
+            nl: low.count_ones() as u16,
+            nh: (list >> 8).count_ones() as u16,
+            borrow,
+            t: if borrow {
+                0
+            } else {
+                low.trailing_zeros() as u8
+            },
+        }
+    }
+
+    // the low registers on the stack, with the borrowed one
+    fn pushed(&self) -> u8 {
+        self.low | self.borrow as u8
+    }
+
+    // the words they take, which is where the high registers' slots start
+    fn words(&self) -> u16 {
+        self.nl + self.borrow as u16
+    }
+}
+
+fn off_addr(base: u32, up: bool, imm: u32) -> u32 {
+    if up {
+        base.wrapping_add(imm)
+    } else {
+        base.wrapping_sub(imm)
     }
 }
 
 fn writes_pc(insn: &Insn) -> bool {
     match *insn {
         Insn::Dp { op, rd, .. } => !op.is_test() && rd == PC,
-        Insn::Mem { load, rd, .. } => load && rd == PC,
-        Insn::Block { load, list, .. } => load && list & (1 << 15) != 0,
+        Insn::Mem(m) => m.load && m.rd == PC,
+        Insn::Block(b) => b.load && b.list & (1 << 15) != 0,
         _ => false,
     }
 }
@@ -1984,15 +1779,6 @@ fn is_terminator(d: &Decoded) -> bool {
         d.insn,
         Insn::Branch { .. } | Insn::Bx { .. } | Insn::Unsupported
     ) || writes_pc(&d.insn)
-}
-
-// does the instruction change the flags, which ends a condition group
-fn writes_flags(d: &Decoded) -> bool {
-    match d.insn {
-        Insn::Dp { s, .. } | Insn::Mul { s, .. } => s,
-        Insn::Msr { spsr, flags, .. } => flags && !spsr,
-        _ => false,
-    }
 }
 
 // The flags the instruction sets for sure, and the ones it sets or leaves alone depending on the
@@ -2013,7 +1799,7 @@ fn flags_written(d: &Decoded) -> (u8, u8) {
             Op2::RegShift { .. } => (FNZ, FC),
         },
         Insn::Dp { s: true, .. } => (FALL, 0),
-        Insn::Mul { s: true, .. } => (FNZ, 0),
+        Insn::Mul(MulOp { s: true, .. }) => (FNZ, 0),
         Insn::Msr { spsr, flags, .. } if flags && !spsr => (FALL, 0),
         _ => (0, 0),
     }
@@ -2033,6 +1819,21 @@ fn flags_read(d: &Decoded) -> u8 {
         Insn::Mrs { .. } => FALL,
         _ => 0,
     }
+}
+
+// The flags and registers live before an instruction, given the ones live after it. Its
+// condition is read unless a skip shared with the instruction before it already tests it, and a
+// conditional instruction kills nothing because it may not run.
+fn step(d: &Decoded, tests_cond: bool, flags: u8, regs: u16) -> (u8, u16) {
+    let mut reads = flags_read(d);
+    let (mut kills, mut rkills) = (flags_written(d).0, regs_written(d));
+    if d.cond != COND_AL {
+        if tests_cond {
+            reads |= cond_flags(d.cond);
+        }
+        (kills, rkills) = (0, 0);
+    }
+    (reads | (flags & !kills), regs_read(d) | (regs & !rkills))
 }
 
 // the flags a condition code reads
@@ -2061,19 +1862,15 @@ fn regs_read(d: &Decoded) -> u16 {
             };
             o | if op.uses_rn() { bit(rn) } else { 0 }
         }
-        Insn::Mul {
-            acc, rm, rs, rn, ..
-        } => bit(rm) | bit(rs) | if acc { bit(rn) } else { 0 },
-        Insn::Mem {
-            load, rd, rn, off, ..
-        } => {
-            let o = match off {
+        Insn::Mul(m) => bit(m.rm) | bit(m.rs) | if m.acc { bit(m.rn) } else { 0 },
+        Insn::Mem(m) => {
+            let o = match m.off {
                 Offset::Imm(_) => 0,
                 Offset::Reg { rm, .. } => bit(rm),
             };
-            o | bit(rn) | if load { 0 } else { bit(rd) }
+            o | bit(m.rn) | if m.load { 0 } else { bit(m.rd) }
         }
-        Insn::Block { load, rn, list, .. } => bit(rn) | if load { 0 } else { list },
+        Insn::Block(b) => bit(b.rn) | if b.load { 0 } else { b.list },
         Insn::Msr {
             src: MsrSrc::Reg(rm),
             ..
@@ -2096,13 +1893,9 @@ fn regs_written(d: &Decoded) -> u16 {
                 bit(rd)
             }
         }
-        Insn::Mul { rd, .. } | Insn::Mrs { rd, .. } => bit(rd),
-        Insn::Mem {
-            load, wb, rd, rn, ..
-        } => (if load { bit(rd) } else { 0 }) | if wb { bit(rn) } else { 0 },
-        Insn::Block {
-            load, wb, rn, list, ..
-        } => (if load { list } else { 0 }) | if wb { bit(rn) } else { 0 },
+        Insn::Mul(MulOp { rd, .. }) | Insn::Mrs { rd, .. } => bit(rd),
+        Insn::Mem(m) => (if m.load { bit(m.rd) } else { 0 }) | if m.wb { bit(m.rn) } else { 0 },
+        Insn::Block(b) => (if b.load { b.list } else { 0 }) | if b.wb { bit(b.rn) } else { 0 },
         Insn::Branch { link: true, .. } => bit(LR),
         _ => 0,
     }

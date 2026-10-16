@@ -1,5 +1,6 @@
 // Encoders for the ARMv6-M (Cortex-M0+) Thumb instructions the translator emits. Low registers
 // are r0-r7, anything above is a high register that only a few instructions can reach.
+use super::decode::{DpOp, Shift};
 
 pub const NOP: u16 = 0xBF00;
 // UDF #0xFE, raises a HardFault the handler recognises as an unresolved exit
@@ -34,6 +35,41 @@ pub const MVN: u16 = 0xF;
 pub fn alu(op: u16, rdn: u8, rm: u8) -> u16 {
     debug_assert!(rdn < 8 && rm < 8);
     0x4000 | op << 6 | (rm as u16) << 3 | rdn as u16
+}
+
+pub fn neg(rd: u8, rm: u8) -> u16 {
+    alu(NEG, rd, rm)
+}
+
+pub fn mvn(rd: u8, rm: u8) -> u16 {
+    alu(MVN, rd, rm)
+}
+
+// the ALU opcode that shifts by a register
+pub fn shift_op(kind: Shift) -> u16 {
+    match kind {
+        Shift::Lsl => LSL,
+        Shift::Lsr => LSR,
+        Shift::Asr => ASR,
+        Shift::Ror => ROR,
+    }
+}
+
+// The ALU opcode that does a data processing op as rdn = rdn op rm, for the ones that have one
+// (TEQ is an EOR whose result is thrown away).
+pub fn dp_op(op: DpOp) -> Option<u16> {
+    Some(match op {
+        DpOp::And => AND,
+        DpOp::Eor | DpOp::Teq => EOR,
+        DpOp::Adc => ADC,
+        DpOp::Sbc => SBC,
+        DpOp::Tst => TST,
+        DpOp::Cmp => CMP,
+        DpOp::Cmn => CMN,
+        DpOp::Orr => ORR,
+        DpOp::Bic => BIC,
+        _ => return None,
+    })
 }
 
 // MOV rd, rm between any registers, does not touch the flags

@@ -100,10 +100,60 @@ pub enum MemKind {
     SignedHalf,
 }
 
+impl MemKind {
+    // log2 of the number of bytes the access moves
+    pub fn size_shift(self) -> u32 {
+        match self {
+            MemKind::Word => 2,
+            MemKind::Half | MemKind::SignedHalf => 1,
+            MemKind::Byte | MemKind::SignedByte => 0,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MsrSrc {
     Reg(u8),
     Imm(u32),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MulOp {
+    pub acc: bool,
+    pub s: bool,
+    pub rd: u8,
+    pub rm: u8,
+    pub rs: u8,
+    pub rn: u8,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MemOp {
+    pub load: bool,
+    pub kind: MemKind,
+    pub pre: bool,
+    pub up: bool,
+    pub wb: bool,
+    pub rd: u8,
+    pub rn: u8,
+    pub off: Offset,
+}
+
+impl MemOp {
+    // does the base register change
+    pub fn update(&self) -> bool {
+        !self.pre || self.wb
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BlockOp {
+    pub load: bool,
+    pub pre: bool,
+    pub up: bool,
+    pub wb: bool,
+    pub rn: u8,
+    pub list: u16,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -115,32 +165,9 @@ pub enum Insn {
         rn: u8,
         op2: Op2,
     },
-    Mul {
-        acc: bool,
-        s: bool,
-        rd: u8,
-        rm: u8,
-        rs: u8,
-        rn: u8,
-    },
-    Mem {
-        load: bool,
-        kind: MemKind,
-        pre: bool,
-        up: bool,
-        wb: bool,
-        rd: u8,
-        rn: u8,
-        off: Offset,
-    },
-    Block {
-        load: bool,
-        pre: bool,
-        up: bool,
-        wb: bool,
-        rn: u8,
-        list: u16,
-    },
+    Mul(MulOp),
+    Mem(MemOp),
+    Block(BlockOp),
     // Only the flags of the status registers are modelled, there are no modes
     Mrs {
         rd: u8,
@@ -200,14 +227,14 @@ pub fn decode(word: u32, pc: u32) -> Decoded {
                 }
             } else if word & 0x0FC0_00F0 == 0x0000_0090 {
                 // MUL/MLA, the destination is in the bits DP uses for Rn
-                Insn::Mul {
+                Insn::Mul(MulOp {
                     acc: word & (1 << 21) != 0,
                     s,
                     rd: rn,
                     rm: (word & 0xF) as u8,
                     rs: ((word >> 8) & 0xF) as u8,
                     rn: rd,
-                }
+                })
             } else if word & 0x90 == 0x90 && word & 0x60 != 0 {
                 // halfword and signed transfers
                 let load = word & (1 << 20) != 0;
@@ -236,7 +263,7 @@ pub fn decode(word: u32, pc: u32) -> Decoded {
                 if !pre && wb {
                     return unsupported;
                 }
-                Insn::Mem {
+                Insn::Mem(MemOp {
                     load,
                     kind,
                     pre,
@@ -245,7 +272,7 @@ pub fn decode(word: u32, pc: u32) -> Decoded {
                     rd,
                     rn,
                     off,
-                }
+                })
             } else if word & 0x90 == 0x90 {
                 // long multiplies, swap
                 return unsupported;
@@ -327,7 +354,7 @@ pub fn decode(word: u32, pc: u32) -> Decoded {
             } else {
                 Offset::Imm(word & 0xFFF)
             };
-            Insn::Mem {
+            Insn::Mem(MemOp {
                 load: word & (1 << 20) != 0,
                 kind: if word & (1 << 22) != 0 {
                     MemKind::Byte
@@ -340,21 +367,21 @@ pub fn decode(word: u32, pc: u32) -> Decoded {
                 rd,
                 rn,
                 off,
-            }
+            })
         }
         0b100 => {
             if word & (1 << 22) != 0 {
                 // S bit, user bank or CPSR restore
                 return unsupported;
             }
-            Insn::Block {
+            Insn::Block(BlockOp {
                 load: word & (1 << 20) != 0,
                 pre: word & (1 << 24) != 0,
                 up: word & (1 << 23) != 0,
                 wb: word & (1 << 21) != 0,
                 rn,
                 list: word as u16,
-            }
+            })
         }
         0b101 => {
             let offset = (((word & 0x00FF_FFFF) << 8) as i32 >> 6) as u32;

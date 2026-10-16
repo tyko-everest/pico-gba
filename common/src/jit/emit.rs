@@ -2,14 +2,27 @@
 // a literal pool for pc relative loads, and the exit slots that link blocks together.
 use super::{JitError, thumb};
 
-const MAX_USES: usize = 48;
-const MAX_POOL: usize = 48;
+// Every pool entry has a use, so this limits both
+const MAX_LITERALS: usize = 48;
 
-// the error for a conditional branch that does not reach, translate retries with long skips
-pub const COND_RANGE: &str = "conditional branch out of range";
+// The pool is flushed when the oldest literal waiting for it is this many halfwords back: an ldr
+// reaches 255 words and the pool, up to MAX_LITERALS words, still has to fit in between
+const POOL_REACH: usize = 240;
+
+// ... or when there is this little room left for the literals of the next instruction
+const POOL_RESERVE: usize = 8;
 
 // An exit slot is six halfwords starting on a word boundary
 pub const SLOT_HW: usize = 6;
+
+// A frame whose registers are popped by the next code that is emitted, unless the next frame
+// takes the same ones
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Pop {
+    mask: u8,
+    // the register the flags are put back from first
+    flags: Option<u8>,
+}
 
 #[derive(Clone, Copy)]
 struct Use {
@@ -20,19 +33,17 @@ struct Use {
 pub struct Emit<'a> {
     code: &'a mut [u16],
     base: u32,
-    // next halfword to write
-    pub len: usize,
+    // next halfword to write, not counting the pop that is still pending
+    len: usize,
     overflow: bool,
     pub err: Option<JitError>,
-    uses: [Use; MAX_USES],
+    uses: [Use; MAX_LITERALS],
     nuses: usize,
-    pool: [u32; MAX_POOL],
+    pool: [u32; MAX_LITERALS],
     npool: usize,
     // pool entries whose value is set after the load is emitted, these are never shared
     late: u64,
-    // the last position something was bound to or jumped over, code before it can not be
-    // changed by what is emitted after it
-    barrier: usize,
+    pending: Option<Pop>,
 }
 
 impl<'a> Emit<'a> {
@@ -44,18 +55,46 @@ impl<'a> Emit<'a> {
             len,
             overflow: false,
             err: None,
-            uses: [Use { at: 0, idx: 0 }; MAX_USES],
+            uses: [Use { at: 0, idx: 0 }; MAX_LITERALS],
             nuses: 0,
-            pool: [0; MAX_POOL],
+            pool: [0; MAX_LITERALS],
             npool: 0,
             late: 0,
-            barrier: len,
+            pending: None,
         }
     }
 
-    // is the current position a branch target, or was code just placed that must stay
-    pub fn at_barrier(&self) -> bool {
-        self.barrier == self.len
+    // The pop of a frame that was closed is not emitted at once: a frame that opens right after
+    // with the same registers (and flags) takes it over, which saves the pop and the push.
+    // Everything else settles it first.
+    pub fn defer_pop(&mut self, mask: u8, flags: Option<u8>) {
+        self.settle();
+        self.pending = Some(Pop { mask, flags });
+    }
+
+    // take over the pending pop when it is the one of these registers
+    pub fn reuse_pop(&mut self, mask: u8, flags: Option<u8>) -> bool {
+        let same = self.pending == Some(Pop { mask, flags });
+        if same {
+            self.pending = None;
+        }
+        same
+    }
+
+    // emit the pending pop
+    pub fn settle(&mut self) {
+        if let Some(p) = self.pending.take() {
+            if let Some(t) = p.flags {
+                self.put_all(&thumb::msr(t));
+            }
+            self.put(thumb::pop(p.mask, false));
+        }
+    }
+
+    // the next halfword to write
+    pub fn pos(&mut self) -> usize {
+        self.settle();
+        self.len
     }
 
     pub fn fail(&mut self, err: JitError) {
@@ -72,11 +111,13 @@ impl<'a> Emit<'a> {
         self.base + 2 * hw as u32
     }
 
-    pub fn pc(&self) -> u32 {
-        self.addr_of(self.len)
+    pub fn pc(&mut self) -> u32 {
+        let at = self.pos();
+        self.addr_of(at)
     }
 
     pub fn put(&mut self, hw: u16) {
+        self.settle();
         match self.code.get_mut(self.len) {
             Some(slot) => *slot = hw,
             None => self.overflow = true,
@@ -104,6 +145,9 @@ impl<'a> Emit<'a> {
 
     // LDR rt, =value through the literal pool, does not touch the flags
     pub fn lit(&mut self, rt: u8, value: u32) {
+        if self.literals_full() {
+            return;
+        }
         let idx =
             match (0..self.npool).find(|&i| self.pool[i] == value && self.late & (1 << i) == 0) {
                 Some(i) => i,
@@ -114,6 +158,9 @@ impl<'a> Emit<'a> {
 
     // a literal whose value is filled in later with set_pool
     pub fn lit_late(&mut self, rt: u8) -> usize {
+        if self.literals_full() {
+            return 0;
+        }
         let idx = self.new_pool_entry(0);
         self.late |= 1 << idx;
         self.use_pool(rt, idx);
@@ -124,38 +171,38 @@ impl<'a> Emit<'a> {
         self.pool[idx] = value;
     }
 
-    fn new_pool_entry(&mut self, value: u32) -> usize {
-        if self.npool == MAX_POOL {
-            self.fail(JitError::Internal("literal pool full"));
-            return 0;
+    fn literals_full(&mut self) -> bool {
+        let full = self.nuses == MAX_LITERALS;
+        if full {
+            self.fail(JitError::Internal("too many literal uses"));
         }
+        full
+    }
+
+    fn new_pool_entry(&mut self, value: u32) -> usize {
         self.pool[self.npool] = value;
         self.npool += 1;
         self.npool - 1
     }
 
     fn use_pool(&mut self, rt: u8, idx: usize) {
-        if self.nuses == MAX_USES {
-            self.fail(JitError::Internal("too many literal uses"));
-            return;
-        }
-        self.uses[self.nuses] = Use { at: self.len, idx };
+        let at = self.pos();
+        self.uses[self.nuses] = Use { at, idx };
         self.nuses += 1;
         self.put(thumb::ldr_pc(rt, 0));
     }
 
-    // halfwords since the oldest literal use that is still waiting for a pool
-    pub fn pool_pressure(&self) -> usize {
+    // is it time to flush the pool
+    pub fn pool_due(&self) -> bool {
         if self.nuses == 0 {
-            0
-        } else {
-            self.len - self.uses[0].at
+            return false;
         }
-    }
-
-    // How many more literal uses and pool entries fit before the pool must be flushed
-    pub fn pool_room(&self) -> usize {
-        (MAX_USES - self.nuses).min(MAX_POOL - self.npool)
+        // the oldest literal use still waiting for a pool, counting the pending pop
+        let pending = self
+            .pending
+            .map_or(0, |p| 1 + 2 * p.flags.is_some() as usize);
+        self.len + pending - self.uses[0].at > POOL_REACH
+            || MAX_LITERALS - self.nuses < POOL_RESERVE
     }
 
     // Place the pending literals here and point their loads at them. When code can fall into
@@ -164,7 +211,7 @@ impl<'a> Emit<'a> {
         if self.nuses == 0 {
             return;
         }
-        let over = self.len;
+        let over = self.pos();
         if branch_over {
             self.put(thumb::b(0));
         }
@@ -198,62 +245,48 @@ impl<'a> Emit<'a> {
         self.nuses = 0;
         self.npool = 0;
         self.late = 0;
-        self.barrier = self.len;
     }
 
-    // Emit a placeholder conditional branch to patch with bind_cond
+    // Emit a placeholder conditional branch to patch with bind
     pub fn fwd_cond(&mut self, cond: u8) -> usize {
-        let at = self.len;
+        let at = self.pos();
         self.put(thumb::b_cond(cond, 0));
         at
     }
 
-    pub fn bind_cond(&mut self, at: usize) {
-        self.barrier = self.len;
-        let imm = self.len as i32 - (at as i32 + 2);
-        if imm > 127 {
-            self.fail(JitError::Internal(COND_RANGE));
-            return;
-        }
-        if let Some(h) = self.code.get_mut(at) {
-            *h = (*h & 0xFF00) | (imm as u16 & 0xFF);
-        }
-    }
-
-    // Branch back to the halfword to, if it is in reach
-    pub fn back_cond(&mut self, cond: u8, to: usize) -> bool {
-        let imm = to as i32 - (self.len as i32 + 2);
-        if imm < -128 {
-            return false;
-        }
+    // Branch back to the halfword to, the caller has checked that it is in reach
+    pub fn back_cond(&mut self, cond: u8, to: usize) {
+        let imm = to as i32 - (self.pos() as i32 + 2);
         self.put(thumb::b_cond(cond, imm));
-        true
     }
 
-    pub fn back(&mut self, to: usize) -> bool {
-        let imm = to as i32 - (self.len as i32 + 2);
-        if imm < -1024 {
-            return false;
-        }
+    pub fn back(&mut self, to: usize) {
+        let imm = to as i32 - (self.pos() as i32 + 2);
         self.put(thumb::b(imm));
-        true
     }
 
     pub fn fwd(&mut self) -> usize {
-        let at = self.len;
+        let at = self.pos();
         self.put(thumb::b(0));
         at
     }
 
+    // Point the branch from fwd or fwd_cond at the current position
     pub fn bind(&mut self, at: usize) {
-        self.barrier = self.len;
-        let imm = self.len as i32 - (at as i32 + 2);
-        if imm > 1023 {
-            self.fail(JitError::Internal("branch out of range"));
+        let imm = self.pos() as i32 - (at as i32 + 2);
+        let Some(&h) = self.code.get(at) else {
             return;
-        }
-        if let Some(h) = self.code.get_mut(at) {
-            *h = thumb::b(imm);
+        };
+        if h >> 12 == 0xD {
+            if imm > 127 {
+                self.fail(JitError::CondRange);
+            } else {
+                self.code[at] = (h & 0xFF00) | (imm as u16 & 0xFF);
+            }
+        } else if imm > 1023 {
+            self.fail(JitError::Internal("branch out of range"));
+        } else {
+            self.code[at] = thumb::b(imm);
         }
     }
 
@@ -268,7 +301,6 @@ impl<'a> Emit<'a> {
         self.put_word(target);
         self.put(thumb::NOP);
         self.put(thumb::NOP);
-        self.barrier = self.len;
         at
     }
 }
