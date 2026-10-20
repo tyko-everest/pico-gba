@@ -318,6 +318,12 @@ def gen_instruction(rng, cond=None):
         else:
             op2 = reg() << 8 | shift << 5 | 1 << 4 | rm
         return cond << 28 | op << 21 | s << 20 | rn << 16 | rd << 12 | op2
+    if kind < 0.47 and rng.random() < 0.4:  # umull umlal smull smlal
+        regs = rng.sample(range(15), 3)
+        rdhi, rdlo, rm = regs
+        rs = reg()
+        signed, acc = rng.random() < 0.5, rng.random() < 0.5
+        return cond << 28 | 1 << 23 | signed << 22 | acc << 21 | rdhi << 16 | rdlo << 12 | rs << 8 | 0x90 | rm
     if kind < 0.47:  # mul / mla
         rd, rm, rs, rn = reg(), reg(), reg(), reg()
         while rm == rd:

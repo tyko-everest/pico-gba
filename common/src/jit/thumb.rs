@@ -3,6 +3,9 @@
 use super::decode::{DpOp, Shift};
 
 pub const NOP: u16 = 0xBF00;
+// CPSID I and CPSIE I, mask and unmask interrupts
+pub const CPSID: u16 = 0xB672;
+pub const CPSIE: u16 = 0xB662;
 // UDF #0xFE, raises a HardFault the handler recognises as an unresolved exit
 pub const TRAP: u16 = 0xDEFE;
 

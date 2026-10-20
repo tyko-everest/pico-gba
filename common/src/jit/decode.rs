@@ -127,6 +127,18 @@ pub struct MulOp {
     pub rn: u8,
 }
 
+// UMULL, UMLAL, SMULL and SMLAL: rm * rs as a 64 bit value, added to the pair when acc is set
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MulLongOp {
+    pub signed: bool,
+    pub acc: bool,
+    pub s: bool,
+    pub rdlo: u8,
+    pub rdhi: u8,
+    pub rm: u8,
+    pub rs: u8,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MemOp {
     pub load: bool,
@@ -166,6 +178,7 @@ pub enum Insn {
         op2: Op2,
     },
     Mul(MulOp),
+    MulLong(MulLongOp),
     Mem(MemOp),
     Block(BlockOp),
     // Only the flags of the status registers are modelled, there are no modes
@@ -273,8 +286,18 @@ pub fn decode(word: u32, pc: u32) -> Decoded {
                     rn,
                     off,
                 })
+            } else if word & 0x0F80_00F0 == 0x0080_0090 {
+                Insn::MulLong(MulLongOp {
+                    signed: word & (1 << 22) != 0,
+                    acc: word & (1 << 21) != 0,
+                    s,
+                    rdhi: rn,
+                    rdlo: rd,
+                    rs: ((word >> 8) & 0xF) as u8,
+                    rm: (word & 0xF) as u8,
+                })
             } else if word & 0x90 == 0x90 {
-                // long multiplies, swap
+                // swap
                 return unsupported;
             } else if word & 0x0FBF_0FFF == 0x010F_0000 {
                 Insn::Mrs {

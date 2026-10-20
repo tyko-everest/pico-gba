@@ -143,10 +143,10 @@ const READ_Y: u8 = 0b1001_0000;
 const SAMPLES: usize = 5;
 
 // SPI1 runs at clk_peri / (2 * (1 + SCR))
-const DISPLAY_SCR: u8 = 0; // 62.5 MHz
+pub const DISPLAY_SCR: u8 = 0; // 62.5 MHz
 const TOUCH_SCR: u8 = 31; // 1.95 MHz, the XPT2046 allows up to 2.5 MHz
 
-fn spi1_configure(scr: u8, cpol: bool, cpha: bool) {
+pub fn spi1_configure(scr: u8, cpol: bool, cpha: bool) {
     let spi = unsafe { &*pac::SPI1::PTR };
     spi.sspcr1().modify(|_, w| w.sse().clear_bit());
     spi.sspcr0()
@@ -154,7 +154,7 @@ fn spi1_configure(scr: u8, cpol: bool, cpha: bool) {
     spi.sspcr1().modify(|_, w| w.sse().set_bit());
 }
 
-fn spi1_transfer(byte: u8) -> u8 {
+pub fn spi1_transfer(byte: u8) -> u8 {
     let spi = unsafe { &*pac::SPI1::PTR };
     while spi.sspsr().read().tnf().bit_is_clear() {}
     spi.sspdr().write(|w| unsafe { w.data().bits(byte as u16) });

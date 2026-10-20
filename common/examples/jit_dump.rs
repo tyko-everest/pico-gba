@@ -43,7 +43,7 @@ fn main() {
     };
     let mut code = vec![0u16; 1 << 19];
     let mut map = vec![Jit::empty_map_entry(); 16384];
-    let mut jit = Jit::new(&mut code, cache_base, &mut map, regions);
+    let mut jit = Jit::new(&mut code, cache_base, &mut map, regions, 0);
 
     let mut failed: HashSet<u32> = HashSet::new();
     let mut blocks = Vec::new();

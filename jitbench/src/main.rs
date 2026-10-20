@@ -25,6 +25,11 @@ struct Args {
     entry: Option<u32>,
     translate_bench: bool,
     trace: bool,
+    timed: bool,
+    thumb_jit: bool,
+    trace_from: Option<u64>,
+    rom_cache_kb: usize,
+    intr: Option<u32>,
     // write the code cache and the cycles spent on every halfword of it
     dump_cache: Option<String>,
     input: InputScript,
@@ -43,6 +48,11 @@ fn parse_args() -> Args {
         entry: None,
         translate_bench: false,
         trace: false,
+        timed: false,
+        thumb_jit: false,
+        trace_from: None,
+        rom_cache_kb: 0,
+        intr: None,
         dump_cache: None,
         // press A for 6 frames every 90 frames, starting at frame 60
         input: InputScript {
@@ -63,6 +73,13 @@ fn parse_args() -> Args {
                 a.entry = Some(u32::from_str_radix(value().trim_start_matches("0x"), 16).unwrap())
             }
             "--trace" => a.trace = true,
+            "--timed" => a.timed = true,
+            "--rom-cache" => a.rom_cache_kb = value().parse().unwrap(),
+            "--trace-from" => a.trace_from = Some(value().parse().unwrap()),
+            "--thumb-jit" => a.thumb_jit = true,
+            "--intr" => {
+                a.intr = Some(u32::from_str_radix(value().trim_start_matches("0x"), 16).unwrap())
+            }
             "--dump-cache" => a.dump_cache = Some(value()),
             "--translate-bench" => a.translate_bench = true,
             "--press-start" => a.input.start = value().parse().unwrap(),
@@ -259,9 +276,10 @@ fn report(m: &Machine, top: usize) {
 
     let jit = &m.sys.jit;
     println!(
-        "\njit: {} blocks, {} code bytes, {} ARM instrs translated, {:.3} ms translating ({:.0} ns per ARM instr)",
+        "\njit: {} blocks, {} code bytes, {} flushes, {} guest instrs translated, {:.3} ms translating ({:.0} ns per instr)",
         jit.block_count(),
         jit.code_used_bytes(),
+        s.flushes,
         s.arm_instrs,
         s.translate_ns as f64 / 1e6,
         s.translate_ns as f64 / s.arm_instrs.max(1) as f64
@@ -285,7 +303,7 @@ fn translate_bench(m: &Machine) {
     let mut order: Vec<u32> = Vec::new();
     let mut arm_instrs = 0u64;
     {
-        let mut jit = Jit::new(&mut code, CACHE_BASE, &mut map, REGIONS_ADDR);
+        let mut jit = Jit::new(&mut code, CACHE_BASE, &mut map, REGIONS_ADDR, 0);
         let mut work: Vec<u32> = m.sys.stats.blocks.iter().map(|b| b.arm).rev().collect();
         let mut failed = std::collections::HashSet::new();
         while let Some(t) = work.pop() {
@@ -323,7 +341,7 @@ fn translate_bench(m: &Machine) {
     let mut rounds = 0u64;
     let mut bytes = 0;
     while start.elapsed() < Duration::from_secs(2) {
-        let mut jit = Jit::new(&mut code, CACHE_BASE, &mut map, REGIONS_ADDR);
+        let mut jit = Jit::new(&mut code, CACHE_BASE, &mut map, REGIONS_ADDR, 0);
         for &t in &order {
             let _ = std::hint::black_box(jit.translate(t, &mut read));
         }
@@ -338,19 +356,148 @@ fn translate_bench(m: &Machine) {
     );
 }
 
+// Render what a dump of the device's display memory would show: files vram, palette, oam and io
+// (the IO registers from 0x04000000) in a directory
+fn render_dump(dir: &str, png_path: &str) {
+    let read = |name: &str, size: usize| {
+        let mut b = std::fs::read(format!("{dir}/{name}")).unwrap_or_else(|e| panic!("{name}: {e}"));
+        b.resize(size, 0);
+        // the video code reads these through structs, which want the alignment of a word
+        let mut words = vec![0u32; size / 4];
+        unsafe { std::ptr::copy_nonoverlapping(b.as_ptr(), words.as_mut_ptr() as *mut u8, size) };
+        words
+    };
+    let (mut io, mut pal, mut vram, mut oam) = (
+        read("io", 0x400),
+        read("palette", 0x400),
+        read("vram", 0x18000),
+        read("oam", 0x400),
+    );
+    let (registers, palette, vram, oam) = unsafe {
+        (
+            &mut *(io.as_mut_ptr() as *mut DisplayRegisters),
+            &mut *(pal.as_mut_ptr() as *mut Palette),
+            &mut *(vram.as_mut_ptr() as *mut VRAM),
+            &mut *(oam.as_mut_ptr() as *mut OAM),
+        )
+    };
+    let mut video = Video::new(registers, palette, vram, oam);
+    video.begin_frame();
+    let mut pixels = Vec::new();
+    for y in 0..SCREEN_HEIGHT {
+        for c in video.render_scanline(y) {
+            pixels.push(c.to_minifb_format());
+        }
+    }
+    std::fs::write(png_path, png::encode(SCREEN_WIDTH, SCREEN_HEIGHT, &pixels)).unwrap();
+}
+
 fn main() {
+    let argv: Vec<String> = std::env::args().collect();
+    if let Some(i) = argv.iter().position(|a| a == "--render-dump") {
+        render_dump(&argv[i + 1], &argv[i + 2]);
+        return;
+    }
     let args = parse_args();
     let rom = std::fs::read(&args.rom).unwrap_or_else(|e| panic!("cannot read {}: {e}", args.rom));
-    let mut m = Machine::new(&rom, args.input);
+    let mut m = Machine::new(&rom, args.input, args.thumb_jit);
     if let Some(entry) = args.entry {
         m.cpu.r[15] = entry;
     }
     m.trace = args.trace;
+    m.trace_from = args.trace_from;
+    for shift in [7, 8, 9, 10] {
+        for kb in [16, 24, 32, 48] {
+            m.sys.stats.caches.push(machine::LruSim::new(kb, shift));
+        }
+    }
+    m.timed = args.timed;
+    if args.rom_cache_kb != 0 {
+        m.enable_rom_cache(args.rom_cache_kb);
+    }
+    m.thumb_jit = args.thumb_jit;
+    if let Some(intr) = args.intr {
+        m.sys.mem.set_irq_vector(intr);
+    }
     let t0 = Instant::now();
     m.run(args.frames);
     let host = t0.elapsed();
 
     report(&m, args.top);
+    println!(
+        "most code translated inside the interrupt handler between flushes: {} bytes",
+        m.sys.stats.irq_bytes_max
+    );
+    {
+        let st = &m.sys.stats;
+        let v = &st.rom_misses_by_frame;
+        if !v.is_empty() {
+            let tail = &v[v.len() / 2..];
+            println!(
+                "ROM page cache: {} misses in all, {:.2} per frame in the 2nd half, worst frame {}, {} cycles stalled ({:.2}% of a frame on average)",
+                v.iter().sum::<u32>(),
+                tail.iter().sum::<u32>() as f64 / tail.len().max(1) as f64,
+                v.iter().max().unwrap(),
+                st.rom_miss_cycles,
+                st.rom_miss_cycles as f64 / v.len() as f64 / FRAME_BUDGET * 100.0
+            );
+        }
+    }
+    {
+        let st = &m.sys.stats;
+        let now = m.frames_done();
+        let count = |h: &std::collections::HashMap<u32, u64>, window: u64| {
+            h.values().filter(|&&f| now - f <= window).count()
+        };
+        println!(
+            "ROM pages of 512 B touched (KB): code {} data {}, both {}",
+            st.code_pages.len() / 2,
+            st.data_pages.len() / 2,
+            st.code_pages
+                .keys()
+                .chain(st.data_pages.keys())
+                .collect::<std::collections::HashSet<_>>()
+                .len()
+                / 2
+        );
+        for c in &st.caches {
+            let tail =
+                &c.misses_by_frame[(c.misses_by_frame.len() / 2).min(c.misses_by_frame.len())..];
+            let max = tail.iter().max().copied().unwrap_or(0);
+            let sum: u32 = tail.iter().sum();
+            println!(
+                "  {} KB cache, {} B pages: {:.2} misses/frame in the 2nd half of the run, worst frame {}, total {}",
+                c.pages * (1 << c.shift) / 1024,
+                1 << c.shift,
+                sum as f64 / tail.len().max(1) as f64,
+                max,
+                c.misses_by_frame.iter().sum::<u32>()
+            );
+        }
+        for w in [60, 300, 1000] {
+            println!(
+                "  in the last {w} frames (KB): code {} data {}",
+                count(&st.code_pages, w) / 2,
+                count(&st.data_pages, w) / 2
+            );
+        }
+    }
+    if let Ok(list) = std::env::var("JITBENCH_PEEK") {
+        // comma separated GBA IWRAM addresses to print as words
+        for a in list.split(',') {
+            let a = u32::from_str_radix(a.trim_start_matches("0x"), 16).unwrap();
+            println!("peek {a:08x} = {:08x}", m.sys.mem.read(a, 4).unwrap_or(0));
+        }
+    }
+    println!(
+        "DISPCNT {:04x} DISPSTAT {:04x} IE {:04x} IF {:04x} IME {:04x} vector {:08x}",
+        m.sys.mem.io16(0),
+        m.sys.mem.io16(4),
+        m.sys.mem.io16(0x200),
+        m.sys.mem.io16(0x202),
+        m.sys.mem.io16(0x208),
+        m.sys.mem.iwram_vector()
+    );
     println!(
         "\nstate hash: {:016x} after {} frames (host time {:.2?})",
         state_hash(&m),

@@ -2,7 +2,8 @@
 // interrupts, mirroring firmware/src/main.rs. Time is counted in Cortex-M0+ cycles and only moves
 // when the interpreter runs, so the GBA state does not depend on how fast the JIT code is.
 use crate::cpu::{Access, Bus, Cpu, Event};
-use common::jit::{Jit, MapEntry, TRAP};
+use common::jit::{Jit, MapEntry, STUB_TRAP, TRAP};
+use common::romcache::{PAGE_SIZE, RomCache, RomSource};
 use std::collections::HashMap;
 use std::time::Instant;
 
@@ -14,14 +15,23 @@ const BIOS_SIZE: usize = 0x4000;
 const BIOS_OPEN_BUS: u32 = 0xE129_F000;
 pub const CACHE_BASE: u32 = NATIVE_BASE;
 // as in the firmware: 24 KiB of code and a 1024 entry block map
-pub const CACHE_HW: usize = 12 * 1024;
-pub const MAP_LEN: usize = 1024;
+pub const CACHE_HW: usize = 64 * 1024;
+pub const MAP_LEN: usize = 4096;
+// the cycles a ROM page cache miss stalls for: an SD block read at 20 MHz and the command and
+// wait for the other core, about 0.6 ms
+const ROM_MISS_CYCLES: u64 = 75_000;
+// free code cache (in halfwords) below which a translation outside the interrupt handler
+// flushes the cache first
+const FLUSH_MARGIN_HW: usize = 4 * 1024;
+const FLUSH_MARGIN_BLOCKS: usize = 100;
 
 // The region offset table the translated code reads, after the code cache. A GBA address a that
 // is flat in native memory is reached at a + table[a >> 24], in a window the interpreter treats
 // as a non-faulting view of the GBA region. EWRAM and the BIOS have no entry, they still fault.
-pub const REGIONS_ADDR: u32 = NATIVE_BASE + 0x8000;
+pub const REGIONS_ADDR: u32 = NATIVE_BASE + 0x20000;
 // the page tables of EWRAM and IWRAM (512 entries each) follow the region table
+// the indirect jump dispatch table of the translated Thumb code
+pub const DISPATCH_ADDR: u32 = REGIONS_ADDR + 0x1400;
 const EWRAM_PT: u32 = REGIONS_ADDR + 0x400;
 const IWRAM_PT: u32 = REGIONS_ADDR + 0xC00;
 const ALIAS: u32 = 0x4000_0000;
@@ -224,6 +234,15 @@ impl Mem {
         self.io.bytes_mut()[off..off + 2].copy_from_slice(&v.to_le_bytes());
     }
 
+    pub fn iwram_vector(&self) -> u32 {
+        self.iwram32(IRQ_VECTOR)
+    }
+
+    // what a crt0 that is skipped would have stored for the interrupt handler
+    pub fn set_irq_vector(&mut self, handler: u32) {
+        self.iwram.bytes_mut()[IRQ_VECTOR..IRQ_VECTOR + 4].copy_from_slice(&handler.to_le_bytes());
+    }
+
     fn iwram16(&self, off: usize) -> u16 {
         u16::from_le_bytes([self.iwram.bytes()[off], self.iwram.bytes()[off + 1]])
     }
@@ -271,6 +290,43 @@ fn region_of(addr: u32) -> usize {
     }
 }
 
+// An LRU cache of ROM pages, to see how many misses a given amount of RAM would have
+pub struct LruSim {
+    pub pages: usize,
+    pub shift: u32,
+    // page -> last use stamp
+    map: HashMap<u32, u64>,
+    stamp: u64,
+    pub misses_by_frame: Vec<u32>,
+}
+
+impl LruSim {
+    pub fn new(kb: usize, shift: u32) -> Self {
+        LruSim {
+            pages: kb * 1024 >> shift,
+            shift,
+            map: HashMap::new(),
+            stamp: 0,
+            misses_by_frame: Vec::new(),
+        }
+    }
+
+    pub fn access(&mut self, addr: u32, frame: u64) {
+        let page = addr >> self.shift;
+        self.stamp += 1;
+        if self.map.insert(page, self.stamp).is_none() {
+            while self.misses_by_frame.len() <= frame as usize {
+                self.misses_by_frame.push(0);
+            }
+            self.misses_by_frame[frame as usize] += 1;
+            if self.map.len() > self.pages {
+                let (&victim, _) = self.map.iter().min_by_key(|(_, t)| **t).unwrap();
+                self.map.remove(&victim);
+            }
+        }
+    }
+}
+
 #[derive(Clone, Copy, Default)]
 pub struct FaultPc {
     pub count: u64,
@@ -314,6 +370,17 @@ pub struct Stats {
     pub cache_other: Vec<u64>,
     pub blocks: Vec<BlockInfo>,
     pub translate_ns: u64,
+    pub flushes: u64,
+    pub rom_miss_cycles: u64,
+    // ROM page cache misses in each frame
+    pub rom_misses_by_frame: Vec<u32>,
+    // bytes translated inside the interrupt handler since the last flush, and the most of those
+    pub irq_bytes: usize,
+    pub irq_bytes_max: usize,
+    // ROM pages (of 512 bytes) fetched as code and read as data, with the frame of the last use
+    pub code_pages: HashMap<u32, u64>,
+    pub caches: Vec<LruSim>,
+    pub data_pages: HashMap<u32, u64>,
     pub arm_instrs: u64,
 }
 
@@ -342,6 +409,54 @@ pub struct Sys {
     frame_cycles: u64,
     frame_no: u64,
     input: InputScript,
+    in_irq: bool,
+    paging: Option<Paging>,
+    // cycles since the start, the timers count from it
+    total_cycles: u64,
+    timers: common::timers::Timers,
+    flash: common::flash::FlashChip,
+}
+
+// The ROM as the SD card holds it, pages are copied out of it on a miss
+struct VecSource(Vec<u8>);
+
+impl RomSource for VecSource {
+    fn read_page(&mut self, offset: u32, dst: &mut [u8; PAGE_SIZE]) {
+        let at = offset as usize;
+        let n = self.0.len().saturating_sub(at).min(PAGE_SIZE);
+        dst[..n].copy_from_slice(&self.0[at..at + n]);
+        dst[n..].fill(0);
+    }
+}
+
+// ROM reads go through a cache of pages of RAM, like the firmware will have
+struct Paging {
+    cache: RomCache<'static>,
+    src: VecSource,
+}
+
+// adapter for the BIOS calls and DMA: GBA addresses in, bytes of the model out
+struct GbaMem<'a>(&'a mut Sys);
+
+impl common::bios::Memory for GbaMem<'_> {
+    fn read8(&mut self, a: u32) -> u8 {
+        self.0.raw_read(a, 1) as u8
+    }
+    fn read16(&mut self, a: u32) -> u16 {
+        self.0.raw_read(a & !1, 2) as u16
+    }
+    fn read32(&mut self, a: u32) -> u32 {
+        self.0.raw_read(a & !3, 4)
+    }
+    fn write8(&mut self, a: u32, v: u8) {
+        self.0.raw_write(a, 1, v as u32)
+    }
+    fn write16(&mut self, a: u32, v: u16) {
+        self.0.raw_write(a & !1, 2, v as u32)
+    }
+    fn write32(&mut self, a: u32, v: u32) {
+        self.0.raw_write(a & !3, 4, v)
+    }
 }
 
 impl Sys {
@@ -375,6 +490,7 @@ impl Sys {
     fn charge_instr(&mut self, pc: u32, cycles: u32) {
         let c = cycles as u64;
         self.frame_cycles += c;
+        self.total_cycles += c;
         if Self::in_cache(pc) {
             self.stats.jit_cycles += c;
             self.stats.cache_instr[((pc - CACHE_BASE) / 2) as usize] += c;
@@ -386,6 +502,7 @@ impl Sys {
     // cycles that belong to the instruction at pc but are not the instruction itself
     fn charge_other(&mut self, pc: u32, c: u64) {
         self.frame_cycles += c;
+        self.total_cycles += c;
         if Self::in_cache(pc) {
             self.stats.cache_other[((pc - CACHE_BASE) / 2) as usize] += c;
         }
@@ -429,6 +546,81 @@ impl Sys {
         (gba, true)
     }
 
+    // Memory as the BIOS and DMA see it: GBA addresses, or native ones for the stack
+    fn raw_read(&mut self, addr: u32, size: u32) -> u32 {
+        if let Some(v) = self.mem_read(addr, size) {
+            return v;
+        }
+        match Self::native_off(addr, size) {
+            Some(off) => self.read_native(off, size),
+            // open bus
+            None => 0,
+        }
+    }
+
+    fn raw_write(&mut self, addr: u32, size: u32, value: u32) {
+        if !self.mem.write(addr, size, value) {
+            if let Some(off) = Self::native_off(addr, size) {
+                for i in 0..size {
+                    self.mem.native[(off + i) as usize] = (value >> (8 * i)) as u8;
+                }
+            }
+        }
+    }
+
+    // writes to IO registers with side effects: timers and DMA
+    fn io_write(&mut self, io: u32, size: u32, value: u32) {
+        if std::env::var_os("JITBENCH_LOG_IO").is_some() && self.frame_no < 3 {
+            eprintln!(
+                "io write {io:#x} size {size} value {value:#x} at pc {:#x}",
+                self.cur_pc
+            );
+        }
+        match io {
+            0x100..=0x10F => {
+                let now = self.total_cycles;
+                self.timers.write(io, size, value, now);
+            }
+            0xB0..=0xDF => {
+                if let Some(ch) = common::dma::Dma::started_by(io, size) {
+                    self.dma_start(ch);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn io_read(&self, io: u32, size: u32, value: u32) -> u32 {
+        if (0x100..=0x10F).contains(&io) {
+            return self.timers.read(io, size, value, self.total_cycles);
+        }
+        value
+    }
+
+    // Immediate DMA runs right away. Other start times (VBlank, HBlank, sound FIFO) are left.
+    fn dma_start(&mut self, ch: usize) {
+        let base = 0xB0 + 12 * ch;
+        let io = |m: &Mem, off: usize| {
+            u32::from_le_bytes(m.io.bytes()[off..off + 4].try_into().unwrap())
+        };
+        let dma = common::dma::Dma::from_registers(
+            ch,
+            io(&self.mem, base),
+            io(&self.mem, base + 4),
+            io(&self.mem, base + 8),
+        );
+        if !dma.enabled() || !dma.immediate() {
+            return;
+        }
+        let count = dma.run(&mut GbaMem(self));
+        self.charge_other(self.cur_pc, count as u64 * 2);
+        // done, the enable bit clears
+        let off = base + 10;
+        let b = self.mem.io.bytes_mut();
+        let c = u16::from_le_bytes([b[off], b[off + 1]]) & 0x7FFF;
+        b[off..off + 2].copy_from_slice(&c.to_le_bytes());
+    }
+
     fn native_off(addr: u32, size: u32) -> Option<u32> {
         let off = addr.wrapping_sub(NATIVE_BASE);
         (off <= NATIVE_LEN - size).then_some(off)
@@ -451,38 +643,126 @@ impl Sys {
     // Read GBA memory for the translator, like gba_read_word
     // The translator also reads the region table and the page tables (native memory) here, to
     // find the address behind a constant base register.
-    fn gba_word(mem: &Mem, addr: u32) -> Option<u32> {
+    fn gba_word(mem: &Mem, paging: &mut Option<Paging>, addr: u32) -> Option<u32> {
         if addr >= REGIONS_ADDR && addr < REGIONS_ADDR + 0x1400 {
             let at = (addr - NATIVE_BASE) as usize;
             return Some(u32::from_le_bytes(
                 mem.native[at..at + 4].try_into().unwrap(),
             ));
         }
+        if let (Some(p), 8..=0xD) = (paging.as_mut(), addr >> 24) {
+            return Some(p.cache.read32(&mut p.src, addr & 0x01FF_FFFC));
+        }
         mem.read(addr, 4)
     }
 
+    // A read of GBA memory, ROM through the page cache when there is one. The cycles a miss
+    // stalls for are charged.
+    fn mem_read(&mut self, addr: u32, size: u32) -> Option<u32> {
+        if let (Some(p), 8..=0xD) = (self.paging.as_mut(), addr >> 24) {
+            let off = addr & 0x01FF_FFFF;
+            let before = p.cache.misses;
+            let v = match size {
+                1 => p.cache.read8(&mut p.src, off) as u32,
+                2 => p.cache.read16(&mut p.src, off) as u32,
+                _ => p.cache.read32(&mut p.src, off),
+            };
+            let missed = (p.cache.misses - before) as u64;
+            if missed != 0 {
+                let c = missed * ROM_MISS_CYCLES;
+                self.frame_cycles += c;
+                self.total_cycles += c;
+                self.stats.rom_miss_cycles += c;
+            }
+            return Some(v);
+        }
+        self.mem.read(addr, size)
+    }
+
     // Translate the block at an ARM address, charging nothing. Returns the thumb address.
+    // The code cache is full: throw all of it away. Nothing may hold addresses in it, which is
+    // true outside the interrupt handler (the code it interrupted is in the cache).
+    fn needs_flush(&self) -> bool {
+        let margin = std::env::var("JITBENCH_MARGIN_HW")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(FLUSH_MARGIN_HW);
+        self.jit.free_halfwords() < margin || self.jit.free_blocks() < FLUSH_MARGIN_BLOCKS
+    }
+
+    fn flush(&mut self) {
+        self.jit.reset();
+        let at = (DISPATCH_ADDR - NATIVE_BASE) as usize;
+        self.mem.native[at..at + common::jit::DISPATCH_BYTES].fill(0);
+        self.stats.blocks.clear();
+        self.stats.flushes += 1;
+        self.stats.irq_bytes = 0;
+    }
+
     fn translate(&mut self, arm: u32) -> u32 {
-        let used0 = self.jit.used_halfwords();
+        // the interrupt handler needs room to translate its code after a flush, outside of it
+        // the cache is thrown away before that room is used
+        if !self.in_irq && self.needs_flush() {
+            self.flush();
+        }
+        let mut used0 = self.jit.used_halfwords();
         let t0 = Instant::now();
         let mem = &self.mem;
-        let r = self.jit.translate(arm, &mut |a| Self::gba_word(mem, a));
+        let paging = &mut self.paging;
+        let mut r = self
+            .jit
+            .translate(arm, &mut |a| Self::gba_word(mem, paging, a));
+        if r == Err(common::jit::JitError::CacheFull) && self.in_irq && !self.jit.in_emergency() {
+            // the interrupt handler needs more than the margin: use the reserve
+            self.jit.use_reserve();
+            let mem = &self.mem;
+            let paging = &mut self.paging;
+            r = self
+                .jit
+                .translate(arm, &mut |a| Self::gba_word(mem, paging, a));
+        }
+        if r == Err(common::jit::JitError::CacheFull) && !self.in_irq {
+            self.flush();
+            used0 = self.jit.used_halfwords();
+            let mem = &self.mem;
+            let paging = &mut self.paging;
+            r = self
+                .jit
+                .translate(arm, &mut |a| Self::gba_word(mem, paging, a));
+        }
         self.stats.translate_ns += t0.elapsed().as_nanos() as u64;
         let thumb = match r {
             Ok(t) => t,
             Err(e) => self.die(&format!("cannot translate ARM code at {arm:#x}: {e:?}")),
         };
+        if self.in_irq {
+            self.stats.irq_bytes += 2 * (self.jit.used_halfwords() - used0);
+            self.stats.irq_bytes_max = self.stats.irq_bytes_max.max(self.stats.irq_bytes);
+        }
         self.record_block(used0, arm);
         thumb
     }
 
     fn resolve(&mut self, slot: u32) -> u32 {
+        if !self.in_irq && self.needs_flush() {
+            // the slot is gone with the rest of the cache
+            let arm =
+                self.jit.halfword(slot + 4) as u32 | (self.jit.halfword(slot + 6) as u32) << 16;
+            return self.translate(arm);
+        }
         let used0 = self.jit.used_halfwords();
         let arm = self.jit.halfword(slot + 4) as u32 | (self.jit.halfword(slot + 6) as u32) << 16;
         let t0 = Instant::now();
         let mem = &self.mem;
-        let r = self.jit.resolve_slot(slot, &mut |a| Self::gba_word(mem, a));
+        let paging = &mut self.paging;
+        let r = self
+            .jit
+            .resolve_slot(slot, &mut |a| Self::gba_word(mem, paging, a));
         self.stats.translate_ns += t0.elapsed().as_nanos() as u64;
+        if r == Err(common::jit::JitError::CacheFull) {
+            // the slot is gone with the rest of the cache, or the reserve is opened up
+            return self.translate(arm);
+        }
         let thumb = match r {
             Ok(t) => t,
             Err(e) => self.die(&format!("cannot resolve slot at {slot:#x}: {e:?}")),
@@ -519,11 +799,18 @@ impl Bus for Sys {
             0x20 if Self::in_cache(addr) => self.jit.halfword(addr),
             0x08 => {
                 let o = (addr - ROM_BASE) as usize;
-                u16::from_le_bytes([self.mem.rom[o], self.mem.rom[o + 1]])
+                let f = self.frame_no;
+                self.stats.code_pages.insert((o >> 9) as u32, f);
+                for c in &mut self.stats.caches {
+                    c.access(o as u32, f);
+                }
+                self.mem_read(addr, 2).unwrap() as u16
             }
-            _ => match self.mem.read(addr, 2) {
-                Some(v) => v as u16,
-                None => self.die(&format!("fetch from {addr:#x}")),
+            _ => match (self.mem_read(addr, 2), Self::native_off(addr, 2)) {
+                (Some(v), _) => v as u16,
+                // code copied onto the stack
+                (None, Some(off)) => self.read_native(off, 2) as u16,
+                _ => self.die(&format!("fetch from {addr:#x}")),
             },
         }
     }
@@ -543,9 +830,35 @@ impl Bus for Sys {
         if kind == Access::Data && !inline {
             self.note_fault(addr);
         }
-        let Some(v) = self.mem.read(addr, size) else {
-            self.die(&format!("read of {size} bytes at unmapped {addr:#x}"));
+        // unmapped addresses read the open bus, which the BIOS leaves as a constant here
+        let v = self.mem_read(addr, size).unwrap_or_else(|| match size {
+            1 => BIOS_OPEN_BUS & 0xFF,
+            2 => BIOS_OPEN_BUS & 0xFFFF,
+            _ => BIOS_OPEN_BUS,
+        });
+        if matches!(addr >> 24, 8..=0xD) {
+            let page = (addr & 0x01FF_FFFF) >> 9;
+            let f = self.frame_no;
+            let byte = addr & 0x01FF_FFFF;
+            self.stats.data_pages.insert(page, f);
+            for c in &mut self.stats.caches {
+                c.access(byte, f);
+            }
+        }
+        let v = if addr >> 24 == 4 {
+            self.io_read(addr & 0xFFFFFF, size, v)
+        } else if addr >> 24 == 0xE {
+            self.flash.read(addr & 0xFFFF).map_or(v, |b| b as u32)
+        } else {
+            v
         };
+        if std::env::var_os("JITBENCH_LOG_IO").is_some() && self.frame_no < 3 && addr == 0x0400_0004
+        {
+            eprintln!(
+                "io read DISPSTAT size {size} -> {v:#x} at pc {:#x}",
+                self.cur_pc
+            );
+        }
         // every read of VCOUNT moves it on, so a game polling it makes progress without the
         // result depending on how many cycles the polling loop takes
         let io = addr.wrapping_sub(0x0400_0000);
@@ -581,8 +894,17 @@ impl Bus for Sys {
         if kind == Access::Data && !inline {
             self.note_fault(addr);
         }
-        if !self.mem.write(addr, size, value) {
-            self.die(&format!("write of {size} bytes at unmapped {addr:#x}"));
+        let old_if = self.mem.io16(IF);
+        // a write to an unmapped address is ignored
+        self.mem.write(addr, size, value);
+        if addr >> 24 == 4 && addr & 0xFFFFFF < 0x400 {
+            // IF is write one to clear
+            if addr & 0xFFFFFE == 0x202 {
+                self.mem.set_io16(IF, old_if & !(value as u16));
+            }
+            self.io_write(addr & 0xFFFFFF, size, value);
+        } else if addr >> 24 == 0xE {
+            self.flash.write(addr & 0xFFFF, value as u8);
         }
     }
 }
@@ -592,6 +914,9 @@ struct Saved {
     r: [u32; 16],
     flags: u32,
     ret_pc: u32,
+    // the word a dispatch that missed leaves its target in: the interrupt may come between that
+    // and the trap that reads it
+    miss: u32,
 }
 
 pub struct Machine {
@@ -600,28 +925,56 @@ pub struct Machine {
     in_irq: bool,
     saved: Option<Saved>,
     intr_waiting: bool,
+    // frames end after one frame of cycles, with VBlank, for games that poll flags
+    pub timed: bool,
+    // translate Thumb code as well, so it runs from the code cache
+    pub thumb_jit: bool,
     // print every instruction executed, for debugging
     pub trace: bool,
+    pub trace_from: Option<u64>,
 }
 
 impl Machine {
-    pub fn new(rom: &[u8], input: InputScript) -> Self {
+    pub fn new(rom: &[u8], input: InputScript, thumb_jit: bool) -> Self {
         let code: &'static mut [u16] = Box::leak(vec![0u16; CACHE_HW].into_boxed_slice());
         let map: &'static mut [MapEntry] =
             Box::leak(vec![Jit::empty_map_entry(); MAP_LEN].into_boxed_slice());
-        let jit = Jit::new(code, CACHE_BASE, map, REGIONS_ADDR);
+        // JITBENCH_CACHE_KB limits how much of the cache the translator may use
+        let kb: usize = std::env::var("JITBENCH_CACHE_KB")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(128);
+        let code = &mut code[..(kb * 512).min(CACHE_HW)];
+        let mut jit = Jit::new(
+            code,
+            CACHE_BASE,
+            map,
+            REGIONS_ADDR,
+            if thumb_jit { DISPATCH_ADDR } else { 0 },
+        );
+        // the last 6 KB are for when the cache is full inside the interrupt handler
+        jit.set_reserve(3 * 1024);
         let mut mem = Mem::new(rom);
         mem.set_io16(KEYINPUT, 0x03FF);
+        // the BIOS leaves the display in forced blank
+        mem.set_io16(0, 0x0080);
         let stats = Stats {
             cache_instr: vec![0; CACHE_HW],
             cache_other: vec![0; CACHE_HW],
             ..Default::default()
         };
         let mut cpu = Cpu::new();
-        // main starts the game in Thumb past the crt0, on the native stack
-        let entry = common::rom::thumb_entry(rom).expect("no Thumb entry in the ROM");
-        cpu.r[15] = ROM_BASE + entry as u32;
+        // main starts the game in Thumb past the crt0 (a ROM with an unrecognised one needs --entry)
+        let entry = common::rom::find_entry(|at| {
+            let at = at as usize;
+            rom.get(at..at + 4)
+                .map_or(0, |b| u32::from_le_bytes(b.try_into().unwrap()))
+        });
+        cpu.r[15] = entry.as_ref().map_or(ROM_BASE, |e| e.thumb & !1);
         cpu.r[13] = NATIVE_BASE + NATIVE_LEN;
+        if let Some(e) = entry.as_ref().filter(|e| e.irq_handler != 0) {
+            mem.set_irq_vector(e.irq_handler);
+        }
         Machine {
             cpu,
             sys: Sys {
@@ -634,11 +987,37 @@ impl Machine {
                 frame_cycles: 0,
                 frame_no: 0,
                 input,
+                in_irq: false,
+                paging: None,
+                total_cycles: 0,
+                timers: common::timers::Timers::new(),
+                flash: common::flash::FlashChip::new(),
             },
             in_irq: false,
             saved: None,
             intr_waiting: false,
+            timed: false,
+            trace_from: None,
+            thumb_jit,
             trace: false,
+        }
+    }
+
+    // Send ROM reads through a cache of kb kilobytes of 256 byte pages. The translated code stops
+    // reading ROM inline, those loads fault and the handler reads through the cache.
+    pub fn enable_rom_cache(&mut self, kb: usize) {
+        let slots = kb * 1024 / PAGE_SIZE;
+        let data: &'static mut [u8] = Box::leak(vec![0u8; slots * PAGE_SIZE].into_boxed_slice());
+        let tags: &'static mut [u32] = Box::leak(vec![0u32; slots].into_boxed_slice());
+        let stamps: &'static mut [u32] = Box::leak(vec![0u32; slots].into_boxed_slice());
+        let rom = self.sys.mem.rom.clone();
+        self.sys.paging = Some(Paging {
+            cache: RomCache::new(data, tags, stamps),
+            src: VecSource(rom),
+        });
+        for top in 8..=0xDu32 {
+            let at = (REGIONS_ADDR - NATIVE_BASE + 4 * top) as usize;
+            self.sys.mem.native[at..at + 4].fill(0);
         }
     }
 
@@ -653,7 +1032,18 @@ impl Machine {
                 self.finish_irq();
                 continue;
             }
+            if self.thumb_jit && !Sys::in_cache(pc) && matches!(pc >> 24, 2 | 3 | 8..=0xD) {
+                // Thumb code at a GBA address: the fault handler translates it and continues
+                // in the code cache
+                self.sys.trap(pc, 1);
+                let t = self.sys.translate(pc | 1);
+                self.cpu.r[15] = t & !1;
+                continue;
+            }
             self.sys.cur_pc = pc;
+            if let Some(f) = self.trace_from {
+                self.trace = self.sys.frame_no >= f;
+            }
             self.sys.trace = self.trace;
             if self.trace {
                 let hw = self.sys.fetch(pc);
@@ -670,6 +1060,10 @@ impl Machine {
             }
             if self.sys.vblank_polled {
                 self.sys.vblank_polled = false;
+                self.end_frame(true);
+                self.try_inject(pc);
+            }
+            if self.timed && self.sys.frame_cycles > 2_083_333 {
                 self.end_frame(true);
                 self.try_inject(pc);
             }
@@ -691,6 +1085,26 @@ impl Machine {
                 self.sys.trap(pc, 0);
                 let t = self.sys.resolve(pc);
                 self.cpu.r[15] = t & !1;
+            }
+            Event::Udf(hw) if hw == STUB_TRAP && self.sys.jit.is_stub(pc) => {
+                // a dispatch missed: continue at the target, translating it first
+                self.sys.trap(pc, 0);
+                let var = (self.sys.jit.miss_var() - NATIVE_BASE) as usize;
+                let target =
+                    u32::from_le_bytes(self.sys.mem.native[var..var + 4].try_into().unwrap());
+                let dest = if !matches!(target >> 24, 2 | 3 | 8..=0xD) {
+                    // native code: the cache or something copied to the stack
+                    target
+                } else {
+                    let t = self.sys.translate(target);
+                    if target & 1 != 0 {
+                        let at = (self.sys.jit.dispatch_entry(target) - NATIVE_BASE) as usize;
+                        self.sys.mem.native[at..at + 4].copy_from_slice(&target.to_le_bytes());
+                        self.sys.mem.native[at + 4..at + 8].copy_from_slice(&t.to_le_bytes());
+                    }
+                    t
+                };
+                self.cpu.r[15] = dest & !1;
             }
             Event::Udf(hw) => self.sys.die(&format!("udf {hw:#x}")),
             Event::Bkpt => self.sys.die("bkpt"),
@@ -738,6 +1152,31 @@ impl Machine {
                     r[3] = q.unsigned_abs();
                 }
             }
+            // DivArm: the same with the operands swapped
+            0x07 => {
+                let (num, den) = (r1 as i32, r0 as i32);
+                if den != 0 {
+                    let q = num.wrapping_div(den);
+                    let r = &mut self.cpu.r;
+                    r[0] = q as u32;
+                    r[1] = num.wrapping_rem(den) as u32;
+                    r[3] = q.unsigned_abs();
+                }
+            }
+            0x08 => self.cpu.r[0] = common::bios::sqrt(r0),
+            0x09 => self.cpu.r[0] = common::bios::arctan(r0 as i32) as u32,
+            0x0A => self.cpu.r[0] = common::bios::arctan2(r0 as i32, r1 as i32),
+            0x0E => {
+                let r2 = self.cpu.r[2];
+                common::bios::bg_affine_set(&mut GbaMem(&mut self.sys), r0, r1, r2);
+            }
+            0x0F => {
+                let (r2, r3) = (self.cpu.r[2], self.cpu.r[3]);
+                common::bios::obj_affine_set(&mut GbaMem(&mut self.sys), r0, r1, r2, r3);
+            }
+            0x11 | 0x12 => common::bios::lz77(&mut GbaMem(&mut self.sys), r0, r1, n == 0x12),
+            0x13 => common::bios::huffman(&mut GbaMem(&mut self.sys), r0, r1),
+            0x14 | 0x15 => common::bios::run_length(&mut GbaMem(&mut self.sys), r0, r1, n == 0x15),
             0x0B => self.cpu_set(at, false),
             0x0C => self.cpu_set(at, true),
             // Halt
@@ -775,9 +1214,13 @@ impl Machine {
             } else {
                 src.wrapping_add(i * unit)
             };
-            let Some(v) = self.sys.mem.read(from, unit) else {
-                self.sys
-                    .die(&format!("CpuSet read from unmapped {from:#x}"));
+            // like the firmware, an address that is not a GBA one is native (the stack)
+            let v = match (self.sys.mem.read(from, unit), Sys::native_off(from, unit)) {
+                (Some(v), _) => v,
+                (None, Some(off)) => self.sys.read_native(off, unit),
+                _ => self
+                    .sys
+                    .die(&format!("CpuSet read from unmapped {from:#x}")),
             };
             let to = dst.wrapping_add(i * unit);
             if !self.sys.mem.write(to, unit, v) {
@@ -820,6 +1263,11 @@ impl Machine {
     fn end_frame(&mut self, vblank: bool) {
         let sys = &mut self.sys;
         sys.stats.frames.push(sys.frame_cycles);
+        if let Some(p) = &sys.paging {
+            let total = p.cache.misses;
+            let before: u32 = sys.stats.rom_misses_by_frame.iter().sum();
+            sys.stats.rom_misses_by_frame.push(total - before);
+        }
         sys.frame_cycles = 0;
         sys.frame_no += 1;
         let keys = if sys.input.pressed(sys.frame_no) {
@@ -847,6 +1295,7 @@ impl Machine {
             return;
         }
         self.in_irq = true;
+        self.sys.in_irq = true;
         self.sys.stats.tramp_count += 1;
         self.sys.stats.tramp_cycles += TRAMPOLINE_CYCLES;
         self.sys.charge_other(at, TRAMPOLINE_CYCLES);
@@ -854,6 +1303,7 @@ impl Machine {
             r: self.cpu.r,
             flags: self.cpu.flags(),
             ret_pc: self.cpu.r[15] | 1,
+            miss: self.miss_word(),
         });
         self.cpu.r[0] = 0x0400_0000;
         self.cpu.r[14] = MAGIC | 1;
@@ -866,9 +1316,27 @@ impl Machine {
         let f = mem.io16(IF);
         mem.set_io16(IF, f & !1);
         self.in_irq = false;
+        self.sys.in_irq = false;
         let s = self.saved.take().expect("irq return without an irq");
         self.cpu.r = s.r;
         self.cpu.set_flags(s.flags);
         self.cpu.r[15] = s.ret_pc & !1;
+        self.set_miss_word(s.miss);
+    }
+
+    fn miss_word(&self) -> u32 {
+        if !self.thumb_jit {
+            return 0;
+        }
+        let at = (self.sys.jit.miss_var() - NATIVE_BASE) as usize;
+        u32::from_le_bytes(self.sys.mem.native[at..at + 4].try_into().unwrap())
+    }
+
+    fn set_miss_word(&mut self, value: u32) {
+        if !self.thumb_jit {
+            return;
+        }
+        let at = (self.sys.jit.miss_var() - NATIVE_BASE) as usize;
+        self.sys.mem.native[at..at + 4].copy_from_slice(&value.to_le_bytes());
     }
 }

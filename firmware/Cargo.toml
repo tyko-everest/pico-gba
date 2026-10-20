@@ -10,7 +10,12 @@ cortex-m-rt = "0.7.5"
 embedded-graphics = "0.8.2"
 embedded-hal = "1.0.0"
 embedded-hal-bus = "0.3.0"
+embedded-sdmmc = { version = "0.10.0", default-features = false }
 mipidsi = "0.10.0"
 rp2040-boot2 = "0.3"
-rp2040-hal = { version = "0.12.0", features = ["critical-section-impl", "rt"] }
+rp2040-hal = { version = "0.12.0", features = ["critical-section-impl", "rt", "disable-intrinsics"] }
 rtt-target = { version = "0.6.2" }
+
+[features]
+# press A now and then, for running without anyone to touch the screen
+autopress = []

@@ -2,11 +2,16 @@
 #![no_main]
 #![allow(static_mut_refs)]
 mod controls;
+mod gba_mem;
+mod romstore;
+mod sdcard;
 
 use common::{
-    jit::{Jit, MapEntry, TRAP},
+    bios::{self, Memory},
+    jit::{DISPATCH_BYTES, Jit, JitError, MapEntry, TRAP},
     profile,
     registers::*,
+    romcache::{PAGE_SIZE, RomCache, RomSource},
     video::*,
 };
 use controls::{
@@ -26,6 +31,7 @@ use embedded_hal::{
 };
 use embedded_hal_bus::spi::ExclusiveDevice;
 use mipidsi::{Builder, interface::SpiInterface, models, options::ColorInversion};
+use romstore::RomStore;
 use rp2040_hal::{
     Clock, Spi, Timer, Watchdog,
     dma::{DMAExt, SingleChannel, WriteTarget, single_buffer},
@@ -44,12 +50,7 @@ const fn KB(num: u32) -> u32 {
     num << 10
 }
 
-const fn MB(num: u32) -> u32 {
-    num << 20
-}
-
 // the GBA memory map
-const REG_START: u32 = 0x0400_0000;
 const REG_LEN: u32 = KB(1);
 
 const PALETTE_START: u32 = 0x0500_0000;
@@ -64,18 +65,15 @@ const OAM_LEN: u32 = KB(1);
 // Only the start of EWRAM exists, the real 256 KiB does not fit next to everything else. The
 // game's heap grows up from the bottom of it.
 const EWRAM_START: u32 = 0x0200_0000;
-const EWRAM_LEN: u32 = KB(48);
+const EWRAM_LEN: u32 = KB(34);
 
 const IWRAM_START: u32 = 0x0300_0000;
 const IWRAM_LEN: u32 = KB(32);
-const IWRAM_MIRRORS: u32 = MB(16);
 
 // Cartridge save memory. Only a small window of it exists and it starts out blank.
-const SRAM_START: u32 = 0x0E00_0000;
 const SRAM_LEN: u32 = KB(4);
 
 const ROM_START: u32 = 0x0800_0000;
-const ROM_LEN: u32 = MB(20);
 
 // All 1K of the GBA's IO registers. Only the display registers are emulated, the rest is plain
 // memory for the game apart from KEYINPUT, which the touch controls write.
@@ -102,17 +100,42 @@ static mut NEW_SRAM: [u8; SRAM_LEN as usize] = [0xFF; SRAM_LEN as usize];
 static mut NEW_EWRAM: [u32; EWRAM_LEN as usize / 4] = [0; EWRAM_LEN as usize / 4];
 static mut NEW_IWRAM: [u32; IWRAM_LEN as usize / 4] = [0; IWRAM_LEN as usize / 4];
 
-// part of the rom loaded in
-// The ROM runs from where it is stored, so it has to keep the GBA's word alignment or every
-// pc relative load in it reads the wrong word
+// The ROM is read from the SD card a page at a time through this cache, there is not nearly room
+// for all of it. A page is read in the first time it is used, by the other core.
+const ROM_CACHE_SLOTS: usize = 64;
+
 #[repr(C, align(4))]
-struct Aligned<T: ?Sized>(T);
-static ROM_ALIGNED: &Aligned<[u8]> = &Aligned(*include_bytes!("nobot.gba"));
-static ROM_CODE: &[u8] = &ROM_ALIGNED.0;
+struct RomCacheData([u8; ROM_CACHE_SLOTS * PAGE_SIZE]);
+
+static mut ROM_CACHE_DATA: RomCacheData = RomCacheData([0; ROM_CACHE_SLOTS * PAGE_SIZE]);
+static mut ROM_CACHE_TAGS: [u32; ROM_CACHE_SLOTS] = [0; ROM_CACHE_SLOTS];
+static mut ROM_CACHE_STAMPS: [u32; ROM_CACHE_SLOTS] = [0; ROM_CACHE_SLOTS];
+static mut ROM_CACHE: Option<RomCache<'static>> = None;
+
+fn rom_cache_init() {
+    unsafe {
+        ROM_CACHE = Some(RomCache::new(
+            &mut ROM_CACHE_DATA.0,
+            &mut ROM_CACHE_TAGS,
+            &mut ROM_CACHE_STAMPS,
+        ));
+    }
+}
+
+// Pages come from the SD card, through core 1
+struct SdRom;
+
+impl RomSource for SdRom {
+    fn read_page(&mut self, offset: u32, dst: &mut [u8; PAGE_SIZE]) {
+        if !romstore::read(offset, dst) {
+            dst.fill(0);
+        }
+    }
+}
 
 // Translated ARM code. The game's ARM mode code cannot run on the Cortex-M0+, the fault handler
 // translates it to Thumb the first time it is reached and runs it from this cache.
-const JIT_CODE_HW: usize = 12 * 1024;
+const JIT_CODE_HW: usize = 16 * 1024;
 const JIT_MAP_LEN: usize = 1024;
 
 #[repr(C, align(4))]
@@ -120,6 +143,10 @@ struct JitCode([u16; JIT_CODE_HW]);
 
 static mut JIT_CODE: JitCode = JitCode([0; JIT_CODE_HW]);
 static mut JIT_MAP: [MapEntry; JIT_MAP_LEN] = [Jit::empty_map_entry(); JIT_MAP_LEN];
+// the indirect jump table of the translated Thumb code
+#[repr(C, align(4))]
+struct JitDispatch([u32; DISPATCH_BYTES / 4]);
+static mut JIT_DISPATCH: JitDispatch = JitDispatch([0; DISPATCH_BYTES / 4]);
 static mut JIT: Option<Jit<'static>> = None;
 
 // Translated loads and stores find the native address of a GBA address through this table,
@@ -139,33 +166,22 @@ fn jit_init() {
         let flat = |gba: u32, native: u32| native.wrapping_sub(gba);
         JIT_REGIONS[0x02] = EWRAM_PAGE_TABLE.as_ptr() as u32 | 1;
         JIT_REGIONS[0x03] = IWRAM_PAGE_TABLE.as_ptr() as u32 | 1;
-        JIT_REGIONS[0x04] = flat(REG_START, &raw const NEW_REG as u32);
+        // IO and SRAM have side effects, accesses to them fault and the handler emulates them
         JIT_REGIONS[0x05] = flat(PALETTE_START, &raw const NEW_PALETTE as u32);
         JIT_REGIONS[0x06] = flat(VRAM_START, &raw const NEW_VRAM as u32);
         JIT_REGIONS[0x07] = flat(OAM_START, &raw const NEW_OAM as u32);
-        // the 32 MiB of ROM space and its two wait state mirrors
-        let rom = ROM_CODE.as_ptr() as u32;
-        for top in 0x08..0x0E {
-            JIT_REGIONS[top] = flat(ROM_START + (top as u32 - 0x08) / 2 * MB(32), rom);
-        }
-        JIT_REGIONS[0x0E] = flat(SRAM_START, &raw const NEW_SRAM as u32);
+        // ROM is not mapped either: it is paged in from the SD card by the handler
 
         let base = JIT_CODE.0.as_ptr() as u32;
         let regions = JIT_REGIONS.as_ptr() as u32;
-        JIT = Some(Jit::new(&mut JIT_CODE.0, base, &mut JIT_MAP, regions));
-    }
-}
-
-// the GBA address of something stored in the ROM or IWRAM copies, for code that runs in place
-fn native_to_gba(native: u32) -> Option<u32> {
-    let rom = ROM_CODE.as_ptr() as u32;
-    let iwram = unsafe { &raw const NEW_IWRAM as u32 };
-    if native >= rom && native < rom + ROM_CODE.len() as u32 {
-        Some(native - rom + ROM_START)
-    } else if native >= iwram && native < iwram + IWRAM_LEN {
-        Some(native - iwram + IWRAM_START)
-    } else {
-        None
+        JIT = Some(Jit::new(
+            &mut JIT_CODE.0,
+            base,
+            &mut JIT_MAP,
+            regions,
+            JIT_DISPATCH.0.as_ptr() as u32,
+        ));
+        JIT.as_mut().unwrap().set_reserve(JIT_RESERVE_HW);
     }
 }
 
@@ -179,36 +195,198 @@ fn gba_read_word(addr: u32) -> Option<u32> {
             || table(IWRAM_PAGE_TABLE.as_ptr() as u32, PAGE_TABLE_LEN)
             || table(EWRAM_PAGE_TABLE.as_ptr() as u32, PAGE_TABLE_LEN)
     };
-    let addr = if native { Some(addr) } else { fix_addr(addr) };
-    addr.map(|native| unsafe { core::ptr::read_volatile(native as *const u32) })
+    if native {
+        Some(unsafe { core::ptr::read_volatile(addr as *const u32) })
+    } else {
+        Some(gba_mem::load(addr, 4))
+    }
 }
 
-// Handles the faults caused by translated code: unresolved exits and jumps into ARM code.
-// Returns true when the fault was dealt with.
+// The code cache is thrown away when there is little room left, outside of the interrupt handler:
+// the code it interrupted is in the cache. The handler needs the room to translate its code
+// again afterwards.
+const JIT_MARGIN_HW: usize = 3 * 1024;
+// held back from translation until a full cache cannot be thrown away
+const JIT_RESERVE_HW: usize = 2 * 1024;
+const JIT_MARGIN_BLOCKS: usize = 200;
+
+fn jit_needs_flush(jit: &Jit) -> bool {
+    !unsafe { IN_IRQ }
+        && (jit.free_halfwords() < JIT_MARGIN_HW || jit.free_blocks() < JIT_MARGIN_BLOCKS)
+}
+
+// Does the stack hold a return address in the code cache? Translated ARM code that calls other
+// ARM code keeps one in lr, and a flush would leave it pointing at nothing.
+fn cache_address_on_stack(jit: &Jit, frame: u32) -> bool {
+    let top = &raw const _stack_start as u32;
+    let holds_cache_address =
+        |at: u32| jit.contains(unsafe { core::ptr::read_volatile(at as *const u32) } & !1);
+    // the registers the exception stacked: r0-r3, r12 and lr (the pc and xpsr that follow are
+    // where the code stopped, which is in the cache)
+    if (0..6).any(|i| holds_cache_address(frame + 4 * i)) {
+        return true;
+    }
+    let mut at = frame + size_of::<ExceptionFrame>() as u32;
+    while at < top {
+        if holds_cache_address(at) {
+            return true;
+        }
+        at += 4;
+    }
+    false
+}
+
+fn jit_flush(jit: &mut Jit) {
+    unsafe { JIT_IRQ_HW = 0 };
+    jit.reset();
+    unsafe { JIT_DISPATCH.0.fill(0) };
+    unsafe { JIT_FLUSHES += 1 };
+    // the code the interrupt handler used goes back first
+    for i in 0..unsafe { JIT_PIN_COUNT } {
+        let key = unsafe { JIT_PIN_KEYS[i] };
+        let _ = jit.translate(key, &mut gba_read_word);
+    }
+}
+
+static mut JIT_FLUSHES: u32 = 0;
+// code translated inside the interrupt handler since the last flush (halfwords), and the most of that
+static mut JIT_IRQ_HW: usize = 0;
+static mut JIT_IRQ_MAX: usize = 0;
+// the core, pc, lr, xpsr and r0-r3 of the last fault that was not in translated code
+#[unsafe(no_mangle)]
+static mut NATIVE_FAULT: [u32; 8] = [0; 8];
+
+// The blocks the interrupt handler needed. The cache cannot be flushed while it runs, so after a
+// flush these are translated again at once, not inside the next interrupt where the room might
+// run out.
+const JIT_PINNED: usize = 160;
+static mut JIT_PIN_KEYS: [u32; JIT_PINNED] = [0; JIT_PINNED];
+static mut JIT_PIN_COUNT: usize = 0;
+
+// Count what the interrupt handler translated, and remember where it started
+fn note_irq_code(jit: &Jit, used_before: usize, key: u32) {
+    if unsafe { IN_IRQ } && jit.used_halfwords() > used_before {
+        unsafe {
+            JIT_IRQ_HW += jit.used_halfwords() - used_before;
+            JIT_IRQ_MAX = JIT_IRQ_MAX.max(JIT_IRQ_HW);
+            if JIT_PIN_COUNT < JIT_PINNED && !JIT_PIN_KEYS[..JIT_PIN_COUNT].contains(&key) {
+                JIT_PIN_KEYS[JIT_PIN_COUNT] = key;
+                JIT_PIN_COUNT += 1;
+            }
+        }
+    }
+}
+
+fn jit_translate(jit: &mut Jit, key: u32, sp: u32) -> Result<u32, JitError> {
+    let used_before = jit.used_halfwords();
+    let result = jit_translate_inner(jit, key, sp);
+    note_irq_code(jit, used_before, key);
+    result
+}
+
+// What recovered from a full cache
+#[derive(PartialEq)]
+enum Recovery {
+    // the cache was thrown away
+    Flushed,
+    // the reserve was opened up
+    Extended,
+    None,
+}
+
+// The cache is full: throw it away if nothing can be pointing into it (not in the interrupt
+// handler, which interrupted code in the cache, nor with a return address on the stack), else use
+// the reserve that was held back for this.
+fn jit_recover(jit: &mut Jit, sp: u32) -> Recovery {
+    if !unsafe { IN_IRQ } && !cache_address_on_stack(jit, sp) {
+        jit_flush(jit);
+        Recovery::Flushed
+    } else if !jit.in_emergency() {
+        jit.use_reserve();
+        Recovery::Extended
+    } else {
+        Recovery::None
+    }
+}
+
+fn jit_translate_inner(jit: &mut Jit, key: u32, sp: u32) -> Result<u32, JitError> {
+    if jit_needs_flush(jit) && !cache_address_on_stack(jit, sp) {
+        jit_flush(jit);
+    }
+    loop {
+        match jit.translate(key, &mut gba_read_word) {
+            Err(JitError::CacheFull) if jit_recover(jit, sp) != Recovery::None => {}
+            r => return r,
+        }
+    }
+}
+
+// An unresolved exit slot was reached
+fn jit_resolve(jit: &mut Jit, slot: u32, sp: u32) -> Result<u32, JitError> {
+    let used_before = jit.used_halfwords();
+    let key = jit.halfword(slot + 4) as u32 | (jit.halfword(slot + 6) as u32) << 16;
+    let result = jit_resolve_inner(jit, slot, key, sp);
+    note_irq_code(jit, used_before, key);
+    result
+}
+
+fn jit_resolve_inner(jit: &mut Jit, slot: u32, key: u32, sp: u32) -> Result<u32, JitError> {
+    if jit_needs_flush(jit) && !cache_address_on_stack(jit, sp) {
+        // the slot goes with the rest of the cache
+        jit_flush(jit);
+        return jit.translate(key, &mut gba_read_word);
+    }
+    match jit.resolve_slot(slot, &mut gba_read_word) {
+        Err(JitError::CacheFull) => match jit_recover(jit, sp) {
+            Recovery::Flushed => jit.translate(key, &mut gba_read_word),
+            Recovery::Extended => jit.resolve_slot(slot, &mut gba_read_word),
+            Recovery::None => Err(JitError::CacheFull),
+        },
+        r => r,
+    }
+}
+
+// Is this a GBA address that code runs from
+fn is_guest_code(addr: u32) -> bool {
+    matches!(addr >> 24, 2 | 3 | 8..=0xD)
+}
+
+// Handles the faults caused by translated code: unresolved exits, dispatches that missed, and
+// jumps to GBA code (a bx from translated ARM code to Thumb code, an ARM jump). Returns true
+// when the fault was dealt with.
 fn jit_fault(frame: &mut ExceptionFrame) -> bool {
     let Some(jit) = (unsafe { JIT.as_mut() }) else {
         return false;
     };
     let pc = frame.pc();
     const THUMB_BIT: u32 = 1 << 24;
+    let sp = frame as *mut ExceptionFrame as u32;
     let target = if jit.contains(pc) && jit.halfword(pc) == TRAP {
-        jit.resolve_slot(pc, &mut gba_read_word)
-    } else if native_to_gba(pc & !1).is_some() && unsafe { *((pc & !1) as *const u16) } == 0x4778 {
-        // bx pc, the Thumb to ARM veneer. Cortex-M0+ does not allow it, the ARM code follows
-        // the next instruction.
-        match native_to_gba((pc + 4) & !3) {
-            Some(gba) => jit.translate(gba, &mut gba_read_word),
-            None => return false,
+        jit_resolve(jit, pc, sp)
+    } else if jit.is_stub(pc) {
+        // a dispatch missed, it left its target in the miss word
+        let target = unsafe { core::ptr::read_volatile(jit.miss_var() as *const u32) };
+        if !is_guest_code(target) {
+            // native code: the cache, or something the game copied to the stack
+            Ok(target)
+        } else {
+            let result = jit_translate(jit, target, sp);
+            if let (Ok(native), true) = (result, target & 1 != 0) {
+                let entry = jit.dispatch_entry(target) as *mut u32;
+                unsafe {
+                    core::ptr::write_volatile(entry, target);
+                    core::ptr::write_volatile(entry.add(1), native);
+                }
+            }
+            result
         }
-    } else if frame.xpsr() & THUMB_BIT == 0 {
-        // a bx to an even address, which is ARM code. ROM code runs from where it is stored, so
-        // the address may be in the flash copy of the ROM.
-        let gba = match native_to_gba(pc) {
-            Some(gba) => gba,
-            None if fix_addr(pc).is_some() => pc,
-            None => return false,
+    } else if is_guest_code(pc) {
+        let key = if frame.xpsr() & THUMB_BIT != 0 {
+            pc | 1
+        } else {
+            pc & !3
         };
-        jit.translate(gba, &mut gba_read_word)
+        jit_translate(jit, key, sp)
     } else {
         return false;
     };
@@ -221,14 +399,15 @@ fn jit_fault(frame: &mut ExceptionFrame) -> bool {
             true
         },
         Err(e) => {
-            rprintln!("cannot translate ARM code at 0x{:x}: {:?}", pc, e);
+            rprintln!("cannot translate code at 0x{:x}: {:?}", pc, e);
             panic!()
         }
     }
 }
 
 #[panic_handler]
-fn panic_handler(_info: &PanicInfo) -> ! {
+fn panic_handler(info: &PanicInfo) -> ! {
+    rprintln!("panic: {}", info);
     loop {}
 }
 
@@ -278,6 +457,8 @@ static mut EWRAM_PAGE_TABLE: [u32; PAGE_TABLE_LEN] = {
     t
 };
 static mut EWRAM_PAGES_USED: u32 = 0;
+// set when a page was needed and the pool had none left: stores to it are lost
+static mut EWRAM_POOL_FULL: bool = false;
 
 // A page that has not been handed out holds its own GBA address in the table
 fn ewram_page_empty(gba_addr: u32) -> bool {
@@ -285,36 +466,39 @@ fn ewram_page_empty(gba_addr: u32) -> bool {
     unsafe { EWRAM_PAGE_TABLE[page as usize] == EWRAM_START + page * EWRAM_PAGE }
 }
 
-// The pages nothing but zero has been stored to share this one: a read of it gives zeros and a
-// store of zero leaves it zero. The crt0 of a ROM clears all 256 KiB of EWRAM, which would use up
-// the pool for nothing. The extra bytes are for an unaligned access at the end of the page.
-static mut EWRAM_ZERO: [u8; EWRAM_PAGE as usize + 4] = [0; EWRAM_PAGE as usize + 4];
-
 // The BIOS is not here. Code outside it reads the last word the BIOS fetched, the same value at
 // every address, and writes do nothing. C++ code that follows a null pointer relies on this: both
 // ends of an empty std::vector read the same word, the RP2040 boot rom there has different words.
 const BIOS_LEN: u32 = KB(16);
 const BIOS_OPEN_BUS: u32 = 0xE129_F000;
-static BIOS_BUS: [u32; 2] = [BIOS_OPEN_BUS; 2];
-static mut BIOS_SINK: [u32; 2] = [0; 2];
 
-// Like fix_addr, for a load or store the handler does itself. store is the value written.
-fn access_addr(gba_addr: u32, store: Option<u32>, size: u32) -> Option<u32> {
-    if gba_addr < BIOS_LEN {
-        let word = if store.is_some() {
-            &raw const BIOS_SINK as u32
-        } else {
-            BIOS_BUS.as_ptr() as u32
-        };
-        // an access across words reads the same word again, the buffer repeats it
-        return Some(word + gba_addr % 4);
+const EWRAM_SLOTS: usize = (EWRAM_LEN / EWRAM_PAGE) as usize;
+// the page table index each slot of the pool holds, EWRAM_FREE for one that is free
+const EWRAM_FREE: u16 = u16::MAX;
+static mut EWRAM_SLOT_PAGE: [u16; EWRAM_SLOTS] = [EWRAM_FREE; EWRAM_SLOTS];
+
+// Free the pages that hold nothing but zeros, which are the same as pages that were never used.
+// The translator does not build the native address of an EWRAM page into code, so a page can go.
+// Returns whether any page was freed.
+fn ewram_reclaim() -> bool {
+    unsafe {
+        let pool = &raw const NEW_EWRAM as u32;
+        let mut freed = false;
+        for slot in 0..EWRAM_SLOTS {
+            let page = EWRAM_SLOT_PAGE[slot];
+            if page == EWRAM_FREE {
+                continue;
+            }
+            let words = (pool + slot as u32 * EWRAM_PAGE) as *const u32;
+            if (0..EWRAM_PAGE as usize / 4).all(|i| core::ptr::read_volatile(words.add(i)) == 0) {
+                EWRAM_PAGE_TABLE[page as usize] = EWRAM_START + page as u32 * EWRAM_PAGE;
+                EWRAM_SLOT_PAGE[slot] = EWRAM_FREE;
+                EWRAM_PAGES_USED -= 1;
+                freed = true;
+            }
+        }
+        freed
     }
-    let mask = u32::MAX >> (32 - 8 * size);
-    let in_ewram = gba_addr >= EWRAM_START && gba_addr < IWRAM_START;
-    if in_ewram && ewram_page_empty(gba_addr) && store.is_none_or(|v| v & mask == 0) {
-        return Some(&raw const EWRAM_ZERO as u32 + gba_addr % EWRAM_PAGE);
-    }
-    fix_addr(gba_addr)
 }
 
 fn ewram_native(gba_addr: u32) -> Option<u32> {
@@ -322,46 +506,20 @@ fn ewram_native(gba_addr: u32) -> Option<u32> {
         let offset = (gba_addr - EWRAM_START) & (EWRAM_MIRROR - 1);
         let page = (offset / EWRAM_PAGE) as usize;
         if ewram_page_empty(gba_addr) {
-            if EWRAM_PAGES_USED * EWRAM_PAGE >= EWRAM_LEN {
-                return None;
+            let mut slot = EWRAM_SLOT_PAGE.iter().position(|&p| p == EWRAM_FREE);
+            if slot.is_none() && ewram_reclaim() {
+                slot = EWRAM_SLOT_PAGE.iter().position(|&p| p == EWRAM_FREE);
             }
+            let Some(slot) = slot else {
+                EWRAM_POOL_FULL = true;
+                return None;
+            };
             let pool = &raw const NEW_EWRAM as u32;
-            EWRAM_PAGE_TABLE[page] = pool + EWRAM_PAGES_USED * EWRAM_PAGE;
+            EWRAM_PAGE_TABLE[page] = pool + slot as u32 * EWRAM_PAGE;
+            EWRAM_SLOT_PAGE[slot] = page as u16;
             EWRAM_PAGES_USED += 1;
         }
         Some(EWRAM_PAGE_TABLE[page] + offset % EWRAM_PAGE)
-    }
-}
-
-#[allow(static_mut_refs)]
-fn fix_addr(gba_addr: u32) -> Option<u32> {
-    if gba_addr >= REG_START && gba_addr < REG_START + REG_LEN {
-        let new_reg_start = unsafe { &NEW_REG as *const IoRegisters as u32 };
-        Some(gba_addr + new_reg_start - REG_START)
-    } else if gba_addr >= PALETTE_START && gba_addr < PALETTE_START + PALETTE_LEN {
-        let new_palette_start = unsafe { &NEW_PALETTE as *const Palette as u32 };
-        Some(gba_addr + new_palette_start - PALETTE_START)
-    } else if gba_addr >= VRAM_START && gba_addr < VRAM_START + VRAM_LEN {
-        let new_vram_start = unsafe { &NEW_VRAM as *const VRAM as u32 };
-        Some(gba_addr + new_vram_start - VRAM_START)
-    } else if gba_addr >= OAM_START && gba_addr < OAM_START + OAM_LEN {
-        let new_oam_start = unsafe { &NEW_OAM as *const OAM as u32 };
-        Some(gba_addr + new_oam_start - OAM_START)
-    } else if gba_addr >= SRAM_START && gba_addr < SRAM_START + SRAM_LEN {
-        let new_sram_start = unsafe { &raw const NEW_SRAM as u32 };
-        Some(gba_addr + new_sram_start - SRAM_START)
-    } else if gba_addr >= EWRAM_START && gba_addr < IWRAM_START {
-        ewram_native(gba_addr)
-    } else if gba_addr >= IWRAM_START && gba_addr < IWRAM_START + IWRAM_MIRRORS {
-        // the 32 KiB of IWRAM repeats all the way up to the IO registers, games use the mirror
-        // at the top for the interrupt vector
-        let new_iwram_start = unsafe { &raw const NEW_IWRAM as u32 };
-        Some(new_iwram_start + ((gba_addr - IWRAM_START) & (IWRAM_LEN - 1)))
-    } else if gba_addr >= ROM_START && gba_addr < ROM_START + ROM_LEN {
-        let new_rom_start = ROM_CODE.as_ptr() as u32;
-        Some(gba_addr + new_rom_start - ROM_START)
-    } else {
-        None
     }
 }
 
@@ -378,12 +536,6 @@ extern "C" fn SVCall() {
         "pop {{r4, pc}}",
         func = sym svc_call
     );
-}
-
-// Registers hold GBA addresses unless a faulting load or store already swapped in the native
-// address, so anything that is not a GBA address is assumed to be native already
-fn native_addr(addr: u32) -> u32 {
-    fix_addr(addr).unwrap_or(addr)
 }
 
 // SWI 0x0B CpuSet and SWI 0x0C CpuFastSet, a memcpy/memset in 16 or 32 bit units.
@@ -405,27 +557,19 @@ fn cpu_set(frame: &ExceptionFrame, fast: bool) {
     let (src, dst) = (frame.r0() & align, frame.r1() & align);
     let unit = if word { 4 } else { 2 };
 
-    // Every unit is translated on its own, the memory behind an address range is not contiguous
-    // (EWRAM is paged). Volatile so the loop is not turned into a memcpy call.
-    unsafe {
-        let first = native_addr(src);
-        let value_at = |i: usize| {
-            let from = native_addr(src + if fill { 0 } else { i as u32 * unit });
-            let from = if fill && i == 0 { first } else { from };
-            if word {
-                (from as *const u32).read_volatile()
-            } else {
-                (from as *const u16).read_volatile() as u32
-            }
-        };
-        for i in 0..count {
-            let value = value_at(i);
-            let to = native_addr(dst + i as u32 * unit);
-            if word {
-                (to as *mut u32).write_volatile(value);
-            } else {
-                (to as *mut u16).write_volatile(value as u16);
-            }
+    // Every unit is accessed on its own, the memory behind an address range is not contiguous
+    // (EWRAM is paged, ROM is cached).
+    let mut mem = gba_mem::Gba;
+    let first = if fill { mem.read32(src) } else { 0 };
+    for i in 0..count {
+        let from = src + if fill { 0 } else { i as u32 * unit };
+        let to = dst + i as u32 * unit;
+        if word {
+            let value = if fill { first } else { mem.read32(from) };
+            mem.write32(to, value);
+        } else {
+            let value = if fill { first as u16 } else { mem.read16(from) };
+            mem.write16(to, value);
         }
     }
 }
@@ -434,6 +578,8 @@ fn cpu_set(frame: &ExceptionFrame, fast: bool) {
 static mut LAST_SVC: [u32; 5] = [0; 5];
 static mut SVC_COUNTS: [u32; 16] = [0; 16];
 static mut FAULT_COUNT: u32 = 0;
+#[unsafe(no_mangle)]
+static mut FAULT_PCS: [u32; 8] = [0; 8];
 
 #[unsafe(no_mangle)]
 extern "C" fn svc_call(frame: &mut ExceptionFrame) {
@@ -464,6 +610,43 @@ extern "C" fn svc_call(frame: &mut ExceptionFrame) {
                 }
             }
         }
+        // DivArm: the same with the operands swapped
+        0x07 => {
+            let (num, den) = (frame.r1() as i32, frame.r0() as i32);
+            if den != 0 {
+                let quotient = num.wrapping_div(den);
+                let remainder = num.wrapping_rem(den);
+                unsafe {
+                    frame.set_r0(quotient as u32);
+                    frame.set_r1(remainder as u32);
+                    frame.set_r3(quotient.unsigned_abs());
+                }
+            }
+        }
+        0x08 => unsafe { frame.set_r0(bios::sqrt(frame.r0())) },
+        0x09 => unsafe { frame.set_r0(bios::arctan(frame.r0() as i32) as u32) },
+        0x0A => unsafe { frame.set_r0(bios::arctan2(frame.r0() as i32, frame.r1() as i32)) },
+        0x0E => bios::bg_affine_set(&mut gba_mem::Gba, frame.r0(), frame.r1(), frame.r2()),
+        0x0F => bios::obj_affine_set(
+            &mut gba_mem::Gba,
+            frame.r0(),
+            frame.r1(),
+            frame.r2(),
+            frame.r3(),
+        ),
+        0x11 | 0x12 => bios::lz77(
+            &mut gba_mem::Gba,
+            frame.r0(),
+            frame.r1(),
+            instr & 0xFF == 0x12,
+        ),
+        0x13 => bios::huffman(&mut gba_mem::Gba, frame.r0(), frame.r1()),
+        0x14 | 0x15 => bios::run_length(
+            &mut gba_mem::Gba,
+            frame.r0(),
+            frame.r1(),
+            instr & 0xFF == 0x15,
+        ),
         0x0B => cpu_set(frame, false),
         0x0C => cpu_set(frame, true),
         // Halt: nothing to save power on
@@ -498,30 +681,31 @@ extern "C" fn hard_fault(frame: &mut ExceptionFrame, other_regs: &mut Reg4_7) {
 }
 
 fn hard_fault_inner(frame: &mut ExceptionFrame, other_regs: &mut Reg4_7) {
-    static mut HF_COUNT: usize = 0;
-    unsafe { FAULT_COUNT += 1 };
-    let hf_count: usize;
     unsafe {
-        HF_COUNT += 1;
-        hf_count = HF_COUNT;
+        FAULT_PCS[FAULT_COUNT as usize % 8] = frame.pc();
+        FAULT_COUNT += 1;
     }
 
     if jit_fault(frame) {
         return;
     }
-
-    if let Some(pc) = fix_addr(frame.pc()) {
-        // if we get an invalid PC assume from BX or BLX
-        // bx and blx can use all 16 regisers, r8-r15 are not handled yet
+    // a fault in the firmware's own code, which is a bug: keep what is known where a debugger
+    // finds it, printing could deadlock on the other core's lock
+    let pc = frame.pc();
+    if !unsafe { JIT.as_ref().is_some_and(|j| j.contains(pc)) } {
         unsafe {
-            frame.set_pc(pc);
+            NATIVE_FAULT = [
+                (*pac::SIO::ptr()).cpuid().read().bits(),
+                pc,
+                frame.lr(),
+                frame.xpsr(),
+                frame.r0(),
+                frame.r1(),
+                frame.r2(),
+                frame.r3(),
+            ];
         }
-        return;
     }
-
-    // for debug purposes
-    let rom_start = ROM_CODE.as_ptr() as u32;
-    let diff = frame.pc() - rom_start;
 
     // get the instruction we were trying to execute
     let instr = unsafe { *((frame.pc() & !1) as *const u16) };
@@ -547,7 +731,39 @@ fn hard_fault_inner(frame: &mut ExceptionFrame, other_regs: &mut Reg4_7) {
         // LDMIA
     ) {
         // nothing else handled currently
-        rprintln!("cannot handle opcode 0x{:x}", instr);
+        let jit = unsafe { JIT.as_ref().unwrap() };
+        rprintln!(
+            "cannot handle opcode 0x{:x} at pc 0x{:x}, lr 0x{:x}, in the code cache {}, cache used {} bytes, {} flushes",
+            instr,
+            frame.pc(),
+            frame.lr(),
+            jit.contains(frame.pc()),
+            jit.code_used_bytes(),
+            unsafe { JIT_FLUSHES }
+        );
+        rprintln!(
+            "r0-r7 {:x} {:x} {:x} {:x} {:x} {:x} {:x} {:x}, in irq {}",
+            frame.r0(),
+            frame.r1(),
+            frame.r2(),
+            frame.r3(),
+            { other_regs.r4 },
+            { other_regs.r5 },
+            { other_regs.r6 },
+            { other_regs.r7 },
+            unsafe { IN_IRQ }
+        );
+        rprintln!(
+            "last svc {:x?}, irq pcs {:x?}",
+            unsafe { LAST_SVC },
+            unsafe { PC_SAMPLES }
+        );
+        let around = (frame.pc() & !1).wrapping_sub(32);
+        for i in 0..24 {
+            let at = around + 2 * i;
+            let raw = unsafe { core::ptr::read_volatile(at as *const u16) };
+            rprintln!("  {:x}: {:04x}", at, raw);
+        }
         panic!()
     }
 
@@ -575,32 +791,6 @@ fn hard_fault_inner(frame: &mut ExceptionFrame, other_regs: &mut Reg4_7) {
             _ => other.r7 = value,
         }
     };
-    let fail = |frame: &ExceptionFrame, other: &Reg4_7, address: u32| -> ! {
-        rprintln!("last svc {:x?}", unsafe { LAST_SVC });
-        rprintln!(
-            "r0-r7 {:x} {:x} {:x} {:x} {:x} {:x} {:x} {:x}",
-            frame.r0(),
-            frame.r1(),
-            frame.r2(),
-            frame.r3(),
-            { other.r4 },
-            { other.r5 },
-            { other.r6 },
-            { other.r7 }
-        );
-        rprintln!(
-            "cannot handle address 0x{:x} (instr 0x{:x}, pc 0x{:x}, lr 0x{:x}, rom offset 0x{:x}, rn 0x{:x}, rm 0x{:x})",
-            address,
-            instr,
-            frame.pc(),
-            frame.lr(),
-            diff,
-            get(frame, other, (instr >> 3) & 7),
-            get(frame, other, (instr >> 6) & 7)
-        );
-        panic!()
-    };
-
     // The access is done here and the registers keep the GBA addresses: code compares pointers
     // it loaded from memory against ones it computed, a loop that copies up to an end pointer
     // never ends when the two are different kinds. That goes for ROM pointers too.
@@ -622,16 +812,11 @@ fn hard_fault_inner(frame: &mut ExceptionFrame, other_regs: &mut Reg4_7) {
             if list & (1 << r) == 0 {
                 continue;
             }
-            let store = (!load).then(|| get(frame, other_regs, r));
-            let Some(native) = access_addr(address, store, 4) else {
-                fail(frame, other_regs, address)
-            };
-            match store {
-                None => {
-                    let value = unsafe { read_native(native, 4) };
-                    set(frame, other_regs, r, value);
-                }
-                Some(value) => unsafe { write_native(native, 4, value) },
+            if load {
+                let value = gba_mem::load(address, 4);
+                set(frame, other_regs, r, value);
+            } else {
+                gba_mem::store(address, 4, get(frame, other_regs, r));
             }
             address = address.wrapping_add(4);
         }
@@ -664,12 +849,8 @@ fn hard_fault_inner(frame: &mut ExceptionFrame, other_regs: &mut Reg4_7) {
                 _ => (2, load, false, base.wrapping_add(imm * 2)),
             }
         };
-        let store = (!load).then(|| get(frame, other_regs, rt));
-        let Some(native) = access_addr(address, store, size) else {
-            fail(frame, other_regs, address)
-        };
         if load {
-            let mut value = unsafe { read_native(native, size) };
+            let mut value = gba_mem::load(address, size);
             if signed {
                 value = match size {
                     1 => value as u8 as i8 as i32 as u32,
@@ -678,7 +859,7 @@ fn hard_fault_inner(frame: &mut ExceptionFrame, other_regs: &mut Reg4_7) {
             }
             set(frame, other_regs, rt, value);
         } else {
-            unsafe { write_native(native, size, store.unwrap()) };
+            gba_mem::store(address, size, get(frame, other_regs, rt));
         }
     }
     // the instruction is done, continue after it
@@ -740,6 +921,7 @@ const IRQ_VECTOR_OFFSET: usize = 0x7FFC;
 static mut PC_SAMPLES: [u32; 8] = [0; 8];
 static mut PC_SAMPLE_COUNT: usize = 0;
 static mut IN_IRQ: bool = false;
+static mut SAVED_MISS: u32 = 0;
 static mut IRQ_RETURN_PC: u32 = 0;
 
 fn io_reg(offset: usize) -> *mut u16 {
@@ -798,6 +980,11 @@ fn try_inject(frame: &mut ExceptionFrame) {
             return;
         }
         IN_IRQ = true;
+        // A dispatch that missed leaves its target in a word, and the trap that follows reads it:
+        // an interrupt in between would replace it with its own.
+        if let Some(jit) = JIT.as_ref() {
+            SAVED_MISS = core::ptr::read_volatile(jit.miss_var() as *const u32);
+        }
         // the return has to be a Thumb address
         IRQ_RETURN_PC = frame.pc() | 1;
         frame.set_pc(irq_trampoline as usize as u32 & !1);
@@ -853,6 +1040,9 @@ extern "C" fn irq_finish() {
     unsafe {
         let flags = io_reg(IF_OFFSET);
         core::ptr::write_volatile(flags, core::ptr::read_volatile(flags) & !1);
+        if let Some(jit) = JIT.as_ref() {
+            core::ptr::write_volatile(jit.miss_var() as *mut u32, SAVED_MISS);
+        }
         IN_IRQ = false;
     }
 }
@@ -1146,14 +1336,19 @@ fn draw_controls<SPI: SpiDevice, DC: OutputPin, CH: SingleChannel>(
     }
 }
 
-fn video_loop<SPI, DC, CH, TpCs, TpIrq, LcdCs>(
+// the longest a single ROM read request is expected to take, requests are not started after
+// this long before the end of VBlank
+const SD_MARGIN_US: u32 = 2000;
+
+fn video_loop<SPI, DC, CH, TpCs, TpIrq, LcdCs, SdCs>(
     mut spi: SPI,
     mut dc: DC,
     dma_channel: CH,
-    mut video: Video,
+    video: &mut Video,
     mut systick: SYST,
     mut touch: Touch<TpCs, TpIrq, LcdCs>,
     keyinput: *mut u16,
+    mut rom_store: Option<&mut RomStore<SdCs>>,
 ) -> !
 where
     SPI: SpiDevice,
@@ -1162,6 +1357,7 @@ where
     TpCs: OutputPin,
     TpIrq: InputPin,
     LcdCs: OutputPin,
+    SdCs: OutputPin,
 {
     video.set_colour_format(gba_to_display);
 
@@ -1170,7 +1366,6 @@ where
     let vert_counter = core::ptr::addr_of_mut!(video.registers.vert_counter) as *mut u16;
     assert!(disp_status as usize % 2 == 0 && vert_counter as usize % 2 == 0);
 
-    rtt_init_print!();
     // this is using the 1MHz reference clock right now
     systick.enable_counter();
     // SysTick is a 24-bit down counter; invert it to count up and shift so it wraps at 2^32
@@ -1235,6 +1430,14 @@ where
                     }
                     None => idle.take().unwrap(),
                 };
+                // The bus is idle until the next line goes out: a ROM read the other core is
+                // waiting for is done now, not at VBlank
+                if romstore::request_pending() {
+                    if let Some(store) = rom_store.as_deref_mut() {
+                        spi1_flush();
+                        store.poll(&mut touch.lcd_cs);
+                    }
+                }
                 let bytes: &'static [u8] = unsafe {
                     core::slice::from_raw_parts(buffer.as_ptr() as *const u8, SCREEN_WIDTH * 2)
                 };
@@ -1268,6 +1471,16 @@ where
                 } else {
                     touch_frames = 0;
                 }
+                if cfg!(feature = "autopress") {
+                    // a test without hands: A held for 6 frames out of every 90
+                    static mut AUTO_FRAME: u32 = 0;
+                    unsafe {
+                        AUTO_FRAME += 1;
+                        if AUTO_FRAME % 90 < 6 {
+                            keys |= controls::KEY_A;
+                        }
+                    }
+                }
                 unsafe { core::ptr::write_volatile(keyinput, KEYS_RELEASED & !keys) };
                 if keys != keys_held {
                     for (rect, key) in BUTTONS {
@@ -1278,6 +1491,19 @@ where
                     keys_held = keys;
                 }
                 input_max = input_max.max(elapsed(input_start));
+
+                // SPI1 stays idle for the rest of VBlank, so this is when the SD card is used.
+                // Stop in time to not make the first line of the next frame late.
+                if let Some(store) = rom_store.as_deref_mut() {
+                    let deadline = gba_cycles_to_us((LINES_PER_FRAME as u32 - 1) * LINE_CYCLES)
+                        .saturating_sub(SD_MARGIN_US);
+                    // one request is always served, or a frame that is late would starve the other
+                    // core, then more while there is time
+                    let mut served = store.poll(&mut touch.lcd_cs);
+                    while served && elapsed(frame_start) < deadline {
+                        served = store.poll(&mut touch.lcd_cs);
+                    }
+                }
 
                 vblank_late_max =
                     vblank_late_max.max(elapsed(frame_start).saturating_sub(line_start));
@@ -1303,6 +1529,23 @@ where
                             core::ptr::read_volatile(io_reg(IE_OFFSET)),
                             core::ptr::read_volatile(io_reg(IF_OFFSET)),
                             core::ptr::read_volatile(io_reg(IME_OFFSET))
+                        );
+                        rprintln!(
+                            "stacks used: core 0 {} of {}, core 1 {} of {}; jit flushes {}, most code translated in irq {} bytes; rom cache hits {} misses {}; ewram pool full {}; sd read retries {} (last error {:#x})",
+                            stack_used(&raw const __sheap as u32, &raw const _stack_start as u32),
+                            &raw const _stack_start as u32 - &raw const __sheap as u32,
+                            stack_used(
+                                &raw const CORE1_STACK as u32,
+                                &raw const CORE1_STACK as u32 + size_of::<Stack<2560>>() as u32
+                            ),
+                            size_of::<Stack<2560>>(),
+                            JIT_FLUSHES,
+                            JIT_IRQ_MAX * 2,
+                            ROM_CACHE.as_ref().map_or(0, |c| c.hits),
+                            ROM_CACHE.as_ref().map_or(0, |c| c.misses),
+                            EWRAM_POOL_FULL,
+                            sdcard::RETRIES.load(core::sync::atomic::Ordering::Relaxed),
+                            sdcard::LAST_ERROR.load(core::sync::atomic::Ordering::Relaxed)
                         );
                     }
                     let report_time = elapsed(report_start);
@@ -1355,12 +1598,100 @@ where
     }
 }
 
-static mut CORE1_STACK: Stack<4096> = Stack::new();
+const STACK_PAINT: u32 = 0xC0DE_C0DE;
+
+unsafe extern "C" {
+    static __sheap: u32;
+    static _stack_start: u32;
+}
+
+// Fill the unused part of a stack with a pattern, so stack_used can tell how deep it went
+unsafe fn paint_stack(low: u32, high: u32) {
+    let mut at = low & !3;
+    while at < high {
+        unsafe { core::ptr::write_volatile(at as *mut u32, STACK_PAINT) };
+        at += 4;
+    }
+}
+
+// The most of the stack between low and high that has been used
+fn stack_used(low: u32, high: u32) -> u32 {
+    let mut at = low & !3;
+    while at < high && unsafe { core::ptr::read_volatile(at as *const u32) } == STACK_PAINT {
+        at += 4;
+    }
+    high - at
+}
+
+// The video state is big and stays in a static. Building it in a function of its own gives the
+// room it takes on the stack back when it is done, setup keeps it for good otherwise.
+#[inline(never)]
+fn init_video() -> &'static mut Video<'static> {
+    unsafe {
+        VIDEO = Some(Video::new(
+            &mut NEW_REG.display,
+            &mut NEW_PALETTE,
+            &mut NEW_VRAM,
+            &mut NEW_OAM,
+        ));
+        VIDEO.as_mut().unwrap()
+    }
+}
+
+// Wait until core 1 has mounted the SD card and looked for a ROM, its size when there is one
+fn wait_for_rom(timer: &Timer) -> Option<u32> {
+    let start = timer.get_counter().ticks();
+    loop {
+        if let Some(found) = romstore::rom_size() {
+            return found;
+        }
+        if timer.get_counter().ticks() - start > 5_000_000 {
+            rprintln!("core 1 did not look at the SD card");
+            return None;
+        }
+    }
+}
+
+// The pin the SD card's chip select is on
+type SdCsPin = rp2040_hal::gpio::Pin<
+    rp2040_hal::gpio::bank0::Gpio22,
+    rp2040_hal::gpio::FunctionSioOutput,
+    rp2040_hal::gpio::PullDown,
+>;
+
+// The ROM store is big, and core 1's stack is small
+static mut VIDEO: Option<Video<'static>> = None;
+
+static mut ROM_STORE: Option<RomStore<SdCsPin>> = None;
+
+static mut CORE1_STACK: Stack<2560> = Stack::new();
 
 #[entry]
 fn main() -> ! {
+    // all the setup is in a function that returns, its stack frame is big and the game does not
+    // need that room
+    let thumb_start = setup();
+    unsafe {
+        // measure the stack from here on, not the setup's
+        let here: u32;
+        asm!("mov {}, sp", out(reg) here);
+        paint_stack(&raw const __sheap as u32, here - 256);
+        asm!("bx {}", in(reg) thumb_start);
+    }
+    loop {}
+}
+
+// Set everything up and return the GBA address to start the game at
+#[inline(never)]
+fn setup() -> u32 {
+    rtt_init_print!();
     let mut pac = pac::Peripherals::take().unwrap();
     let core = cortex_m::Peripherals::take().unwrap();
+    unsafe {
+        let here: u32;
+        asm!("mov {}, sp", out(reg) here);
+        paint_stack(&raw const __sheap as u32, here - 256);
+    }
     let mut watchdog = Watchdog::new(pac.WATCHDOG);
 
     let mut systick = core.SYST;
@@ -1413,6 +1744,24 @@ fn main() -> ! {
         embedded_hal::spi::MODE_3,
     );
 
+    // Probe the SD card before the display is set up, they share SPI1 and the card needs it slow
+    let mut sd_cs = pins.gpio22.into_push_pull_output();
+    sd_cs.set_high().unwrap();
+    spi_cs.set_high().unwrap();
+    let sd_card = match sdcard::SdCard::new(sd_cs) {
+        Ok(mut card) => {
+            let blocks = card.block_count();
+            rprintln!("sd card {:?}, {:?} blocks", card.card_type, blocks);
+            Some(card)
+        }
+        Err(e) => {
+            rprintln!("sd card init failed: {:?}", e);
+            None
+        }
+    };
+    controls::spi1_configure(controls::DISPLAY_SCR, true, true);
+    spi_cs.set_low().unwrap();
+
     let spi_device = ExclusiveDevice::new(spi_bus, NoCs, timer).unwrap();
 
     static mut buffer: [u8; 512] = [0; 512];
@@ -1433,15 +1782,11 @@ fn main() -> ! {
 
     // no keys are held until the touch controls say otherwise
     unsafe { core::ptr::write_volatile(keyinput_register(), KEYS_RELEASED) };
+    // the BIOS leaves the display in forced blank, games clear it when they are ready. Some of
+    // them (the ones that buffer their register writes) rely on seeing it.
+    unsafe { core::ptr::write_volatile(io_reg(0), 0x0080) };
 
-    let video = unsafe {
-        Video::new(
-            &mut NEW_REG.display,
-            &mut NEW_PALETTE,
-            &mut NEW_VRAM,
-            &mut NEW_OAM,
-        )
-    };
+    let video = init_video();
 
     display.clear(RgbColor::BLACK);
 
@@ -1456,12 +1801,21 @@ fn main() -> ! {
     let core1 = &mut cores[1];
 
     unsafe {
+        paint_stack(
+            &raw const CORE1_STACK as u32,
+            &raw const CORE1_STACK as u32 + size_of::<Stack<2560>>() as u32 - 64,
+        );
         core1
             .spawn(CORE1_STACK.take().unwrap(), move || {
-                let touch = Touch {
+                let mut touch = Touch {
                     tp_cs,
                     tp_irq,
                     lcd_cs: spi_cs,
+                };
+                // the ROM store mounts the card now, before the display's SPI1 traffic starts
+                let rom_store = unsafe {
+                    ROM_STORE = sd_card.map(|card| RomStore::new(card, &mut touch.lcd_cs));
+                    ROM_STORE.as_mut()
                 };
                 video_loop(
                     spi_device,
@@ -1471,12 +1825,21 @@ fn main() -> ! {
                     systick,
                     touch,
                     keyinput_register(),
+                    rom_store,
                 );
             })
             .unwrap();
     };
 
     unsafe { cortex_m::peripheral::NVIC::unmask(pac::Interrupt::SIO_IRQ_PROC0) };
+
+    rom_cache_init();
+    rprintln!("rom cache ready");
+    let Some(rom_len) = wait_for_rom(&timer) else {
+        rprintln!("no ROM on the SD card");
+        loop {}
+    };
+    rprintln!("ROM of {} bytes", rom_len);
 
     // The game's idea of the BIOS is address 0, which on the RP2040 is its boot rom. Reads of it
     // do not fault, so make it no access on this core and let the fault handler answer for it.
@@ -1494,14 +1857,25 @@ fn main() -> ! {
         asm!("dsb", "isb");
     }
 
-    let rom_addr = ROM_CODE.as_ptr() as u32;
-    // the crt0 of the ROM is ARM code that sets up stacks, skip to where it enters Thumb
-    let Some(entry) = common::rom::thumb_entry(ROM_CODE) else {
+    // The crt0 of the ROM is ARM code that sets up stacks and the interrupt handler, all that is
+    // left to do of it is to start the game where it goes to Thumb
+    let Some(entry) = common::rom::find_entry(|at| gba_mem::load(ROM_START + at, 4)) else {
         rprintln!("cannot find where the ROM switches to Thumb");
         panic!()
     };
-    let thumb_start = rom_addr + entry as u32 | 1; // last bit needs to be 1 for thumb mode
-    unsafe { asm!("bx {}", in(reg) thumb_start) };
-
-    loop {}
+    if entry.irq_handler != 0 {
+        unsafe {
+            let vector = (&raw mut NEW_IWRAM as *mut u8).add(IRQ_VECTOR_OFFSET) as *mut u32;
+            core::ptr::write_volatile(vector, entry.irq_handler);
+        }
+    }
+    // the GBA address, the translator runs the code from the code cache
+    let thumb_start = entry.thumb;
+    unsafe {
+        rprintln!(
+            "stack used by setup: {}",
+            stack_used(&raw const __sheap as u32, &raw const _stack_start as u32)
+        );
+    }
+    thumb_start
 }

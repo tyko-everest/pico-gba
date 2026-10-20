@@ -18,6 +18,8 @@
 // with a known value skip the lookup. An embedder that answers None for those loses that
 // optimisation and nothing else. Only pages that are there are used, they must stay where they are.
 //
+// Thumb code is translated too, an address with bit 0 set (see translate/thumb_src.rs).
+//
 // Known gaps: the translator is verified against Unicorn for every ARM block reachable in the
 // Dino ROM (decoding/jit_diff.py, zero mismatches), but not for ARM in general. Running
 // `jit_diff.py random 800` generates random instructions of every supported kind and still shows
@@ -51,6 +53,16 @@ pub struct MapEntry {
     thumb: u32,
 }
 
+// The indirect jump dispatcher: a direct mapped table of (GBA address, native address) pairs the
+// translated Thumb code looks its jump targets up in, followed by the word a miss leaves the
+// target in.
+pub const DISPATCH_BITS: u32 = 7;
+pub const DISPATCH_ENTRIES: usize = 1 << DISPATCH_BITS;
+pub const DISPATCH_BYTES: usize = DISPATCH_ENTRIES * 8 + 4;
+
+// UDF #0xFD, where a dispatch that missed ends up
+pub const STUB_TRAP: u16 = 0xDEFD;
+
 pub struct Jit<'a> {
     code: &'a mut [u16],
     // address code[0] runs at
@@ -61,6 +73,18 @@ pub struct Jit<'a> {
     // native address of the 256 entry region offset table, 0 for none
     regions: u32,
     blocks: usize,
+    // the end of the cache translations may use: the last `reserve` halfwords are only for
+    // emergencies, and so are the last eighth of the map
+    limit: usize,
+    reserve: usize,
+    emergency: bool,
+    // native address of the dispatch table, 0 when the code cache has no dispatcher (and Thumb
+    // code cannot be translated)
+    dispatch: u32,
+    // halfwords at the start of the cache that hold the dispatcher
+    reserved: usize,
+    // the address of the UDF a dispatch that missed runs
+    stub: u32,
     // the ARM address after the last block translated
     pub last_arm_end: u32,
 }
@@ -75,23 +99,102 @@ impl<'a> Jit<'a> {
     // address of a table of 256 u32 offsets: a load or store through a register holding the GBA
     // address a goes to a + table[a >> 24] (or through a page table, see the top). The embedder
     // fills it, 0 entries leave the address alone. With regions == 0 nothing is translated.
-    pub fn new(code: &'a mut [u16], base: u32, map: &'a mut [MapEntry], regions: u32) -> Self {
+    // dispatch is the native address of DISPATCH_BYTES of zeroed memory for the indirect jump
+    // dispatcher that Thumb code needs, 0 for ARM only.
+    pub fn new(
+        code: &'a mut [u16],
+        base: u32,
+        map: &'a mut [MapEntry],
+        regions: u32,
+        dispatch: u32,
+    ) -> Self {
         for m in map.iter_mut() {
             m.arm = 0;
         }
-        Jit {
+        let mut jit = Jit {
             code,
             base,
             used: 0,
             map,
             regions,
             blocks: 0,
+            limit: 0,
+            reserve: 0,
+            emergency: false,
+            dispatch,
+            reserved: 0,
+            stub: 0,
             last_arm_end: 0,
+        };
+        jit.reset();
+        jit
+    }
+
+    // Forget every translated block. The memory behind dispatch has to be cleared too, and nothing
+    // may jump into the old code afterwards.
+    pub fn reset(&mut self) {
+        for m in self.map.iter_mut() {
+            m.arm = 0;
         }
+        self.blocks = 0;
+        self.used = 0;
+        self.emergency = false;
+        self.limit = self.code.len() - self.reserve;
+        if self.dispatch != 0 {
+            let mut e = Emit::new(&mut self.code[..self.limit], self.base, 0);
+            let stub_hw = translate::emit_dispatcher(&mut e, self.dispatch);
+            self.used = e.pos();
+            self.reserved = self.used;
+            self.stub = self.base + 2 * stub_hw as u32;
+        }
+    }
+
+    // where the dispatch table keeps the entry for a GBA address
+    pub fn dispatch_entry(&self, target: u32) -> u32 {
+        self.dispatch + ((target >> 1) & (DISPATCH_ENTRIES as u32 - 1)) * 8
+    }
+
+    // the word a dispatch that missed stores its target in
+    pub fn miss_var(&self) -> u32 {
+        self.dispatch + DISPATCH_ENTRIES as u32 * 8
+    }
+
+    // Is this the UDF a dispatch that missed runs
+    pub fn is_stub(&self, pc: u32) -> bool {
+        self.dispatch != 0 && pc & !1 == self.stub
     }
 
     pub const fn empty_map_entry() -> MapEntry {
         MapEntry { arm: 0, thumb: 0 }
+    }
+
+    // blocks that fit in the map before it is full
+    pub fn free_blocks(&self) -> usize {
+        (self.map.len() * 3 / 4).saturating_sub(self.blocks)
+    }
+
+    // halfwords of code cache left
+    pub fn free_halfwords(&self) -> usize {
+        self.limit - self.used
+    }
+
+    // Hold the last halfwords of the cache back from translations, for emergency. Call right
+    // after new.
+    pub fn set_reserve(&mut self, halfwords: usize) {
+        self.reserve = halfwords;
+        self.limit = self.code.len() - halfwords;
+    }
+
+    // Is the reserve in use
+    pub fn in_emergency(&self) -> bool {
+        self.emergency
+    }
+
+    // Use what was held back, until the next reset: for when the cache is full at a time when it
+    // cannot be thrown away.
+    pub fn use_reserve(&mut self) {
+        self.emergency = true;
+        self.limit = self.code.len();
     }
 
     pub fn code_used_bytes(&self) -> usize {
@@ -112,9 +215,14 @@ impl<'a> Jit<'a> {
         self.code[((addr - self.base) / 2) as usize]
     }
 
+    // the address Thumb code jumps to to dispatch through the table
+    fn dispatch_routine(&self) -> u32 {
+        if self.dispatch == 0 { 0 } else { self.base | 1 }
+    }
+
     fn slot_index(&self, arm: u32) -> usize {
         // the map is a power of two sized open addressing table
-        ((arm >> 2).wrapping_mul(0x9E37_79B1) >> 8) as usize & (self.map.len() - 1)
+        ((arm >> 1).wrapping_mul(0x9E37_79B1) >> 8) as usize & (self.map.len() - 1)
     }
 
     // The thumb address (with the thumb bit set) of an ARM address that is already translated
@@ -133,9 +241,10 @@ impl<'a> Jit<'a> {
         }
     }
 
-    // keep the table at most half full
+    // keep the table at most three quarters full
     fn map_full(&self) -> bool {
-        self.blocks * 2 >= self.map.len()
+        let eighths = if self.emergency { 7 } else { 6 };
+        self.blocks * 8 >= self.map.len() * eighths
     }
 
     fn insert(&mut self, arm: u32, thumb: u32) {
@@ -165,10 +274,15 @@ impl<'a> Jit<'a> {
         let start = start + (start & 1);
         // a conditional skip that is too long to branch over makes a second try without sharing
         let mut long_skips = false;
+        let routine = self.dispatch_routine();
         let (end, len) = loop {
-            let e = Emit::new(self.code, self.base, start);
-            let mut tr = translate::Tr::new(e, mem, self.regions, long_skips);
-            let end = tr.block(arm);
+            let e = Emit::new(&mut self.code[..self.limit], self.base, start);
+            let mut tr = translate::Tr::new(e, mem, self.regions, long_skips, routine);
+            let end = if arm & 1 != 0 {
+                tr.thumb_block(arm & !1)
+            } else {
+                tr.block(arm)
+            };
             if tr.e.overflowed() {
                 return Err(JitError::CacheFull);
             }

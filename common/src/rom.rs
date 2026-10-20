@@ -42,6 +42,79 @@ pub fn thumb_entry(rom: &[u8]) -> Option<usize> {
     None
 }
 
+// Where the crt0 of a ROM sends the game, and the interrupt handler it installs.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Entry {
+    // the GBA address of the first Thumb instruction to run (bit 0 set)
+    pub thumb: u32,
+    // the address the crt0 stores at the top of IWRAM for the BIOS to call on interrupts, 0 when
+    // it stores none
+    pub irq_handler: u32,
+}
+
+const INTR_VECTOR: u32 = 0x0300_7FFC;
+const ROM_BASE: u32 = 0x0800_0000;
+// How many instructions of the crt0 are followed
+const FOLLOW: usize = 160;
+
+// Run the ARM crt0 a ROM starts with just far enough to find where it goes to Thumb: the values it
+// puts in registers (a literal, mov, or pc relative address) are followed, and a bx through one of
+// them is the end. Everything else is skipped, the stacks it sets are the firmware's. read32
+// returns the ROM word at an offset.
+pub fn find_entry(mut read32: impl FnMut(u32) -> u32) -> Option<Entry> {
+    let mut regs: [Option<u32>; 16] = [None; 16];
+    let mut irq_handler = 0;
+    let mut at = 0u32;
+    for _ in 0..FOLLOW {
+        let w = read32(at);
+        let pc = ROM_BASE + at + 8;
+        let rd = ((w >> 12) & 0xF) as usize;
+        let rn = ((w >> 16) & 0xF) as usize;
+        let imm = (w & 0xFF).rotate_right(((w >> 8) & 0xF) * 2);
+        let cond_al = w >> 28 == 0xE;
+        if w & 0xFF00_0000 == B_ALWAYS {
+            let offset = (((w & 0x00FF_FFFF) << 8) as i32 >> 6) as i64;
+            at = (at as i64 + offset + 8) as u32;
+            continue;
+        }
+        if cond_al {
+            match w & 0x0FFF_F000 {
+                // mov rd, #imm
+                x if x & 0x0FEF_0000 == 0x03A0_0000 => regs[rd] = Some(imm),
+                // add or sub rd, pc, #imm (adr)
+                x if x & 0x0FEF_0000 == 0x028F_0000 => regs[rd] = Some(pc.wrapping_add(imm)),
+                x if x & 0x0FEF_0000 == 0x024F_0000 => regs[rd] = Some(pc.wrapping_sub(imm)),
+                _ => {}
+            }
+            // ldr rd, [pc, #imm12]
+            if w & 0x0F7F_0000 == 0x051F_0000 {
+                let offset = w & 0xFFF;
+                let from = if w & (1 << 23) != 0 {
+                    at + 8 + offset
+                } else {
+                    at + 8 - offset
+                };
+                regs[rd] = Some(read32(from));
+            }
+            // str rd, [rn]
+            if w & 0x0FF0_0FFF == 0x0580_0000 && regs[rn] == Some(INTR_VECTOR) {
+                if let Some(v) = regs[rd] {
+                    irq_handler = v;
+                }
+            }
+            // bx rm
+            if w & 0x0FFF_FFF0 == BX & 0x0FFF_FFF0 {
+                let rm = (w & 0xF) as usize;
+                return regs[rm]
+                    .filter(|t| t & 1 != 0)
+                    .map(|thumb| Entry { thumb, irq_handler });
+            }
+        }
+        at += 4;
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

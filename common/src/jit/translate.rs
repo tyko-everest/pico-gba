@@ -14,12 +14,15 @@
 use super::{
     JitError,
     decode::{
-        BlockOp, COND_AL, Decoded, DpOp, Insn, MemKind, MemOp, MsrSrc, MulOp, Offset, Op2, Shift,
-        decode,
+        BlockOp, COND_AL, Decoded, DpOp, Insn, MemKind, MemOp, MsrSrc, MulLongOp, MulOp, Offset,
+        Op2, Shift, decode,
     },
     emit::Emit,
     thumb::{self, LR, PC, SP, is_low},
 };
+
+mod thumb_src;
+pub use thumb_src::emit_dispatcher;
 
 // Longest run of ARM instructions translated into a single block
 const MAX_BLOCK: usize = 48;
@@ -40,6 +43,8 @@ pub struct Tr<'a, 'm> {
     regions: u32,
     // every conditional instruction gets its own skip, with a branch that always reaches
     long_skips: bool,
+    // the address of the indirect jump dispatcher, 0 when there is none
+    dispatch: u32,
     // words pushed on the stack by the open frame
     pushed: u16,
     // address of the instruction being translated
@@ -125,8 +130,10 @@ impl<'a, 'm> Tr<'a, 'm> {
         mem: &'m mut dyn FnMut(u32) -> Option<u32>,
         regions: u32,
         long_skips: bool,
+        dispatch: u32,
     ) -> Self {
         Tr {
+            dispatch,
             e,
             mem,
             regions,
@@ -461,6 +468,7 @@ impl<'a, 'm> Tr<'a, 'm> {
             _ if writes_pc(&d.insn) => self.pc_write(d),
             Insn::Dp { op, s, rd, rn, op2 } => self.dp(op, s, rd, rn, op2),
             Insn::Mul(m) => self.mul(&m),
+            Insn::MulLong(m) => self.mul_long(&m),
             Insn::Mem(m) => self.mem_access(&m),
             Insn::Block(b) => self.block_transfer(&b),
             Insn::Swi { num } => self.e.put(thumb::svc(num)),
@@ -1043,6 +1051,80 @@ impl<'a, 'm> Tr<'a, 'm> {
         self.close(f);
     }
 
+    // The Cortex-M0+ has no long multiply. The 64 bit product is built from the four 16 bit
+    // partial products, the signed forms correct the high word of the unsigned product.
+    fn mul_long(&mut self, m: &MulLongOp) {
+        let MulLongOp {
+            signed,
+            acc,
+            s,
+            rdlo,
+            rdhi,
+            rm,
+            rs,
+        } = *m;
+        let bad = |r: u8| r == PC || r == SP;
+        if s || bad(rdlo) || bad(rdhi) || bad(rm) || bad(rs) || rdlo == rdhi {
+            return self.unsupported();
+        }
+        let (f, [a, b, c, d, e]) = self.open(
+            [true; 5],
+            low_bit(rdlo) | low_bit(rdhi) | low_bit(rm) | low_bit(rs),
+            FALL,
+            0,
+        );
+        use thumb::{ADC, AND, MUL};
+        self.get_copy(&f, rm, a);
+        self.get_copy(&f, rs, b);
+        // a_lo, a_hi (c), b_lo, b_hi (d)
+        self.e.put(thumb::lsrs_imm(c, a, 16));
+        self.e.put(thumb::lsls_imm(a, a, 16));
+        self.e.put(thumb::lsrs_imm(a, a, 16));
+        self.e.put(thumb::lsrs_imm(d, b, 16));
+        self.e.put(thumb::lsls_imm(b, b, 16));
+        self.e.put(thumb::lsrs_imm(b, b, 16));
+        // e = a_lo * b_hi, a = a_lo * b_lo, b = a_hi * b_lo, c = a_hi * b_hi
+        self.e.put(thumb::mov(e, a));
+        self.e.put(thumb::alu(MUL, e, d));
+        self.e.put(thumb::alu(MUL, a, b));
+        self.e.put(thumb::alu(MUL, b, c));
+        self.e.put(thumb::alu(MUL, c, d));
+        // e = the middle terms, its carry is worth 1 << 48
+        self.e.put(thumb::adds_reg(e, e, b));
+        self.e.put(thumb::movs_imm(b, 0));
+        self.e.put(thumb::alu(ADC, b, b));
+        self.e.put(thumb::lsls_imm(b, b, 16));
+        self.e.put(thumb::adds_reg(c, c, b));
+        // low word, its carry goes to the high word
+        self.e.put(thumb::lsls_imm(b, e, 16));
+        self.e.put(thumb::adds_reg(a, a, b));
+        self.e.put(thumb::movs_imm(b, 0));
+        self.e.put(thumb::alu(ADC, b, b));
+        self.e.put(thumb::lsrs_imm(e, e, 16));
+        self.e.put(thumb::adds_reg(c, c, e));
+        self.e.put(thumb::adds_reg(c, c, b));
+        if signed {
+            // hi -= (rm < 0 ? rs : 0) + (rs < 0 ? rm : 0)
+            self.get_copy(&f, rm, d);
+            self.get_copy(&f, rs, e);
+            self.e.put(thumb::asrs_imm(b, d, 31));
+            self.e.put(thumb::alu(AND, b, e));
+            self.e.put(thumb::subs_reg(c, c, b));
+            self.e.put(thumb::asrs_imm(b, e, 31));
+            self.e.put(thumb::alu(AND, b, d));
+            self.e.put(thumb::subs_reg(c, c, b));
+        }
+        if acc {
+            self.get_copy(&f, rdlo, d);
+            self.get_copy(&f, rdhi, e);
+            self.e.put(thumb::adds_reg(a, a, d));
+            self.e.put(thumb::alu(ADC, c, e));
+        }
+        self.set(&f, rdlo, a);
+        self.set(&f, rdhi, c);
+        self.close(f);
+    }
+
     // ---------------------------------------------------------------------------------------
     // single data transfer
 
@@ -1382,6 +1464,10 @@ impl<'a, 'm> Tr<'a, 'm> {
         let e = (self.mem)(self.regions + 4 * (gba >> 24))?;
         if e & 1 == 0 {
             return (e != 0).then(|| gba.wrapping_add(e));
+        }
+        // EWRAM pages come and go, a native address of one must not end up in code
+        if gba >> 24 == 2 {
+            return None;
         }
         let page = (self.mem)((e & !1) + 4 * ((gba >> 9) & 0x1FF))?;
         // a page that is not there points at its own GBA address
@@ -1863,6 +1949,9 @@ fn regs_read(d: &Decoded) -> u16 {
             o | if op.uses_rn() { bit(rn) } else { 0 }
         }
         Insn::Mul(m) => bit(m.rm) | bit(m.rs) | if m.acc { bit(m.rn) } else { 0 },
+        Insn::MulLong(m) => {
+            bit(m.rm) | bit(m.rs) | if m.acc { bit(m.rdlo) | bit(m.rdhi) } else { 0 }
+        }
         Insn::Mem(m) => {
             let o = match m.off {
                 Offset::Imm(_) => 0,
@@ -1894,6 +1983,7 @@ fn regs_written(d: &Decoded) -> u16 {
             }
         }
         Insn::Mul(MulOp { rd, .. }) | Insn::Mrs { rd, .. } => bit(rd),
+        Insn::MulLong(m) => bit(m.rdlo) | bit(m.rdhi),
         Insn::Mem(m) => (if m.load { bit(m.rd) } else { 0 }) | if m.wb { bit(m.rn) } else { 0 },
         Insn::Block(b) => (if b.load { b.list } else { 0 }) | if b.wb { bit(b.rn) } else { 0 },
         Insn::Branch { link: true, .. } => bit(LR),
