@@ -1,6 +1,7 @@
 #![no_std]
 pub mod bios;
 pub mod dma;
+pub mod eeprom;
 pub mod ewram;
 pub mod flash;
 pub mod jit;

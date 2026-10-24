@@ -155,6 +155,18 @@ impl<'a> EwramPool<'a> {
             .unwrap()
     }
 
+    // Throw everything away: every page reads as zero again (RegisterRamReset)
+    pub fn clear(&mut self) {
+        for slot in 0..self.slot_page.len() {
+            self.slot_page[slot] = FREE;
+        }
+        for page in 0..PAGES {
+            self.table[page] = self.unmapped(page);
+        }
+        self.page_slot.fill(NO_SLOT);
+        self.swapped.fill(0);
+    }
+
     // Unmap every resident page. The next use of one faults and renews its stamp.
     pub fn sweep(&mut self) {
         self.epoch = self.epoch.wrapping_add(1);
@@ -483,6 +495,23 @@ mod tests {
         assert_eq!(load(&mut pool, &mut swap, PAGE_SIZE), 0);
         assert!(pool.stats.zero_drops > 0);
         assert!(swap.writes <= writes + 2);
+    }
+
+    #[test]
+    fn clear_makes_everything_zero() {
+        let mut setup = Setup::new(2);
+        let mut pool = setup.pool();
+        let mut swap = Mem::new();
+        for p in 0..5 {
+            store(&mut pool, &mut swap, p * PAGE_SIZE, 9);
+        }
+        pool.clear();
+        for p in 0..5 {
+            assert_eq!(load(&mut pool, &mut swap, p * PAGE_SIZE), 0);
+        }
+        // and it works again
+        store(&mut pool, &mut swap, 3 * PAGE_SIZE, 4);
+        assert_eq!(load(&mut pool, &mut swap, 3 * PAGE_SIZE), 4);
     }
 
     #[test]

@@ -1,5 +1,6 @@
 // The four timers: what the game wrote, and the counter worked out from the cycles when it is read
-// (the counter does not run on its own here). Timer interrupts and cascading are not modelled.
+// (the counter does not run on its own here). Cascading is not modelled. A timer with its interrupt
+// enabled has the cycle of its next overflow worked out, for the caller to wake up at.
 //
 // The cycles are the GBA's own, 16.78 MHz.
 
@@ -13,9 +14,35 @@ pub struct Timer {
     started: u64,
     start_value: u16,
     prescale_shift: u32,
+    // overflows raise an interrupt, and the cycle of the next one (NEVER when there is none)
+    irq: bool,
+    next_irq: u64,
 }
 
+pub const NEVER: u64 = u64::MAX;
+
 impl Timer {
+    // The cycle of the first overflow after `now`
+    fn next_overflow(&self, now: u64) -> u64 {
+        let ticks = (now - self.started) >> self.prescale_shift;
+        let period = 0x1_0000 - self.reload as u64;
+        let first = 0x1_0000 - self.start_value as u64;
+        let at = if ticks < first {
+            first
+        } else {
+            first + ((ticks - first) / period + 1) * period
+        };
+        self.started + (at << self.prescale_shift)
+    }
+
+    fn update_irq(&mut self, now: u64) {
+        self.next_irq = if self.running && self.irq {
+            self.next_overflow(now)
+        } else {
+            NEVER
+        };
+    }
+
     fn counter(&self, now: u64) -> u16 {
         if !self.running {
             return self.start_value;
@@ -44,6 +71,8 @@ impl Timers {
                 started: 0,
                 start_value: 0,
                 prescale_shift: 0,
+                irq: false,
+                next_irq: NEVER,
             }; 4],
         )
     }
@@ -71,7 +100,31 @@ impl Timers {
             }
             t.running = enable;
             t.prescale_shift = [0, 6, 8, 10][(h & 3) as usize];
+            t.irq = h & 0x40 != 0;
         }
+        t.update_irq(now);
+    }
+
+    // The cycle of the soonest timer interrupt, None when no timer raises one
+    pub fn next_irq(&self) -> Option<u64> {
+        self.0
+            .iter()
+            .map(|t| t.next_irq)
+            .min()
+            .filter(|&at| at != NEVER)
+    }
+
+    // The timers (bit n for timer n) whose interrupt is due at `now`. Each one moves on to its
+    // next overflow, so missed ones are not reported twice.
+    pub fn take_due(&mut self, now: u64) -> u8 {
+        let mut due = 0;
+        for (n, t) in self.0.iter_mut().enumerate() {
+            if t.next_irq <= now {
+                due |= 1 << n;
+                t.update_irq(now);
+            }
+        }
+        due
     }
 
     // A read of a counter register, value is what is in the register memory (the control half)
@@ -105,5 +158,29 @@ mod tests {
         // stopped, it holds
         t.write(0x102, 2, 0, 1000 + 64 * 3);
         assert_eq!(t.read(0x100, 2, 0, 5000), 0xFFF3);
+    }
+
+    #[test]
+    fn interrupts_come_at_each_overflow() {
+        let mut t = Timers::new();
+        assert_eq!(t.next_irq(), None);
+        // reload 0xFFF0 (16 ticks), prescaler 64, interrupt enabled, started at cycle 1000
+        t.write(0x100, 2, 0xFFF0, 0);
+        t.write(0x102, 2, 0xC1, 1000);
+        let period = 16 * 64;
+        assert_eq!(t.next_irq(), Some(1000 + period));
+        assert_eq!(t.take_due(1000 + period - 1), 0);
+        assert_eq!(t.take_due(1000 + period), 1);
+        assert_eq!(t.next_irq(), Some(1000 + 2 * period));
+        // a late caller gets one interrupt for several overflows and the next one is in the future
+        assert_eq!(t.take_due(1000 + 5 * period + 3), 1);
+        assert_eq!(t.next_irq(), Some(1000 + 6 * period));
+        // without the interrupt bit there is none, and stopping clears it
+        t.write(0x102, 2, 0x81, 1000 + 6 * period);
+        assert_eq!(t.next_irq(), None);
+        t.write(0x102, 2, 0xC1, 1000 + 6 * period);
+        assert!(t.next_irq().is_some());
+        t.write(0x102, 2, 0x40, 1000 + 6 * period);
+        assert_eq!(t.next_irq(), None);
     }
 }

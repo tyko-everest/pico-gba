@@ -65,7 +65,7 @@ const OAM_LEN: u32 = KB(1);
 // Only a part of EWRAM is in RAM, the real 256 KiB does not fit next to everything else. The pages
 // the game has not used for a while are kept in a swap file on the SD card (common::ewram).
 const EWRAM_START: u32 = 0x0200_0000;
-const EWRAM_LEN: u32 = KB(24);
+const EWRAM_LEN: u32 = KB(16);
 
 const IWRAM_START: u32 = 0x0300_0000;
 const IWRAM_LEN: u32 = KB(32);
@@ -102,7 +102,7 @@ static mut NEW_IWRAM: [u32; IWRAM_LEN as usize / 4] = [0; IWRAM_LEN as usize / 4
 
 // The ROM is read from the SD card a page at a time through this cache, there is not nearly room
 // for all of it. A page is read in the first time it is used, by the other core.
-const ROM_CACHE_SLOTS: usize = 92;
+const ROM_CACHE_SLOTS: usize = 64;
 
 #[repr(C, align(4))]
 struct RomCacheData([u8; ROM_CACHE_SLOTS * PAGE_SIZE]);
@@ -535,6 +535,46 @@ extern "C" fn SVCall() {
     );
 }
 
+// SWI 0x01 RegisterRamReset, r0 says what: 0 EWRAM, 1 IWRAM (the last 0x200 bytes stay, the BIOS
+// keeps its flags there), 2 palette, 3 VRAM, 4 OAM, 5 serial registers, 6 sound registers, 7 the
+// other registers (display, DMA, timers, keys, interrupts). A reset leaves the display forced blank.
+fn register_ram_reset(flags: u32) {
+    unsafe {
+        let zero = |start: u32, len: usize| core::ptr::write_bytes(start as *mut u8, 0, len);
+        if flags & 1 != 0 {
+            ewram_pool().clear();
+        }
+        if flags & 2 != 0 {
+            zero(&raw mut NEW_IWRAM as u32, IWRAM_LEN as usize - 0x200);
+        }
+        if flags & 4 != 0 {
+            zero(&raw mut NEW_PALETTE as u32, size_of::<Palette>());
+        }
+        if flags & 8 != 0 {
+            zero(&raw mut NEW_VRAM as u32, size_of::<VRAM>());
+        }
+        if flags & 0x10 != 0 {
+            zero(&raw mut NEW_OAM as u32, size_of::<OAM>());
+        }
+        let io = &raw mut NEW_REG as u32;
+        if flags & 0x20 != 0 {
+            zero(io + 0x120, 0x0C);
+            zero(io + 0x134, 0x28);
+        }
+        if flags & 0x40 != 0 {
+            zero(io + 0x60, 0x50);
+        }
+        if flags & 0x80 != 0 {
+            zero(io, 0x60);
+            zero(io + 0xB0, 0x60);
+            zero(io + 0x130, 0x4);
+            zero(io + 0x200, 0xC);
+            gba_mem::reset_timers();
+            core::ptr::write_volatile(io_reg(0), 0x80);
+        }
+    }
+}
+
 // SWI 0x0B CpuSet and SWI 0x0C CpuFastSet, a memcpy/memset in 16 or 32 bit units.
 // r0 = source, r1 = destination, r2 = bits 0-20 unit count, bit 24 fill, bit 26 32 bit (CpuSet).
 // CpuFastSet is always 32 bit and rounds the count up to a multiple of 8.
@@ -650,6 +690,7 @@ extern "C" fn svc_call(frame: &mut ExceptionFrame) {
             frame.r1(),
             instr & 0xFF == 0x15,
         ),
+        0x01 => register_ram_reset(frame.r0()),
         0x0B => cpu_set(frame, false),
         0x0C => cpu_set(frame, true),
         // Halt: nothing to save power on
@@ -954,6 +995,25 @@ extern "C" fn SIO_IRQ_PROC0() {
         "pop {{r4, pc}}",
         func = sym irq_inject
     );
+}
+
+// A timer overflowed that has its interrupt enabled (alarm 3 of the timer, see gba_mem)
+#[unsafe(no_mangle)]
+#[unsafe(naked)]
+extern "C" fn TIMER_IRQ_3() {
+    naked_asm!(
+        "mov r0, sp",
+        "push {{r4, lr}}",
+        "bl {func}",
+        "pop {{r4, pc}}",
+        func = sym timer_irq_inject
+    );
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn timer_irq_inject(frame: &mut ExceptionFrame) {
+    gba_mem::timer_alarm();
+    try_inject(frame);
 }
 
 #[unsafe(no_mangle)]
@@ -1541,6 +1601,17 @@ where
                             core::ptr::read_volatile(io_reg(IME_OFFSET))
                         );
                         rprintln!(
+                            "timer irq: armed {} fired {} raised {} last due {:#x}; in irq {}; inte {:#x} intr {:#x} armed {:#x}",
+                            gba_mem::TIMER_STATS[0],
+                            gba_mem::TIMER_STATS[1],
+                            gba_mem::TIMER_STATS[2],
+                            gba_mem::TIMER_STATS[3],
+                            IN_IRQ,
+                            (*pac::TIMER::ptr()).inte().read().bits(),
+                            (*pac::TIMER::ptr()).intr().read().bits(),
+                            (*pac::TIMER::ptr()).armed().read().bits()
+                        );
+                        rprintln!(
                             "stacks used: core 0 {} of {}, core 1 {} of {}; jit regions evicted {}, {}; rom cache hits {} misses {}; ewram pool full {}; sd read retries {} (last error {:#x}); us translating {} ({} blocks), us in sd reads {}, new code {} bytes in {} blocks; sd requests {}: waited {} us, read {} us (command {} token {} data {})",
                             stack_used(&raw const __sheap as u32, &raw const _stack_start as u32),
                             &raw const _stack_start as u32 - &raw const __sheap as u32,
@@ -1926,6 +1997,7 @@ fn setup() -> u32 {
     };
 
     unsafe { cortex_m::peripheral::NVIC::unmask(pac::Interrupt::SIO_IRQ_PROC0) };
+    unsafe { cortex_m::peripheral::NVIC::unmask(pac::Interrupt::TIMER_IRQ_3) };
 
     rom_cache_init();
     rprintln!("rom cache ready");

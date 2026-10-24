@@ -8,6 +8,10 @@ use embedded_hal::digital::OutputPin;
 use embedded_sdmmc::{Mode, RawFile, TimeSource, Timestamp, VolumeIdx, VolumeManager};
 use rtt_target::rprintln;
 
+// The ROM to run when the card has several: the one whose name starts with this, set when
+// building (GBA_ROM=SM2 cargo build --release). Without it the first .GBA is used.
+const ROM_PREFIX: Option<&str> = option_env!("GBA_ROM");
+
 const IDLE: u32 = 0;
 const PENDING: u32 = 1;
 const DONE: u32 = 2;
@@ -192,9 +196,19 @@ impl<SdCs: OutputPin> RomStore<SdCs> {
             self.volumes.iterate_dir(root, |entry| {
                 rprintln!("  {} ({} bytes)", entry.name, entry.size);
                 if !entry.attributes.is_directory() && entry.name.extension() == b"GBA" {
-                    found = Some(entry.name.clone());
-                    entry_at = (entry.entry_block.0, entry.entry_offset);
-                    return ControlFlow::Break(());
+                    // the first .GBA, unless one starts with the name the firmware was built
+                    // with (GBA_ROM=SM2 cargo build ...), which wins
+                    let wanted = ROM_PREFIX.is_some_and(|p| {
+                        entry.name.base_name().len() >= p.len()
+                            && entry.name.base_name()[..p.len()].eq_ignore_ascii_case(p.as_bytes())
+                    });
+                    if found.is_none() || wanted {
+                        found = Some(entry.name.clone());
+                        entry_at = (entry.entry_block.0, entry.entry_offset);
+                    }
+                    if wanted || ROM_PREFIX.is_none() {
+                        return ControlFlow::Break(());
+                    }
                 }
                 ControlFlow::Continue(())
             })?;

@@ -11,12 +11,15 @@ use crate::{
 use common::{
     bios::Memory,
     dma::Dma,
+    eeprom::Eeprom,
     flash::FlashChip,
     timers::{TIMER_BASE, TIMER_END, Timers},
 };
 
 static mut FLASH: FlashChip = FlashChip::new();
 static mut TIMERS: Timers = Timers::new();
+// the save EEPROM some games have at 0x0D000000 (the part of the ROM mirrors a game never reads)
+static mut EEPROM: Eeprom = Eeprom::new();
 
 const IF_OFFSET: u32 = 0x202;
 
@@ -24,6 +27,68 @@ const IF_OFFSET: u32 = 0x202;
 fn gba_cycles() -> u64 {
     let micros = unsafe { (*pac::TIMER::ptr()).timerawl().read().bits() } as u64;
     micros * 17_592_186 >> 20
+}
+
+// Timer interrupts: alarm 3 of the 1 MHz timer is set for the soonest overflow of a timer that has
+// its interrupt enabled. When it goes off `timer_alarm` raises the flag in IF, and the interrupt
+// handler of core 0 injects the game's handler like it does for VBlank.
+const TIMER_ALARM: u32 = 1 << 3;
+// how many times the alarm was set, went off, and raised an interrupt flag, and the last deadline
+pub static mut TIMER_STATS: [u32; 4] = [0; 4];
+// RegisterRamReset flag bits 0x80 and 0x20 and 0x40 reset registers: the timers' state is here
+pub fn reset_timers() {
+    unsafe { TIMERS = Timers::new() };
+    timer_arm();
+}
+
+// the last IO registers loaded and stored (offset, for a debugger), and how many of each
+#[unsafe(no_mangle)]
+pub static mut IO_LOADS: [u32; 8] = [0; 8];
+#[unsafe(no_mangle)]
+pub static mut IO_STORES: [u32; 8] = [0; 8];
+#[unsafe(no_mangle)]
+pub static mut IO_COUNTS: [u32; 2] = [0; 2];
+// the last addresses loaded (any region) and stored
+#[unsafe(no_mangle)]
+pub static mut LOAD_ADDRS: [u32; 8] = [0; 8];
+#[unsafe(no_mangle)]
+pub static mut STORE_ADDRS: [u32; 8] = [0; 8];
+#[unsafe(no_mangle)]
+pub static mut ADDR_COUNTS: [u32; 2] = [0; 2];
+
+pub fn timer_arm() {
+    unsafe {
+        let timer = &*pac::TIMER::ptr();
+        match TIMERS.next_irq() {
+            None => timer.inte().modify(|r, w| w.bits(r.bits() & !TIMER_ALARM)),
+            Some(at) => {
+                TIMER_STATS[0] += 1;
+                // the alarm goes off when the low 32 bits of the microseconds match: aim a few
+                // microseconds ahead at the least, a time that has already passed would not fire
+                let delta = at.saturating_sub(gba_cycles());
+                let micros = ((delta << 20) / 17_592_186).max(4) as u32;
+                let now = timer.timerawl().read().bits();
+                timer.alarm3().write(|w| w.bits(now.wrapping_add(micros)));
+                timer.inte().modify(|r, w| w.bits(r.bits() | TIMER_ALARM));
+            }
+        }
+    }
+}
+
+// The alarm went off: raise IF for the timers that overflowed and arm the next one
+pub fn timer_alarm() {
+    unsafe {
+        (*pac::TIMER::ptr()).intr().write(|w| w.bits(TIMER_ALARM));
+        TIMER_STATS[1] += 1;
+        let due = TIMERS.take_due(gba_cycles());
+        if due != 0 {
+            TIMER_STATS[2] += 1;
+            TIMER_STATS[3] = due as u32;
+            let flags = (&raw mut NEW_REG as u32 + IF_OFFSET) as *mut u16;
+            core::ptr::write_volatile(flags, core::ptr::read_volatile(flags) | (due as u16) << 3);
+        }
+    }
+    timer_arm();
 }
 
 fn open_bus(addr: u32, size: u32) -> u32 {
@@ -66,6 +131,8 @@ fn io_load(addr: u32, size: u32) -> u32 {
         return open_bus(addr, size);
     }
     unsafe {
+        IO_LOADS[IO_COUNTS[0] as usize % 8] = offset;
+        IO_COUNTS[0] += 1;
         let value = read_native((&raw const NEW_REG as u32) + offset, size);
         if (TIMER_BASE..TIMER_END).contains(&offset) {
             let v = TIMERS.read(offset, size, value, gba_cycles());
@@ -81,6 +148,8 @@ fn io_store(addr: u32, size: u32, value: u32) {
         return;
     }
     unsafe {
+        IO_STORES[IO_COUNTS[1] as usize % 8] = offset | (value & 0xFFFF) << 16;
+        IO_COUNTS[1] += 1;
         let native = (&raw mut NEW_REG as u32) + offset;
         // IF is cleared by writing ones to it
         let flags = (&raw mut NEW_REG as u32 + IF_OFFSET) as *mut u16;
@@ -92,6 +161,7 @@ fn io_store(addr: u32, size: u32, value: u32) {
         }
         if (TIMER_BASE..TIMER_END).contains(&offset) {
             TIMERS.write(offset, size, value, gba_cycles());
+            timer_arm();
         } else if let Some(channel) = Dma::started_by(offset, size) {
             run_dma(channel);
         }
@@ -171,6 +241,8 @@ fn sram_store(addr: u32, size: u32, value: u32) {
 
 pub fn load(addr: u32, size: u32) -> u32 {
     unsafe {
+        LOAD_ADDRS[ADDR_COUNTS[0] as usize % 8] = addr;
+        ADDR_COUNTS[0] += 1;
         match addr >> 24 {
             0x00 if addr < BIOS_LEN => open_bus(addr, size),
             0x02 => ewram_load(addr, size),
@@ -187,6 +259,7 @@ pub fn load(addr: u32, size: u32) -> u32 {
                 read_native((&raw const NEW_VRAM as u32) + (addr & 0x00FF_FFFF), size)
             }
             0x07 => read_native((&raw const NEW_OAM as u32) + (addr & (OAM_LEN - 1)), size),
+            0x0D => EEPROM.read_bit(),
             0x08..=0x0D => rom_load(addr, size),
             0x0E | 0x0F => sram_load(addr, size),
             // native memory: the stack, or code the game copied there
@@ -198,6 +271,8 @@ pub fn load(addr: u32, size: u32) -> u32 {
 
 pub fn store(addr: u32, size: u32, value: u32) {
     unsafe {
+        STORE_ADDRS[ADDR_COUNTS[1] as usize % 8] = addr;
+        ADDR_COUNTS[1] += 1;
         match addr >> 24 {
             0x02 => ewram_store(addr, size, value),
             0x03 => write_native(
@@ -221,6 +296,7 @@ pub fn store(addr: u32, size: u32, value: u32) {
                 size,
                 value,
             ),
+            0x0D => EEPROM.write_bit(value),
             0x0E | 0x0F => sram_store(addr, size, value),
             0x20 => write_native(addr, size, value),
             // the BIOS, the ROM and the holes ignore writes
