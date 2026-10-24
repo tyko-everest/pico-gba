@@ -16,10 +16,26 @@ const FAILED: u32 = 3;
 // The request mailbox. Core 0 fills in the parameters and then sets PENDING, core 1 answers
 // with DONE or FAILED. Only one request is outstanding since core 0 waits for it.
 static STATE: AtomicU32 = AtomicU32::new(IDLE);
+// what the request is: a ROM read, or a read or write of a page of the swap file
+static OP: AtomicU32 = AtomicU32::new(OP_ROM);
+const OP_ROM: u32 = 0;
+const OP_SWAP_READ: u32 = 1;
+const OP_SWAP_WRITE: u32 = 2;
 static OFFSET: AtomicU32 = AtomicU32::new(0);
 static LEN: AtomicU32 = AtomicU32::new(0);
 static DST: AtomicU32 = AtomicU32::new(0);
 // the size of the ROM file, 0 until core 1 has found it
+// timing, in microseconds: how long requests waited for core 1 to get to them, how long it took
+// to read, and how many there were
+pub static US_WAITED: AtomicU32 = AtomicU32::new(0);
+pub static US_READING: AtomicU32 = AtomicU32::new(0);
+pub static REQUESTS: AtomicU32 = AtomicU32::new(0);
+static POSTED_AT: AtomicU32 = AtomicU32::new(0);
+
+fn now_us() -> u32 {
+    unsafe { (*crate::pac::TIMER::ptr()).timerawl().read().bits() }
+}
+
 static ROM_SIZE: AtomicU32 = AtomicU32::new(NOT_LOOKED_UP);
 const NOT_LOOKED_UP: u32 = 0;
 const NO_ROM: u32 = u32::MAX;
@@ -34,12 +50,14 @@ pub fn rom_size() -> Option<Option<u32>> {
     }
 }
 
-// Read `dst.len()` bytes of the ROM starting at `offset`. Blocks until core 1 has done it, which
-// needs a VBlank, so this must not be used before core 1 runs. Returns false when it failed.
-pub fn read(offset: u32, dst: &mut [u8]) -> bool {
+// Post a request and wait for core 1 to answer it. Core 1 needs a VBlank to get to it, so this
+// must not be used before core 1 runs.
+fn request(op: u32, offset: u32, ptr: *mut u8, len: usize) -> bool {
+    OP.store(op, Ordering::Relaxed);
     OFFSET.store(offset, Ordering::Relaxed);
-    LEN.store(dst.len() as u32, Ordering::Relaxed);
-    DST.store(dst.as_mut_ptr() as u32, Ordering::Relaxed);
+    LEN.store(len as u32, Ordering::Relaxed);
+    DST.store(ptr as u32, Ordering::Relaxed);
+    POSTED_AT.store(now_us(), Ordering::Relaxed);
     STATE.store(PENDING, Ordering::Release);
     loop {
         match STATE.load(Ordering::Acquire) {
@@ -50,6 +68,35 @@ pub fn read(offset: u32, dst: &mut [u8]) -> bool {
             }
         }
     }
+}
+
+// Read `dst.len()` bytes of the ROM starting at `offset`. Blocks until core 1 has done it.
+// Returns false when it failed.
+pub fn read(offset: u32, dst: &mut [u8]) -> bool {
+    request(OP_ROM, offset, dst.as_mut_ptr(), dst.len())
+}
+
+// The swap file holds one 512 byte page for each page of the EWRAM, a file named *.SWP in the
+// root directory that is at least 256 KiB and lies in few runs of clusters (EWRAM.SWP is made
+// when there is none). Its contents are never looked at, pages are written before they are read.
+static SWAP_PAGES: AtomicU32 = AtomicU32::new(0);
+
+// Is there a swap file to put pages in
+pub fn swap_available() -> bool {
+    SWAP_PAGES.load(Ordering::Acquire) != 0
+}
+
+pub fn swap_read(page: usize, dst: &mut [u8; BLOCK]) -> bool {
+    request(OP_SWAP_READ, (page * BLOCK) as u32, dst.as_mut_ptr(), BLOCK)
+}
+
+pub fn swap_write(page: usize, src: &[u8; BLOCK]) -> bool {
+    request(
+        OP_SWAP_WRITE,
+        (page * BLOCK) as u32,
+        src.as_ptr() as *mut u8,
+        BLOCK,
+    )
 }
 
 // Is a read waiting for core 1
@@ -100,9 +147,10 @@ impl Layout {
 }
 
 pub struct RomStore<SdCs: OutputPin> {
-    volumes: VolumeManager<SdDevice<SdCs>, NoClock, 2, 1, 1>,
+    volumes: VolumeManager<SdDevice<SdCs>, NoClock, 2, 2, 1>,
     file: Option<RawFile>,
     layout: Option<Layout>,
+    swap_layout: Option<Layout>,
     // the last block read and where it came from, so reads next to each other read once
     block: [u8; BLOCK],
     block_no: u32,
@@ -125,6 +173,7 @@ impl<SdCs: OutputPin> RomStore<SdCs> {
                 volumes,
                 file: None,
                 layout: None,
+                swap_layout: None,
                 block: [0; BLOCK],
                 block_no: u32::MAX,
                 scratch: [0; BLOCK],
@@ -162,6 +211,7 @@ impl<SdCs: OutputPin> RomStore<SdCs> {
                 Some(l) => rprintln!("ROM in {} runs of clusters", l.count),
                 None => rprintln!("ROM is too fragmented to read directly, reading slowly"),
             }
+            self.open_swap(root)?;
             ROM_SIZE.store(size, Ordering::Release);
             Ok::<_, embedded_sdmmc::Error<sdcard::Error>>(())
         })();
@@ -172,6 +222,85 @@ impl<SdCs: OutputPin> RomStore<SdCs> {
         if self.file.is_none() {
             ROM_SIZE.store(NO_ROM, Ordering::Release);
         }
+    }
+
+    // The first *.SWP in the root directory: name, size and where its directory entry is
+    fn find_swap(
+        &mut self,
+        root: embedded_sdmmc::RawDirectory,
+    ) -> Result<
+        Option<(embedded_sdmmc::ShortFileName, u32, u32, u32)>,
+        embedded_sdmmc::Error<sdcard::Error>,
+    > {
+        let mut found = None;
+        self.volumes.iterate_dir(root, |entry| {
+            if !entry.attributes.is_directory() && entry.name.extension() == b"SWP" {
+                found = Some((
+                    entry.name.clone(),
+                    entry.size,
+                    entry.entry_block.0,
+                    entry.entry_offset,
+                ));
+                return ControlFlow::Break(());
+            }
+            ControlFlow::Continue(())
+        })?;
+        Ok(found)
+    }
+
+    // Make EWRAM.SWP: a file of zeros the size of the EWRAM. On a card the ROM was just copied to
+    // the clusters follow each other, which is what reading it directly needs.
+    fn create_swap(
+        &mut self,
+        root: embedded_sdmmc::RawDirectory,
+    ) -> Result<(), embedded_sdmmc::Error<sdcard::Error>> {
+        rprintln!("making EWRAM.SWP on the SD card");
+        let file = self
+            .volumes
+            .open_file_in_dir(root, "EWRAM.SWP", Mode::ReadWriteCreate)?;
+        self.scratch.fill(0);
+        let mut result = Ok(());
+        for _ in 0..common::ewram::PAGES {
+            result = self.volumes.write(file, &self.scratch);
+            if result.is_err() {
+                break;
+            }
+        }
+        self.volumes.close_file(file)?;
+        result
+    }
+
+    // Find the swap file, making it if there is none, and work out where it is on the card
+    fn open_swap(
+        &mut self,
+        root: embedded_sdmmc::RawDirectory,
+    ) -> Result<(), embedded_sdmmc::Error<sdcard::Error>> {
+        let mut found = self.find_swap(root)?;
+        if found.is_none() {
+            if let Err(e) = self.create_swap(root) {
+                rprintln!("cannot make the swap file: {:?}", e);
+                return Ok(());
+            }
+            found = self.find_swap(root)?;
+        }
+        let Some((name, size, block, offset)) = found else {
+            rprintln!("no swap file on the SD card: EWRAM cannot be paged out");
+            return Ok(());
+        };
+        let need = (common::ewram::PAGES * BLOCK) as u32;
+        if size < need {
+            rprintln!("swap file {} is {} bytes, it needs {}", name, size, need);
+            return Ok(());
+        }
+        self.swap_layout = self.find_layout(block, offset, need);
+        match &self.swap_layout {
+            Some(l) => {
+                rprintln!("swap file {} in {} runs of clusters", name, l.count);
+                SWAP_PAGES.store(common::ewram::PAGES as u32, Ordering::Release);
+            }
+            None => rprintln!("swap file {} is too fragmented to use", name),
+        }
+        Ok(())
     }
 
     // Read a device block into a buffer. The buffers live in the struct: core 1's stack is small.
@@ -262,6 +391,7 @@ impl<SdCs: OutputPin> RomStore<SdCs> {
     }
 
     // Answer a pending request, returns whether there was one. Call it while SPI1 is idle.
+    // Serve the request core 0 posted, if there is one. Returns true when one was answered.
     pub fn poll(&mut self, lcd_cs: &mut impl OutputPin) -> bool {
         if STATE.load(Ordering::Acquire) != PENDING {
             return false;
@@ -271,9 +401,71 @@ impl<SdCs: OutputPin> RomStore<SdCs> {
         let dst = DST.load(Ordering::Relaxed) as *mut u8;
         // Safety: core 0 handed over this buffer and waits until the request is answered
         let dst = unsafe { core::slice::from_raw_parts_mut(dst, len) };
-        let ok = with_card_bus(lcd_cs, || self.read_rom(offset, dst));
+        let op = OP.load(Ordering::Relaxed);
+        let started = now_us();
+        let ok = with_card_bus(lcd_cs, || match op {
+            OP_ROM => self.read_rom(offset, dst),
+            OP_SWAP_READ => self.swap_io(offset, dst, false),
+            _ => self.swap_io(offset, dst, true),
+        });
+        let done = now_us();
+        US_WAITED.store(
+            US_WAITED
+                .load(Ordering::Relaxed)
+                .wrapping_add(started.wrapping_sub(POSTED_AT.load(Ordering::Relaxed))),
+            Ordering::Relaxed,
+        );
+        US_READING.store(
+            US_READING
+                .load(Ordering::Relaxed)
+                .wrapping_add(done.wrapping_sub(started)),
+            Ordering::Relaxed,
+        );
+        REQUESTS.store(REQUESTS.load(Ordering::Relaxed) + 1, Ordering::Relaxed);
         STATE.store(if ok { DONE } else { FAILED }, Ordering::Release);
         true
+    }
+
+    // Read or write one page of the swap file. A write is checked by the card (CRC), not read back.
+    fn swap_io(&mut self, offset: u32, buf: &mut [u8], write: bool) -> bool {
+        use embedded_sdmmc::BlockDevice;
+        let Some(block) = self.swap_layout.as_ref().and_then(|l| l.block_of(offset)) else {
+            return false;
+        };
+        if buf.len() != BLOCK {
+            return false;
+        }
+        // Safety: a Block is one array of 512 bytes with no padding
+        self.volumes
+            .device(|card| {
+                if write {
+                    let b = unsafe { &*(buf.as_ptr() as *const embedded_sdmmc::Block) };
+                    card.write(core::slice::from_ref(b), embedded_sdmmc::BlockIdx(block))
+                } else {
+                    let b = unsafe { &mut *(buf.as_mut_ptr() as *mut embedded_sdmmc::Block) };
+                    card.read(core::slice::from_mut(b), embedded_sdmmc::BlockIdx(block))
+                }
+            })
+            .is_ok()
+    }
+
+    // The device blocks of a read of whole consecutive blocks inside the file: the first and how
+    // many. None for anything else.
+    fn run_blocks(&self, offset: u32, len: usize) -> Option<(u32, u32)> {
+        let size = rom_size()??;
+        if offset % BLOCK as u32 != 0 || len == 0 || len % BLOCK != 0 {
+            return None;
+        }
+        if offset as usize + len > size as usize {
+            return None;
+        }
+        let count = (len / BLOCK) as u32;
+        let layout = self.layout.as_ref()?;
+        let first = layout.block_of(offset)?;
+        if layout.block_of(offset + (count - 1) * BLOCK as u32)? != first + count - 1 {
+            return None;
+        }
+        Some((first, count))
     }
 
     fn read_rom(&mut self, offset: u32, dst: &mut [u8]) -> bool {
@@ -289,6 +481,11 @@ impl<SdCs: OutputPin> RomStore<SdCs> {
             return false;
         };
         let size = size.unwrap_or(0);
+        if offset % BLOCK as u32 == 0 && dst.len() > BLOCK && dst.len() % BLOCK == 0 {
+            if let Some(ok) = self.read_run(offset, dst, size) {
+                return ok;
+            }
+        }
         let mut done = 0;
         while done < dst.len() {
             let at = offset + done as u32;
@@ -313,6 +510,26 @@ impl<SdCs: OutputPin> RomStore<SdCs> {
             done += n;
         }
         true
+    }
+
+    // Whole blocks that are next to each other on the card, in one read. None when they are not
+    // (or run past the end of the file), the caller reads them one at a time then.
+    fn read_run(&mut self, offset: u32, dst: &mut [u8], _size: u32) -> Option<bool> {
+        use embedded_sdmmc::BlockDevice;
+        let (first, count) = self.run_blocks(offset, dst.len())?;
+        self.block_no = u32::MAX;
+        // Safety: a Block is one array of 512 bytes with no padding
+        let blocks = unsafe {
+            core::slice::from_raw_parts_mut(
+                dst.as_mut_ptr() as *mut embedded_sdmmc::Block,
+                count as usize,
+            )
+        };
+        Some(
+            self.volumes
+                .device(|card| card.read(blocks, embedded_sdmmc::BlockIdx(first)))
+                .is_ok(),
+        )
     }
 
     fn read_slow(&mut self, offset: u32, dst: &mut [u8]) -> bool {

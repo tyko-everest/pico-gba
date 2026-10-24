@@ -8,10 +8,10 @@ mod sdcard;
 
 use common::{
     bios::{self, Memory},
-    jit::{DISPATCH_BYTES, Jit, JitError, MapEntry, TRAP},
+    jit::{DISPATCH_BYTES, DISPATCH_ENTRIES, Jit, JitError, MapEntry, TRAP},
     profile,
     registers::*,
-    romcache::{PAGE_SIZE, RomCache, RomSource},
+    romcache::{PAGE_SIZE, RUN_BYTES, RomCache, RomSource},
     video::*,
 };
 use controls::{
@@ -62,10 +62,10 @@ const VRAM_LEN: u32 = KB(96);
 const OAM_START: u32 = 0x0700_0000;
 const OAM_LEN: u32 = KB(1);
 
-// Only the start of EWRAM exists, the real 256 KiB does not fit next to everything else. The
-// game's heap grows up from the bottom of it.
+// Only a part of EWRAM is in RAM, the real 256 KiB does not fit next to everything else. The pages
+// the game has not used for a while are kept in a swap file on the SD card (common::ewram).
 const EWRAM_START: u32 = 0x0200_0000;
-const EWRAM_LEN: u32 = KB(34);
+const EWRAM_LEN: u32 = KB(24);
 
 const IWRAM_START: u32 = 0x0300_0000;
 const IWRAM_LEN: u32 = KB(32);
@@ -102,7 +102,7 @@ static mut NEW_IWRAM: [u32; IWRAM_LEN as usize / 4] = [0; IWRAM_LEN as usize / 4
 
 // The ROM is read from the SD card a page at a time through this cache, there is not nearly room
 // for all of it. A page is read in the first time it is used, by the other core.
-const ROM_CACHE_SLOTS: usize = 64;
+const ROM_CACHE_SLOTS: usize = 92;
 
 #[repr(C, align(4))]
 struct RomCacheData([u8; ROM_CACHE_SLOTS * PAGE_SIZE]);
@@ -110,6 +110,7 @@ struct RomCacheData([u8; ROM_CACHE_SLOTS * PAGE_SIZE]);
 static mut ROM_CACHE_DATA: RomCacheData = RomCacheData([0; ROM_CACHE_SLOTS * PAGE_SIZE]);
 static mut ROM_CACHE_TAGS: [u32; ROM_CACHE_SLOTS] = [0; ROM_CACHE_SLOTS];
 static mut ROM_CACHE_STAMPS: [u32; ROM_CACHE_SLOTS] = [0; ROM_CACHE_SLOTS];
+static mut ROM_CACHE_RUN: [u8; RUN_BYTES] = [0; RUN_BYTES];
 static mut ROM_CACHE: Option<RomCache<'static>> = None;
 
 fn rom_cache_init() {
@@ -118,6 +119,7 @@ fn rom_cache_init() {
             &mut ROM_CACHE_DATA.0,
             &mut ROM_CACHE_TAGS,
             &mut ROM_CACHE_STAMPS,
+            &mut *(&raw mut ROM_CACHE_RUN),
         ));
     }
 }
@@ -126,10 +128,24 @@ fn rom_cache_init() {
 struct SdRom;
 
 impl RomSource for SdRom {
-    fn read_page(&mut self, offset: u32, dst: &mut [u8; PAGE_SIZE]) {
+    fn read_run(&mut self, offset: u32, dst: &mut [u8]) {
+        unsafe {
+            RECENT_MISSES[RECENT_AT % 16] = offset;
+            RECENT_AT += 1;
+        }
+        let start = now_us();
         if !romstore::read(offset, dst) {
             dst.fill(0);
         }
+        unsafe { US_SD = US_SD.wrapping_add(now_us().wrapping_sub(start)) };
+    }
+
+    fn read_page(&mut self, offset: u32, dst: &mut [u8; PAGE_SIZE]) {
+        let start = now_us();
+        if !romstore::read(offset, dst) {
+            dst.fill(0);
+        }
+        unsafe { US_SD = US_SD.wrapping_add(now_us().wrapping_sub(start)) };
     }
 }
 
@@ -137,6 +153,8 @@ impl RomSource for SdRom {
 // translates it to Thumb the first time it is reached and runs it from this cache.
 const JIT_CODE_HW: usize = 16 * 1024;
 const JIT_MAP_LEN: usize = 1024;
+// the code cache is divided in this many regions, which go one at a time
+const JIT_REGION_COUNT: usize = 4;
 
 #[repr(C, align(4))]
 struct JitCode([u16; JIT_CODE_HW]);
@@ -158,6 +176,7 @@ static mut IWRAM_PAGE_TABLE: [u32; PAGE_TABLE_LEN] = [0; PAGE_TABLE_LEN];
 
 #[allow(static_mut_refs)]
 fn jit_init() {
+    ewram_init();
     unsafe {
         let iwram = &raw const NEW_IWRAM as u32;
         for (i, page) in IWRAM_PAGE_TABLE.iter_mut().enumerate() {
@@ -181,9 +200,12 @@ fn jit_init() {
             regions,
             JIT_DISPATCH.0.as_ptr() as u32,
         ));
-        JIT.as_mut().unwrap().set_reserve(JIT_RESERVE_HW);
+        JIT.as_mut().unwrap().set_regions(JIT_REGION_COUNT);
     }
 }
+
+// the game code of the ROM, which decides what is patched while its code is translated
+static mut GAME_CODE: [u8; 4] = [0; 4];
 
 // Reads a word of GBA memory for the translator. It also reads the region and page tables
 // (native addresses) to resolve loads and stores through known constant addresses.
@@ -198,152 +220,119 @@ fn gba_read_word(addr: u32) -> Option<u32> {
     if native {
         Some(unsafe { core::ptr::read_volatile(addr as *const u32) })
     } else {
-        Some(gba_mem::load(addr, 4))
+        Some(common::patches::word(
+            unsafe { GAME_CODE },
+            addr,
+            gba_mem::load(addr, 4),
+        ))
     }
 }
 
-// The code cache is thrown away when there is little room left, outside of the interrupt handler:
-// the code it interrupted is in the cache. The handler needs the room to translate its code
-// again afterwards.
-const JIT_MARGIN_HW: usize = 3 * 1024;
-// held back from translation until a full cache cannot be thrown away
-const JIT_RESERVE_HW: usize = 2 * 1024;
-const JIT_MARGIN_BLOCKS: usize = 200;
+// the ROM offsets of the last misses
+static mut RECENT_MISSES: [u32; 16] = [0; 16];
+static mut RECENT_AT: usize = 0;
 
-fn jit_needs_flush(jit: &Jit) -> bool {
-    !unsafe { IN_IRQ }
-        && (jit.free_halfwords() < JIT_MARGIN_HW || jit.free_blocks() < JIT_MARGIN_BLOCKS)
-}
-
-// Does the stack hold a return address in the code cache? Translated ARM code that calls other
-// ARM code keeps one in lr, and a flush would leave it pointing at nothing.
-fn cache_address_on_stack(jit: &Jit, frame: u32) -> bool {
-    let top = &raw const _stack_start as u32;
-    let holds_cache_address =
-        |at: u32| jit.contains(unsafe { core::ptr::read_volatile(at as *const u32) } & !1);
-    // the registers the exception stacked: r0-r3, r12 and lr (the pc and xpsr that follow are
-    // where the code stopped, which is in the cache)
-    if (0..6).any(|i| holds_cache_address(frame + 4 * i)) {
-        return true;
-    }
-    let mut at = frame + size_of::<ExceptionFrame>() as u32;
-    while at < top {
-        if holds_cache_address(at) {
-            return true;
-        }
-        at += 4;
-    }
-    false
-}
-
-fn jit_flush(jit: &mut Jit) {
-    unsafe { JIT_IRQ_HW = 0 };
-    jit.reset();
-    unsafe { JIT_DISPATCH.0.fill(0) };
-    unsafe { JIT_FLUSHES += 1 };
-    // the code the interrupt handler used goes back first
-    for i in 0..unsafe { JIT_PIN_COUNT } {
-        let key = unsafe { JIT_PIN_KEYS[i] };
-        let _ = jit.translate(key, &mut gba_read_word);
-    }
-}
-
+// microseconds spent translating code and reading ROM pages from the SD card, and what was
+// translated, for the status report
+static mut US_TRANSLATE: u32 = 0;
+static mut US_SD: u32 = 0;
+static mut BLOCKS_TRANSLATED: u32 = 0;
+static mut BYTES_TRANSLATED: u32 = 0;
+static mut NEW_BLOCKS: u32 = 0;
+// regions of the code cache that were thrown away
 static mut JIT_FLUSHES: u32 = 0;
-// code translated inside the interrupt handler since the last flush (halfwords), and the most of that
-static mut JIT_IRQ_HW: usize = 0;
-static mut JIT_IRQ_MAX: usize = 0;
 // the core, pc, lr, xpsr and r0-r3 of the last fault that was not in translated code
 #[unsafe(no_mangle)]
 static mut NATIVE_FAULT: [u32; 8] = [0; 8];
 
-// The blocks the interrupt handler needed. The cache cannot be flushed while it runs, so after a
-// flush these are translated again at once, not inside the next interrupt where the room might
-// run out.
-const JIT_PINNED: usize = 160;
-static mut JIT_PIN_KEYS: [u32; JIT_PINNED] = [0; JIT_PINNED];
-static mut JIT_PIN_COUNT: usize = 0;
+fn now_us() -> u32 {
+    unsafe { (*pac::TIMER::ptr()).timerawl().read().bits() }
+}
 
-// Count what the interrupt handler translated, and remember where it started
-fn note_irq_code(jit: &Jit, used_before: usize, key: u32) {
-    if unsafe { IN_IRQ } && jit.used_halfwords() > used_before {
+fn note_new_code(jit: &Jit, used_before: usize) {
+    let used = jit.used_halfwords();
+    if used > used_before {
         unsafe {
-            JIT_IRQ_HW += jit.used_halfwords() - used_before;
-            JIT_IRQ_MAX = JIT_IRQ_MAX.max(JIT_IRQ_HW);
-            if JIT_PIN_COUNT < JIT_PINNED && !JIT_PIN_KEYS[..JIT_PIN_COUNT].contains(&key) {
-                JIT_PIN_KEYS[JIT_PIN_COUNT] = key;
-                JIT_PIN_COUNT += 1;
+            BYTES_TRANSLATED += 2 * (used - used_before) as u32;
+            NEW_BLOCKS += 1;
+        }
+    }
+}
+
+// The code cache is a ring of regions. When the one being filled is full the oldest goes, except
+// for the ones that code is running in or will be returned to: where the exception came from, and
+// every address on the stack (return addresses of translated ARM code, and the interrupted code
+// when the exception is in the middle of an interrupt handler). The jumps into the region that
+// went are exit slots again and the dispatch table forgets it. Returns false when every region is
+// in use.
+fn jit_evict(jit: &mut Jit, frame: u32) -> bool {
+    let top = &raw const _stack_start as u32;
+    let mut keep = 0u32;
+    let mut mark = |at: u32| {
+        let value = unsafe { core::ptr::read_volatile(at as *const u32) };
+        if let Some(r) = jit.region_of(value & !1) {
+            keep |= 1 << r;
+        }
+    };
+    // r0-r3, r12, lr and the pc of the exception frame
+    for i in 0..7 {
+        mark(frame + 4 * i);
+    }
+    let mut at = frame + size_of::<ExceptionFrame>() as u32;
+    while at < top {
+        mark(at);
+        at += 4;
+    }
+    let Some((lo, hi)) = jit.evict_region(keep) else {
+        return false;
+    };
+    unsafe {
+        JIT_FLUSHES += 1;
+        let table = JIT_DISPATCH.0.as_mut_ptr();
+        for e in 0..DISPATCH_ENTRIES {
+            let native = *table.add(2 * e + 1) & !1;
+            if native >= lo && native < hi {
+                *table.add(2 * e) = 0;
+                *table.add(2 * e + 1) = 0;
             }
         }
     }
+    true
 }
 
-fn jit_translate(jit: &mut Jit, key: u32, sp: u32) -> Result<u32, JitError> {
+fn jit_translate(jit: &mut Jit, key: u32, frame: u32) -> Result<u32, JitError> {
     let used_before = jit.used_halfwords();
-    let result = jit_translate_inner(jit, key, sp);
-    note_irq_code(jit, used_before, key);
-    result
-}
-
-// What recovered from a full cache
-#[derive(PartialEq)]
-enum Recovery {
-    // the cache was thrown away
-    Flushed,
-    // the reserve was opened up
-    Extended,
-    None,
-}
-
-// The cache is full: throw it away if nothing can be pointing into it (not in the interrupt
-// handler, which interrupted code in the cache, nor with a return address on the stack), else use
-// the reserve that was held back for this.
-fn jit_recover(jit: &mut Jit, sp: u32) -> Recovery {
-    if !unsafe { IN_IRQ } && !cache_address_on_stack(jit, sp) {
-        jit_flush(jit);
-        Recovery::Flushed
-    } else if !jit.in_emergency() {
-        jit.use_reserve();
-        Recovery::Extended
-    } else {
-        Recovery::None
-    }
-}
-
-fn jit_translate_inner(jit: &mut Jit, key: u32, sp: u32) -> Result<u32, JitError> {
-    if jit_needs_flush(jit) && !cache_address_on_stack(jit, sp) {
-        jit_flush(jit);
-    }
-    loop {
+    let start = now_us();
+    let result = loop {
         match jit.translate(key, &mut gba_read_word) {
-            Err(JitError::CacheFull) if jit_recover(jit, sp) != Recovery::None => {}
-            r => return r,
+            Err(JitError::CacheFull) if jit_evict(jit, frame) => {}
+            r => break r,
         }
+    };
+    unsafe {
+        US_TRANSLATE = US_TRANSLATE.wrapping_add(now_us().wrapping_sub(start));
+        BLOCKS_TRANSLATED += 1;
     }
+    note_new_code(jit, used_before);
+    result
 }
 
 // An unresolved exit slot was reached
-fn jit_resolve(jit: &mut Jit, slot: u32, sp: u32) -> Result<u32, JitError> {
+fn jit_resolve(jit: &mut Jit, slot: u32, frame: u32) -> Result<u32, JitError> {
     let used_before = jit.used_halfwords();
-    let key = jit.halfword(slot + 4) as u32 | (jit.halfword(slot + 6) as u32) << 16;
-    let result = jit_resolve_inner(jit, slot, key, sp);
-    note_irq_code(jit, used_before, key);
+    let start = now_us();
+    let result = loop {
+        match jit.resolve_slot(slot, &mut gba_read_word) {
+            Err(JitError::CacheFull) if jit_evict(jit, frame) => {}
+            r => break r,
+        }
+    };
+    unsafe {
+        US_TRANSLATE = US_TRANSLATE.wrapping_add(now_us().wrapping_sub(start));
+        BLOCKS_TRANSLATED += 1;
+    }
+    note_new_code(jit, used_before);
     result
-}
-
-fn jit_resolve_inner(jit: &mut Jit, slot: u32, key: u32, sp: u32) -> Result<u32, JitError> {
-    if jit_needs_flush(jit) && !cache_address_on_stack(jit, sp) {
-        // the slot goes with the rest of the cache
-        jit_flush(jit);
-        return jit.translate(key, &mut gba_read_word);
-    }
-    match jit.resolve_slot(slot, &mut gba_read_word) {
-        Err(JitError::CacheFull) => match jit_recover(jit, sp) {
-            Recovery::Flushed => jit.translate(key, &mut gba_read_word),
-            Recovery::Extended => jit.resolve_slot(slot, &mut gba_read_word),
-            Recovery::None => Err(JitError::CacheFull),
-        },
-        r => r,
-    }
 }
 
 // Is this a GBA address that code runs from
@@ -456,14 +445,13 @@ static mut EWRAM_PAGE_TABLE: [u32; PAGE_TABLE_LEN] = {
     }
     t
 };
-static mut EWRAM_PAGES_USED: u32 = 0;
-// set when a page was needed and the pool had none left: stores to it are lost
-static mut EWRAM_POOL_FULL: bool = false;
+// EWRAM pages come and go through the pool (common::ewram), which keeps EWRAM_PAGE_TABLE up to
+// date. A page that is not mapped holds its own GBA address.
 
-// A page that has not been handed out holds its own GBA address in the table
+// A page that reads as zero: nothing but zero has been stored in it, or it is all zero now
 fn ewram_page_empty(gba_addr: u32) -> bool {
     let page = ((gba_addr - EWRAM_START) & (EWRAM_MIRROR - 1)) / EWRAM_PAGE;
-    unsafe { EWRAM_PAGE_TABLE[page as usize] == EWRAM_START + page * EWRAM_PAGE }
+    unsafe { ewram_pool().is_absent(page as usize) }
 }
 
 // The BIOS is not here. Code outside it reads the last word the BIOS fetched, the same value at
@@ -473,53 +461,62 @@ const BIOS_LEN: u32 = KB(16);
 const BIOS_OPEN_BUS: u32 = 0xE129_F000;
 
 const EWRAM_SLOTS: usize = (EWRAM_LEN / EWRAM_PAGE) as usize;
-// the page table index each slot of the pool holds, EWRAM_FREE for one that is free
-const EWRAM_FREE: u16 = u16::MAX;
-static mut EWRAM_SLOT_PAGE: [u16; EWRAM_SLOTS] = [EWRAM_FREE; EWRAM_SLOTS];
+static mut EWRAM_SLOT_PAGE: [u16; EWRAM_SLOTS] = [0; EWRAM_SLOTS];
+static mut EWRAM_STAMP: [u32; EWRAM_SLOTS] = [0; EWRAM_SLOTS];
+static mut EWRAM_SUM: [u32; EWRAM_SLOTS] = [0; EWRAM_SLOTS];
+static mut EWRAM_KNOWN: [bool; EWRAM_SLOTS] = [false; EWRAM_SLOTS];
+static mut EWRAM_POOL: Option<common::ewram::EwramPool<'static>> = None;
 
-// Free the pages that hold nothing but zeros, which are the same as pages that were never used.
-// The translator does not build the native address of an EWRAM page into code, so a page can go.
-// Returns whether any page was freed.
-fn ewram_reclaim() -> bool {
-    unsafe {
-        let pool = &raw const NEW_EWRAM as u32;
-        let mut freed = false;
-        for slot in 0..EWRAM_SLOTS {
-            let page = EWRAM_SLOT_PAGE[slot];
-            if page == EWRAM_FREE {
-                continue;
-            }
-            let words = (pool + slot as u32 * EWRAM_PAGE) as *const u32;
-            if (0..EWRAM_PAGE as usize / 4).all(|i| core::ptr::read_volatile(words.add(i)) == 0) {
-                EWRAM_PAGE_TABLE[page as usize] = EWRAM_START + page as u32 * EWRAM_PAGE;
-                EWRAM_SLOT_PAGE[slot] = EWRAM_FREE;
-                EWRAM_PAGES_USED -= 1;
-                freed = true;
-            }
-        }
-        freed
+// The swap file on the SD card, written and read by core 1 on request
+struct CardSwap;
+
+impl common::ewram::SwapStore for CardSwap {
+    fn available(&self) -> bool {
+        romstore::swap_available()
+    }
+    fn read(&mut self, page: usize, dst: &mut [u8; 512]) -> bool {
+        romstore::swap_read(page, dst)
+    }
+    fn write(&mut self, page: usize, src: &[u8; 512]) -> bool {
+        romstore::swap_write(page, src)
     }
 }
 
-fn ewram_native(gba_addr: u32) -> Option<u32> {
+#[allow(static_mut_refs)]
+fn ewram_init() {
+    unsafe {
+        EWRAM_POOL = Some(common::ewram::EwramPool::new(
+            core::slice::from_raw_parts_mut(&raw mut NEW_EWRAM as *mut u8, EWRAM_LEN as usize),
+            &mut EWRAM_PAGE_TABLE,
+            &mut EWRAM_SLOT_PAGE,
+            &mut EWRAM_STAMP,
+            &mut EWRAM_SUM,
+            &mut EWRAM_KNOWN,
+            EWRAM_START,
+        ));
+    }
+}
+
+#[allow(static_mut_refs)]
+unsafe fn ewram_pool() -> &'static mut common::ewram::EwramPool<'static> {
+    unsafe { EWRAM_POOL.as_mut().unwrap() }
+}
+
+// Called at every VBlank by the interrupt that tells core 0, which cannot interrupt the fault
+// handler where the pool is used: unmap the pages so the ones still in use fault back in
+fn ewram_sweep() {
+    unsafe { ewram_pool().sweep() }
+}
+
+// The native address of a byte of EWRAM, paging its page in (and another out) if it is not
+// there. `create` is for stores of something other than zero: a page nothing was stored in is
+// not made for a read. None when the pool is full and cannot swap.
+fn ewram_native(gba_addr: u32, create: bool) -> Option<u32> {
     unsafe {
         let offset = (gba_addr - EWRAM_START) & (EWRAM_MIRROR - 1);
         let page = (offset / EWRAM_PAGE) as usize;
-        if ewram_page_empty(gba_addr) {
-            let mut slot = EWRAM_SLOT_PAGE.iter().position(|&p| p == EWRAM_FREE);
-            if slot.is_none() && ewram_reclaim() {
-                slot = EWRAM_SLOT_PAGE.iter().position(|&p| p == EWRAM_FREE);
-            }
-            let Some(slot) = slot else {
-                EWRAM_POOL_FULL = true;
-                return None;
-            };
-            let pool = &raw const NEW_EWRAM as u32;
-            EWRAM_PAGE_TABLE[page] = pool + slot as u32 * EWRAM_PAGE;
-            EWRAM_SLOT_PAGE[slot] = page as u16;
-            EWRAM_PAGES_USED += 1;
-        }
-        Some(EWRAM_PAGE_TABLE[page] + offset % EWRAM_PAGE)
+        let native = ewram_pool().native(&mut CardSwap, page, create)?;
+        Some(native + offset % EWRAM_PAGE)
     }
 }
 
@@ -560,7 +557,13 @@ fn cpu_set(frame: &ExceptionFrame, fast: bool) {
     // Every unit is accessed on its own, the memory behind an address range is not contiguous
     // (EWRAM is paged, ROM is cached).
     let mut mem = gba_mem::Gba;
-    let first = if fill { mem.read32(src) } else { 0 };
+    // the fill value is read at its own width: read32 rounds down to a word, which for a halfword
+    // at an address ending in 2 gives its neighbour
+    let first = match (fill, word) {
+        (false, _) => 0,
+        (true, true) => mem.read32(src),
+        (true, false) => mem.read16(src) as u32,
+    };
     for i in 0..count {
         let from = src + if fill { 0 } else { i as u32 * unit };
         let to = dst + i as u32 * unit;
@@ -963,6 +966,7 @@ extern "C" fn irq_inject(frame: &mut ExceptionFrame) {
         PC_SAMPLES[PC_SAMPLE_COUNT % 8] = frame.pc();
         PC_SAMPLE_COUNT += 1;
     }
+    ewram_sweep();
     try_inject(frame);
 }
 
@@ -1398,7 +1402,7 @@ where
         for line in 0..LINES_PER_FRAME {
             // wait for the line to start, a line that is already late starts right away
             let line_start = gba_cycles_to_us(line as u32 * LINE_CYCLES);
-            while elapsed(frame_start) < line_start {}
+            while !cfg!(feature = "unpaced") && elapsed(frame_start) < line_start {}
 
             unsafe { core::ptr::write_volatile(vert_counter, line as u16) };
             set_display_status(disp_status, line, false);
@@ -1514,9 +1518,15 @@ where
                 if frames == REPORT_FRAMES {
                     unsafe {
                         rprintln!(
-                            "fault us {}, ewram pages {}, faults {}, svc counts {:?}, jit blocks {} ({} bytes), last svc {:x?}, game pc samples {:x?} (count {}), dispcnt {:x} dispstat {:x} ie {:x} if {:x} ime {:x}",
+                            "fault us {}, ewram pages {} (swap reads {} writes {} clean {} zero {} errors {}/{}), faults {}, svc counts {:?}, jit blocks {} ({} bytes), last svc {:x?}, game pc samples {:x?} (count {}), dispcnt {:x} dispstat {:x} ie {:x} if {:x} ime {:x}",
                             FAULT_TICKS,
-                            EWRAM_PAGES_USED,
+                            ewram_pool().resident(),
+                            ewram_pool().stats.reads,
+                            ewram_pool().stats.writes,
+                            ewram_pool().stats.clean_drops,
+                            ewram_pool().stats.zero_drops,
+                            ewram_pool().stats.write_errors,
+                            ewram_pool().stats.read_errors,
                             FAULT_COUNT,
                             SVC_COUNTS,
                             JIT.as_ref().map(|j| j.block_count()).unwrap_or(0),
@@ -1531,7 +1541,7 @@ where
                             core::ptr::read_volatile(io_reg(IME_OFFSET))
                         );
                         rprintln!(
-                            "stacks used: core 0 {} of {}, core 1 {} of {}; jit flushes {}, most code translated in irq {} bytes; rom cache hits {} misses {}; ewram pool full {}; sd read retries {} (last error {:#x})",
+                            "stacks used: core 0 {} of {}, core 1 {} of {}; jit regions evicted {}, {}; rom cache hits {} misses {}; ewram pool full {}; sd read retries {} (last error {:#x}); us translating {} ({} blocks), us in sd reads {}, new code {} bytes in {} blocks; sd requests {}: waited {} us, read {} us (command {} token {} data {})",
                             stack_used(&raw const __sheap as u32, &raw const _stack_start as u32),
                             &raw const _stack_start as u32 - &raw const __sheap as u32,
                             stack_used(
@@ -1540,14 +1550,32 @@ where
                             ),
                             size_of::<Stack<2560>>(),
                             JIT_FLUSHES,
-                            JIT_IRQ_MAX * 2,
+                            0,
                             ROM_CACHE.as_ref().map_or(0, |c| c.hits),
                             ROM_CACHE.as_ref().map_or(0, |c| c.misses),
-                            EWRAM_POOL_FULL,
+                            ewram_pool().stats.full,
                             sdcard::RETRIES.load(core::sync::atomic::Ordering::Relaxed),
-                            sdcard::LAST_ERROR.load(core::sync::atomic::Ordering::Relaxed)
+                            sdcard::LAST_ERROR.load(core::sync::atomic::Ordering::Relaxed),
+                            US_TRANSLATE,
+                            BLOCKS_TRANSLATED,
+                            US_SD,
+                            BYTES_TRANSLATED,
+                            NEW_BLOCKS,
+                            romstore::REQUESTS.load(core::sync::atomic::Ordering::Relaxed),
+                            romstore::US_WAITED.load(core::sync::atomic::Ordering::Relaxed),
+                            romstore::US_READING.load(core::sync::atomic::Ordering::Relaxed),
+                            sdcard::US_PARTS[0].load(core::sync::atomic::Ordering::Relaxed),
+                            sdcard::US_PARTS[1].load(core::sync::atomic::Ordering::Relaxed),
+                            sdcard::US_PARTS[2].load(core::sync::atomic::Ordering::Relaxed)
                         );
                     }
+                    // pokeemerald's gMain.callback1 and callback2, to see which screen it is on
+                    rprintln!(
+                        "recent misses {:x?} callbacks {:x} {:x}",
+                        unsafe { RECENT_MISSES },
+                        gba_mem::load(0x0300_36CC, 4),
+                        gba_mem::load(0x0300_36D0, 4)
+                    );
                     let report_time = elapsed(report_start);
                     report_start = SYST::get_current();
                     rprintln!(
@@ -1558,18 +1586,20 @@ where
                         FRAME_US,
                         late_frames
                     );
+                    let phases = profile::take();
                     rprintln!(
-                        "  render avg {} us, max {} us, last line sent up to {} us into VBlank",
+                        "  render avg {} us, max {} us, late line {} us; bg {} sprite {} setup {} out {} prep {}; input {}",
                         render_total / frames,
                         render_max,
-                        vblank_late_max
+                        vblank_late_max,
+                        (phases[1] >> 8) / frames,
+                        (phases[2] >> 8) / frames,
+                        (phases[0] >> 8) / frames,
+                        (phases[3] >> 8) / frames,
+                        (phases[4] >> 8) / frames,
+                        input_max
                     );
-                    rprintln!("  touch and button drawing took up to {} us", input_max);
                     input_max = 0;
-                    let phases = profile::take();
-                    for (name, time) in profile::PHASE_NAMES.iter().zip(phases) {
-                        rprintln!("  {:>12}: {:>6} us/frame", name, (time >> 8) / frames);
-                    }
                     frames = 0;
                     render_total = 0;
                     render_max = 0;
@@ -1579,7 +1609,7 @@ where
             }
 
             let hblank_start = gba_cycles_to_us(line as u32 * LINE_CYCLES + HBLANK_START_CYCLES);
-            while elapsed(frame_start) < hblank_start {}
+            while !cfg!(feature = "unpaced") && elapsed(frame_start) < hblank_start {}
             set_display_status(disp_status, line, true);
         }
 
@@ -1588,7 +1618,7 @@ where
         if frame_time > FRAME_US {
             late_frames += 1;
         }
-        while elapsed(frame_start) < FRAME_US {}
+        while !cfg!(feature = "unpaced") && elapsed(frame_start) < FRAME_US {}
         if frame_time > 2 * FRAME_US {
             // more than a frame behind, give up on catching up
             frame_start = SYST::get_current();
@@ -1683,6 +1713,72 @@ fn main() -> ! {
 
 // Set everything up and return the GBA address to start the game at
 #[inline(never)]
+// The CPU runs at 250 MHz, twice the default. The peripheral clock stays at 125 MHz (from the
+// otherwise unused USB PLL) so the SPI dividers and the display and card timings do not change.
+fn init_clocks_overclocked(
+    xosc_dev: pac::XOSC,
+    clocks_dev: pac::CLOCKS,
+    pll_sys_dev: pac::PLL_SYS,
+    pll_usb_dev: pac::PLL_USB,
+    mut vreg: pac::VREG_AND_CHIP_RESET,
+    resets: &mut pac::RESETS,
+    watchdog: &mut Watchdog,
+) -> rp2040_hal::clocks::ClocksManager {
+    use rp2040_hal::{
+        clocks::{ClockSource, ClocksManager},
+        fugit::RateExtU32,
+        pll::{PLLConfig, common_configs::PLL_SYS_125MHZ, setup_pll_blocking},
+        vreg::set_voltage,
+        xosc::setup_xosc_blocking,
+    };
+    const PLL_SYS_250MHZ: PLLConfig = PLLConfig {
+        vco_freq: HertzU32::MHz(1500),
+        refdiv: 1,
+        post_div1: 6,
+        post_div2: 1,
+    };
+
+    // 250 MHz needs more than the default 1.10 V
+    set_voltage(
+        &mut vreg,
+        pac::vreg_and_chip_reset::vreg::VSEL_A::VOLTAGE1_15,
+    );
+    cortex_m::asm::delay(1_000_000);
+
+    let xosc = setup_xosc_blocking(xosc_dev, 12_000_000u32.Hz()).unwrap();
+    watchdog.enable_tick_generation(12);
+    let mut clocks = ClocksManager::new(clocks_dev);
+    let pll_sys = setup_pll_blocking(
+        pll_sys_dev,
+        xosc.operating_frequency(),
+        PLL_SYS_250MHZ,
+        &mut clocks,
+        resets,
+    )
+    .unwrap();
+    let pll_peri = setup_pll_blocking(
+        pll_usb_dev,
+        xosc.operating_frequency(),
+        PLL_SYS_125MHZ,
+        &mut clocks,
+        resets,
+    )
+    .unwrap();
+    clocks
+        .reference_clock
+        .configure_clock(&xosc, xosc.get_freq())
+        .unwrap();
+    clocks
+        .system_clock
+        .configure_clock(&pll_sys, pll_sys.get_freq())
+        .unwrap();
+    clocks
+        .peripheral_clock
+        .configure_clock(&pll_peri, pll_peri.get_freq())
+        .unwrap();
+    clocks
+}
+
 fn setup() -> u32 {
     rtt_init_print!();
     let mut pac = pac::Peripherals::take().unwrap();
@@ -1700,17 +1796,15 @@ fn setup() -> u32 {
     systick.clear_current(); // Clear current value to force a reload
     systick.set_clock_source(SystClkSource::Core); // Use the RP2040 CPU clock (typically 125MHz)
 
-    let clocks = rp2040_hal::clocks::init_clocks_and_plls(
-        12_000_000,
+    let clocks = init_clocks_overclocked(
         pac.XOSC,
         pac.CLOCKS,
         pac.PLL_SYS,
         pac.PLL_USB,
+        pac.VREG_AND_CHIP_RESET,
         &mut pac.RESETS,
         &mut watchdog,
-    )
-    .ok()
-    .unwrap();
+    );
 
     let mut timer = Timer::new(pac.TIMER, &mut pac.RESETS, &clocks);
 
@@ -1840,6 +1934,9 @@ fn setup() -> u32 {
         loop {}
     };
     rprintln!("ROM of {} bytes", rom_len);
+    unsafe {
+        GAME_CODE = gba_mem::load(ROM_START + common::patches::GAME_CODE_OFFSET, 4).to_le_bytes();
+    }
 
     // The game's idea of the BIOS is address 0, which on the RP2040 is its boot rom. Reads of it
     // do not fault, so make it no access on this core and let the fault handler answer for it.

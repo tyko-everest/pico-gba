@@ -46,10 +46,13 @@ impl Dma {
         if count == 0 {
             count = if channel == 3 { 0x1_0000 } else { 0x4000 };
         }
+        // The native stack (0x2000_0000 and up) holds the value of a fill that the game keeps in
+        // a local, those addresses are not GBA addresses and must not be wrapped into one
+        let wrap = |addr: u32, mask: u32| if addr >> 28 == 2 { addr } else { addr & mask };
         Dma {
             channel,
-            src: src & src_mask,
-            dst: dst & dst_mask,
+            src: wrap(src, src_mask),
+            dst: wrap(dst, dst_mask),
             count,
             control: (cnt >> 16) as u16,
         }
@@ -117,6 +120,18 @@ mod tests {
         fn write32(&mut self, a: u32, v: u32) {
             self.0[a as usize..a as usize + 4].copy_from_slice(&v.to_le_bytes());
         }
+    }
+
+    #[test]
+    fn native_addresses_are_not_wrapped() {
+        // a fill from a local on the stack
+        let dma = Dma::from_registers(3, 0x2004_1956, 0x0600_0000, 0x800 | (0x8100 << 16));
+        assert_eq!((dma.src, dma.dst), (0x2004_1956, 0x0600_0000));
+        // GBA addresses still wrap at 27 bits (channel 0) or 28 bits
+        let dma = Dma::from_registers(0, 0x1A00_0000, 0x0300_0000, 1);
+        assert_eq!(dma.src, 0x0200_0000);
+        let dma = Dma::from_registers(3, 0xF800_0000, 0x0600_0000, 1);
+        assert_eq!(dma.src, 0x0800_0000);
     }
 
     #[test]

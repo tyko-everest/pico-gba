@@ -327,6 +327,162 @@ impl LruSim {
     }
 }
 
+// An EWRAM page pool of `slots` pages of 1 << shift bytes with LRU eviction, for judging paging
+// to the SD card: pages that were never written non-zero are free (they read as zero), the others
+// need a slot, and one that was evicted is read back from the card when it is used again.
+pub struct EwramSim {
+    pub shift: u32,
+    pub slots: usize,
+    backed: Vec<bool>,
+    in_pool: Vec<bool>,
+    stamp: Vec<u64>,
+    dirty: Vec<bool>,
+    // the page has a copy on the card
+    swapped: Vec<bool>,
+    clock: u64,
+    resident: usize,
+    pub reads_by_frame: Vec<u32>,
+    pub writebacks_by_frame: Vec<u32>,
+}
+
+impl EwramSim {
+    pub fn new(shift: u32, kb: usize) -> Self {
+        let pages = EWRAM_SIZE >> shift;
+        EwramSim {
+            shift,
+            slots: kb * 1024 >> shift,
+            backed: vec![false; pages],
+            in_pool: vec![false; pages],
+            stamp: vec![0; pages],
+            dirty: vec![false; pages],
+            swapped: vec![false; pages],
+            clock: 0,
+            resident: 0,
+            reads_by_frame: Vec::new(),
+            writebacks_by_frame: Vec::new(),
+        }
+    }
+
+    fn access(&mut self, off: usize, size: u32, write: bool, value: u32, frame: usize) {
+        let first = off >> self.shift;
+        let last = ((off + size as usize - 1) & (EWRAM_SIZE - 1)) >> self.shift;
+        for page in [first, last].into_iter().take(1 + (first != last) as usize) {
+            if write && value != 0 {
+                self.backed[page] = true;
+            }
+            if self.backed[page] {
+                self.touch(page, write, frame);
+            }
+        }
+    }
+
+    fn touch(&mut self, page: usize, write: bool, frame: usize) {
+        self.clock += 1;
+        if self.in_pool[page] {
+            self.stamp[page] = self.clock;
+            self.dirty[page] |= write;
+            return;
+        }
+        while self.reads_by_frame.len() <= frame {
+            self.reads_by_frame.push(0);
+            self.writebacks_by_frame.push(0);
+        }
+        if self.swapped[page] {
+            self.reads_by_frame[frame] += 1;
+        }
+        if self.resident == self.slots {
+            let victim = (0..self.in_pool.len())
+                .filter(|&i| self.in_pool[i])
+                .min_by_key(|&i| self.stamp[i])
+                .unwrap();
+            self.in_pool[victim] = false;
+            self.resident -= 1;
+            if self.dirty[victim] {
+                self.writebacks_by_frame[frame] += 1;
+                self.swapped[victim] = true;
+            }
+        }
+        self.in_pool[page] = true;
+        self.resident += 1;
+        self.stamp[page] = self.clock;
+        // a page read back is clean, a new one only exists in the pool
+        self.dirty[page] = write || !self.swapped[page];
+    }
+}
+
+pub const EWRAM_PAGES: usize = EWRAM_SIZE / 512;
+
+// What the game does with its EWRAM, page by page
+pub struct EwramStats {
+    // a page that has been written a non-zero value, so it needs a slot
+    pub backed: Vec<bool>,
+    pub reads: Vec<u64>,
+    pub writes: Vec<u64>,
+    // the frame of the last access and of the last write
+    pub last_access: Vec<u64>,
+    pub last_write: Vec<u64>,
+    // distinct backed pages touched in each frame
+    pub touched_by_frame: Vec<u32>,
+    last_frame: Vec<i64>,
+    pub sims: Vec<EwramSim>,
+}
+
+impl Default for EwramStats {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl EwramStats {
+    pub fn new() -> Self {
+        EwramStats {
+            backed: vec![false; EWRAM_PAGES],
+            reads: vec![0; EWRAM_PAGES],
+            writes: vec![0; EWRAM_PAGES],
+            last_access: vec![0; EWRAM_PAGES],
+            last_write: vec![0; EWRAM_PAGES],
+            touched_by_frame: Vec::new(),
+            last_frame: vec![-1; EWRAM_PAGES],
+            sims: [7, 8, 9, 10, 11]
+                .into_iter()
+                .flat_map(|shift| [8, 12, 16, 24].map(|kb| EwramSim::new(shift, kb)))
+                .collect(),
+        }
+    }
+
+    // an access of size bytes at the EWRAM offset (already mirrored); value is what is stored
+    pub fn access(&mut self, off: usize, size: u32, write: bool, value: u32, frame: u64) {
+        // an access can straddle two pages, count both
+        let first = off / 512;
+        let last = ((off + size as usize - 1) & (EWRAM_SIZE - 1)) / 512;
+        for page in [first, last].into_iter().take(1 + (first != last) as usize) {
+            if write {
+                self.writes[page] += 1;
+                self.last_write[page] = frame;
+                if value != 0 {
+                    self.backed[page] = true;
+                }
+            } else {
+                self.reads[page] += 1;
+            }
+            if !self.backed[page] {
+                continue;
+            }
+            self.last_access[page] = frame;
+            if self.last_frame[page] != frame as i64 {
+                self.last_frame[page] = frame as i64;
+                while self.touched_by_frame.len() <= frame as usize {
+                    self.touched_by_frame.push(0);
+                }
+                self.touched_by_frame[frame as usize] += 1;
+            }
+        }
+        for sim in &mut self.sims {
+            sim.access(off, size, write, value, frame as usize);
+        }
+    }
+}
+
 #[derive(Clone, Copy, Default)]
 pub struct FaultPc {
     pub count: u64,
@@ -367,6 +523,8 @@ pub struct Stats {
     pub capped_frames: u64,
     // per code cache halfword: instruction cycles, and fault + trap cycles
     pub cache_instr: Vec<u64>,
+    // the frame each halfword of the cache last ran in, to measure the working set
+    pub last_run: Vec<u32>,
     pub cache_other: Vec<u64>,
     pub blocks: Vec<BlockInfo>,
     pub translate_ns: u64,
@@ -382,6 +540,7 @@ pub struct Stats {
     pub caches: Vec<LruSim>,
     pub data_pages: HashMap<u32, u64>,
     pub arm_instrs: u64,
+    pub ewram: EwramStats,
 }
 
 #[derive(Clone, Copy)]
@@ -410,7 +569,12 @@ pub struct Sys {
     frame_no: u64,
     input: InputScript,
     in_irq: bool,
+    // regions of the code cache are thrown away one at a time
+    ring: bool,
+    cur_regs: [u32; 16],
+    irq_ret: u32,
     paging: Option<Paging>,
+    game_code: [u8; 4],
     // cycles since the start, the timers count from it
     total_cycles: u64,
     timers: common::timers::Timers,
@@ -494,6 +658,7 @@ impl Sys {
         if Self::in_cache(pc) {
             self.stats.jit_cycles += c;
             self.stats.cache_instr[((pc - CACHE_BASE) / 2) as usize] += c;
+            self.stats.last_run[((pc - CACHE_BASE) / 2) as usize] = self.frame_no as u32;
         } else {
             self.stats.native_cycles += c;
         }
@@ -505,6 +670,15 @@ impl Sys {
         self.total_cycles += c;
         if Self::in_cache(pc) {
             self.stats.cache_other[((pc - CACHE_BASE) / 2) as usize] += c;
+        }
+    }
+
+    // EWRAM accesses by page, whoever makes them (the cpu, dma, a BIOS call)
+    fn note_ewram(&mut self, addr: u32, size: u32, write: bool, value: u32) {
+        if addr >> 24 == 2 {
+            let off = (addr & 0x00FF_FFFF) as usize & (EWRAM_SIZE - 1);
+            let frame = self.frame_no;
+            self.stats.ewram.access(off, size, write, value, frame);
         }
     }
 
@@ -548,6 +722,7 @@ impl Sys {
 
     // Memory as the BIOS and DMA see it: GBA addresses, or native ones for the stack
     fn raw_read(&mut self, addr: u32, size: u32) -> u32 {
+        self.note_ewram(addr, size, false, 0);
         if let Some(v) = self.mem_read(addr, size) {
             return v;
         }
@@ -559,6 +734,7 @@ impl Sys {
     }
 
     fn raw_write(&mut self, addr: u32, size: u32, value: u32) {
+        self.note_ewram(addr, size, true, value);
         if !self.mem.write(addr, size, value) {
             if let Some(off) = Self::native_off(addr, size) {
                 for i in 0..size {
@@ -643,7 +819,16 @@ impl Sys {
     // Read GBA memory for the translator, like gba_read_word
     // The translator also reads the region table and the page tables (native memory) here, to
     // find the address behind a constant base register.
-    fn gba_word(mem: &Mem, paging: &mut Option<Paging>, addr: u32) -> Option<u32> {
+    fn gba_word(
+        mem: &Mem,
+        paging: &mut Option<Paging>,
+        game_code: [u8; 4],
+        addr: u32,
+    ) -> Option<u32> {
+        Self::gba_word_raw(mem, paging, addr).map(|w| common::patches::word(game_code, addr, w))
+    }
+
+    fn gba_word_raw(mem: &Mem, paging: &mut Option<Paging>, addr: u32) -> Option<u32> {
         if addr >= REGIONS_ADDR && addr < REGIONS_ADDR + 0x1400 {
             let at = (addr - NATIVE_BASE) as usize;
             return Some(u32::from_le_bytes(
@@ -699,7 +884,51 @@ impl Sys {
         self.stats.irq_bytes = 0;
     }
 
+    // Throw away a region of the code cache that nothing running is in or about to return to
+    fn evict_for_room(&mut self) {
+        let mut keep = 0u32;
+        let mut mark = |a: u32| {
+            if let Some(r) = self.jit.region_of(a & !1) {
+                keep |= 1 << r;
+            }
+        };
+        mark(self.cur_pc);
+        for r in self.cur_regs {
+            mark(r);
+        }
+        if self.in_irq {
+            mark(self.irq_ret);
+        }
+        // anything on the stack that is an address in the cache
+        let top = NATIVE_BASE + NATIVE_LEN;
+        let mut at = self.cur_regs[13] & !3;
+        while at < top {
+            if let Some(off) = Self::native_off(at, 4) {
+                mark(self.read_native(off, 4));
+            }
+            at += 4;
+        }
+        match self.jit.evict_region(keep) {
+            Some((lo, hi)) => {
+                let table = (DISPATCH_ADDR - NATIVE_BASE) as usize;
+                for e in 0..common::jit::DISPATCH_ENTRIES {
+                    let at = table + 8 * e + 4;
+                    let native =
+                        u32::from_le_bytes(self.mem.native[at..at + 4].try_into().unwrap());
+                    if native & !1 >= lo && native & !1 < hi {
+                        self.mem.native[at - 4..at + 4].fill(0);
+                    }
+                }
+                self.stats.flushes += 1;
+            }
+            None => self.die("every region of the code cache is in use"),
+        }
+    }
+
     fn translate(&mut self, arm: u32) -> u32 {
+        if self.ring {
+            return self.translate_ring(arm);
+        }
         // the interrupt handler needs room to translate its code after a flush, outside of it
         // the cache is thrown away before that room is used
         if !self.in_irq && self.needs_flush() {
@@ -707,28 +936,31 @@ impl Sys {
         }
         let mut used0 = self.jit.used_halfwords();
         let t0 = Instant::now();
+        let game_code = self.game_code;
         let mem = &self.mem;
         let paging = &mut self.paging;
         let mut r = self
             .jit
-            .translate(arm, &mut |a| Self::gba_word(mem, paging, a));
+            .translate(arm, &mut |a| Self::gba_word(mem, paging, game_code, a));
         if r == Err(common::jit::JitError::CacheFull) && self.in_irq && !self.jit.in_emergency() {
             // the interrupt handler needs more than the margin: use the reserve
             self.jit.use_reserve();
+            let game_code = self.game_code;
             let mem = &self.mem;
             let paging = &mut self.paging;
             r = self
                 .jit
-                .translate(arm, &mut |a| Self::gba_word(mem, paging, a));
+                .translate(arm, &mut |a| Self::gba_word(mem, paging, game_code, a));
         }
         if r == Err(common::jit::JitError::CacheFull) && !self.in_irq {
             self.flush();
             used0 = self.jit.used_halfwords();
+            let game_code = self.game_code;
             let mem = &self.mem;
             let paging = &mut self.paging;
             r = self
                 .jit
-                .translate(arm, &mut |a| Self::gba_word(mem, paging, a));
+                .translate(arm, &mut |a| Self::gba_word(mem, paging, game_code, a));
         }
         self.stats.translate_ns += t0.elapsed().as_nanos() as u64;
         let thumb = match r {
@@ -743,7 +975,50 @@ impl Sys {
         thumb
     }
 
+    fn translate_ring(&mut self, arm: u32) -> u32 {
+        loop {
+            let used0 = self.jit.used_halfwords();
+            let t0 = Instant::now();
+            let game_code = self.game_code;
+            let mem = &self.mem;
+            let paging = &mut self.paging;
+            let r = self
+                .jit
+                .translate(arm, &mut |a| Self::gba_word(mem, paging, game_code, a));
+            self.stats.translate_ns += t0.elapsed().as_nanos() as u64;
+            match r {
+                Ok(t) => {
+                    self.record_block(used0, arm);
+                    return t;
+                }
+                Err(common::jit::JitError::CacheFull) => self.evict_for_room(),
+                Err(e) => self.die(&format!("cannot translate code at {arm:#x}: {e:?}")),
+            }
+        }
+    }
+
     fn resolve(&mut self, slot: u32) -> u32 {
+        if self.ring {
+            loop {
+                let used0 = self.jit.used_halfwords();
+                let arm =
+                    self.jit.halfword(slot + 4) as u32 | (self.jit.halfword(slot + 6) as u32) << 16;
+                let game_code = self.game_code;
+                let mem = &self.mem;
+                let paging = &mut self.paging;
+                let r = self
+                    .jit
+                    .resolve_slot(slot, &mut |a| Self::gba_word(mem, paging, game_code, a));
+                match r {
+                    Ok(t) => {
+                        self.record_block(used0, arm);
+                        return t;
+                    }
+                    Err(common::jit::JitError::CacheFull) => self.evict_for_room(),
+                    Err(e) => self.die(&format!("cannot resolve slot at {slot:#x}: {e:?}")),
+                }
+            }
+        }
         if !self.in_irq && self.needs_flush() {
             // the slot is gone with the rest of the cache
             let arm =
@@ -753,11 +1028,12 @@ impl Sys {
         let used0 = self.jit.used_halfwords();
         let arm = self.jit.halfword(slot + 4) as u32 | (self.jit.halfword(slot + 6) as u32) << 16;
         let t0 = Instant::now();
+        let game_code = self.game_code;
         let mem = &self.mem;
         let paging = &mut self.paging;
         let r = self
             .jit
-            .resolve_slot(slot, &mut |a| Self::gba_word(mem, paging, a));
+            .resolve_slot(slot, &mut |a| Self::gba_word(mem, paging, game_code, a));
         self.stats.translate_ns += t0.elapsed().as_nanos() as u64;
         if r == Err(common::jit::JitError::CacheFull) {
             // the slot is gone with the rest of the cache, or the reserve is opened up
@@ -830,6 +1106,7 @@ impl Bus for Sys {
         if kind == Access::Data && !inline {
             self.note_fault(addr);
         }
+        self.note_ewram(addr, size, false, 0);
         // unmapped addresses read the open bus, which the BIOS leaves as a constant here
         let v = self.mem_read(addr, size).unwrap_or_else(|| match size {
             1 => BIOS_OPEN_BUS & 0xFF,
@@ -894,6 +1171,7 @@ impl Bus for Sys {
         if kind == Access::Data && !inline {
             self.note_fault(addr);
         }
+        self.note_ewram(addr, size, true, value);
         let old_if = self.mem.io16(IF);
         // a write to an unmapped address is ignored
         self.mem.write(addr, size, value);
@@ -954,12 +1232,20 @@ impl Machine {
         );
         // the last 6 KB are for when the cache is full inside the interrupt handler
         jit.set_reserve(3 * 1024);
+        let ring = std::env::var("JITBENCH_REGIONS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(0);
+        if ring != 0 && thumb_jit {
+            jit.set_regions(ring);
+        }
         let mut mem = Mem::new(rom);
         mem.set_io16(KEYINPUT, 0x03FF);
         // the BIOS leaves the display in forced blank
         mem.set_io16(0, 0x0080);
         let stats = Stats {
             cache_instr: vec![0; CACHE_HW],
+            last_run: vec![u32::MAX; CACHE_HW],
             cache_other: vec![0; CACHE_HW],
             ..Default::default()
         };
@@ -988,7 +1274,13 @@ impl Machine {
                 frame_no: 0,
                 input,
                 in_irq: false,
+                ring: ring != 0 && thumb_jit,
+                cur_regs: [0; 16],
+                irq_ret: 0,
                 paging: None,
+                game_code: rom
+                    .get(0xAC..0xB0)
+                    .map_or([0; 4], |b| b.try_into().unwrap()),
                 total_cycles: 0,
                 timers: common::timers::Timers::new(),
                 flash: common::flash::FlashChip::new(),
@@ -1010,9 +1302,11 @@ impl Machine {
         let data: &'static mut [u8] = Box::leak(vec![0u8; slots * PAGE_SIZE].into_boxed_slice());
         let tags: &'static mut [u32] = Box::leak(vec![0u32; slots].into_boxed_slice());
         let stamps: &'static mut [u32] = Box::leak(vec![0u32; slots].into_boxed_slice());
+        let run: &'static mut [u8; common::romcache::RUN_BYTES] =
+            Box::leak(Box::new([0u8; common::romcache::RUN_BYTES]));
         let rom = self.sys.mem.rom.clone();
         self.sys.paging = Some(Paging {
-            cache: RomCache::new(data, tags, stamps),
+            cache: RomCache::new(data, tags, stamps, run),
             src: VecSource(rom),
         });
         for top in 8..=0xDu32 {
@@ -1031,6 +1325,10 @@ impl Machine {
             if pc == MAGIC {
                 self.finish_irq();
                 continue;
+            }
+            if self.sys.ring {
+                self.sys.cur_regs = self.cpu.r;
+                self.sys.cur_pc = pc;
             }
             if self.thumb_jit && !Sys::in_cache(pc) && matches!(pc >> 24, 2 | 3 | 8..=0xD) {
                 // Thumb code at a GBA address: the fault handler translates it and continues
@@ -1270,6 +1568,37 @@ impl Machine {
         }
         sys.frame_cycles = 0;
         sys.frame_no += 1;
+        if sys.frame_no % 60 == 0 && std::env::var_os("JITBENCH_WSET").is_some() {
+            let now = sys.frame_no as u32;
+            let within = |n: u32| {
+                2 * sys
+                    .stats
+                    .last_run
+                    .iter()
+                    .filter(|&&f| f != u32::MAX && now - f <= n)
+                    .count()
+            };
+            eprintln!(
+                "wset frame {now}: code run in the last 1 frame {} B, 10 frames {} B, 60 frames {} B, 300 frames {} B (cache holds {} B)",
+                within(1),
+                within(10),
+                within(60),
+                within(300),
+                sys.jit.code_used_bytes()
+            );
+        }
+        // JITBENCH_WATCH=addr prints a 32 bit word of memory whenever it changes (debugging)
+        if let Some(addr) = std::env::var("JITBENCH_WATCH")
+            .ok()
+            .and_then(|v| u32::from_str_radix(v.trim_start_matches("0x"), 16).ok())
+        {
+            static mut LAST: u32 = 1;
+            let now = sys.raw_read(addr, 4);
+            if now != unsafe { LAST } {
+                eprintln!("frame {}: [{:#x}] = {:#x}", sys.frame_no, addr, now);
+                unsafe { LAST = now };
+            }
+        }
         let keys = if sys.input.pressed(sys.frame_no) {
             0x03FE
         } else {
@@ -1305,6 +1634,7 @@ impl Machine {
             ret_pc: self.cpu.r[15] | 1,
             miss: self.miss_word(),
         });
+        self.sys.irq_ret = self.cpu.r[15] | 1;
         self.cpu.r[0] = 0x0400_0000;
         self.cpu.r[14] = MAGIC | 1;
         self.jump(at, vector);

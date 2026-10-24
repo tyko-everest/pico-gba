@@ -453,34 +453,50 @@ impl Video<'_> {
         let mut pos = LINE_MARGIN - (bg_x & TILE_MASK);
         let palette_type = control.palette_type();
 
+        // the map entry's tile number is bits 0-9, then hflip, vflip and the palette in bits 12-15
+        let row_pixels = row * 4;
+        let flipped_row_pixels = (TILE_MASK - row) * 4;
         for _ in 0..(SCREEN_WIDTH / TILE_SIZE + 1) {
             let column = tile_x & width_mask_tiles;
             let mut entry_addr = map_row + (column & 31) * 2;
             if column >= 32 {
                 entry_addr += SCREENBLOCK;
             }
-            let entry = MapTextEntry::from(self.vram.read_u16(entry_addr));
-            let tile = entry.tile().as_usize();
-            let hflip = entry.horiz_flip();
-            let tile_row = if entry.vert_flip() {
-                TILE_MASK - row
-            } else {
-                row
-            };
-            let dst = (&mut line[pos..pos + TILE_SIZE]).try_into().unwrap();
+            let entry = self.vram.read_u16(entry_addr) as usize;
+            let hflip = entry & 0x400 != 0;
+            let vflip = entry & 0x800 != 0;
+            let tile = entry & 0x3FF;
+            // pos stays inside the line buffer: it starts at most 8 in and moves 8 per tile
+            let dst: &mut [u16; TILE_SIZE] =
+                unsafe { &mut *(line.as_mut_ptr().add(pos) as *mut [u16; TILE_SIZE]) };
+            pos += TILE_SIZE;
+            tile_x += 1;
 
             match palette_type {
                 PaletteType::P16 => {
-                    let addr = tileset + tile * 32 + tile_row * 4;
+                    let tile_row = if vflip {
+                        flipped_row_pixels
+                    } else {
+                        row_pixels
+                    };
+                    let addr = tileset + tile * 32 + tile_row;
                     if addr < BG_VRAM_SIZE {
                         let pixels = self.vram.read_u32(addr);
-                        let base = entry.palette().as_usize() * 16;
-                        let palette = (&self.palette_cache[base..base + 16]).try_into().unwrap();
-                        draw_tile_row_4bpp(dst, pixels, palette, hflip);
+                        if pixels != 0 {
+                            let base = (entry >> 12) * 16;
+                            let palette =
+                                (&self.palette_cache[base..base + 16]).try_into().unwrap();
+                            draw_tile_row_4bpp(dst, pixels, palette, hflip);
+                        }
                     }
                 }
                 PaletteType::P256 => {
-                    let addr = tileset + tile * 64 + tile_row * 8;
+                    let tile_row = if vflip {
+                        flipped_row_pixels
+                    } else {
+                        row_pixels
+                    } * 2;
+                    let addr = tileset + tile * 64 + tile_row;
                     if addr < BG_VRAM_SIZE {
                         let low = self.vram.read_u32(addr);
                         let high = self.vram.read_u32(addr + 4);
@@ -489,9 +505,6 @@ impl Video<'_> {
                     }
                 }
             }
-
-            pos += TILE_SIZE;
-            tile_x += 1;
         }
     }
 
@@ -641,23 +654,41 @@ impl Video<'_> {
     }
 }
 
+// Reverse the order of the 8 nibbles of a 4 bit tile row
+#[inline(always)]
+fn flip_nibbles(pixels: u32) -> u32 {
+    let swapped = pixels.swap_bytes();
+    ((swapped & 0x0F0F_0F0F) << 4) | ((swapped >> 4) & 0x0F0F_0F0F)
+}
+
 // Draw the 8 pixels of a 4 bit tile row, colour 0 is transparent
 #[inline(always)]
-fn draw_tile_row_4bpp(
-    dst: &mut [u16; TILE_SIZE],
-    mut pixels: u32,
-    palette: &[u16; 16],
-    hflip: bool,
-) {
+fn draw_tile_row_4bpp(dst: &mut [u16; TILE_SIZE], pixels: u32, palette: &[u16; 16], hflip: bool) {
     if pixels == 0 {
         return;
     }
+    let pixels = if hflip { flip_nibbles(pixels) } else { pixels };
+    // a nibble is zero when the classic haszero trick flags its top bit
+    let has_zero = pixels.wrapping_sub(0x1111_1111) & !pixels & 0x8888_8888;
+    // indices are masked to 4 bits so the palette lookups need no bounds checks
+    let colour = |shift: u32| unsafe { *palette.get_unchecked(((pixels >> shift) & 0xF) as usize) };
+    if has_zero == 0 {
+        dst[0] = colour(0);
+        dst[1] = colour(4);
+        dst[2] = colour(8);
+        dst[3] = colour(12);
+        dst[4] = colour(16);
+        dst[5] = colour(20);
+        dst[6] = colour(24);
+        dst[7] = colour(28);
+        return;
+    }
+    let mut rest = pixels;
     for i in 0..TILE_SIZE {
-        let colour = (pixels & 0xF) as usize;
-        if colour != 0 {
-            dst[if hflip { TILE_MASK - i } else { i }] = palette[colour];
+        if rest & 0xF != 0 {
+            dst[i] = palette[(rest & 0xF) as usize];
         }
-        pixels >>= 4;
+        rest >>= 4;
     }
 }
 
@@ -670,14 +701,95 @@ fn draw_tile_row_8bpp(
     palette: &[u16; 256],
     hflip: bool,
 ) {
+    if low | high == 0 {
+        return;
+    }
+    let (low, high) = if hflip {
+        (high.swap_bytes(), low.swap_bytes())
+    } else {
+        (low, high)
+    };
     for (half, mut pixels) in [low, high].into_iter().enumerate() {
+        let base = half * 4;
+        let has_zero = pixels.wrapping_sub(0x0101_0101) & !pixels & 0x8080_8080;
+        if has_zero == 0 {
+            for i in 0..4 {
+                dst[base + i] = palette[((pixels >> (8 * i)) & 0xFF) as usize];
+            }
+            continue;
+        }
         for i in 0..4 {
             let colour = (pixels & 0xFF) as usize;
             if colour != 0 {
-                let x = half * 4 + i;
-                dst[if hflip { TILE_MASK - x } else { x }] = palette[colour];
+                dst[base + i] = palette[colour];
             }
             pixels >>= 8;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tile_row_tests {
+    use super::*;
+
+    fn naive_4bpp(pixels: u32, palette: &[u16; 16], hflip: bool) -> [u16; 8] {
+        let mut dst = [0xAAAA; 8];
+        for i in 0..8 {
+            let colour = ((pixels >> (4 * i)) & 0xF) as usize;
+            if colour != 0 {
+                dst[if hflip { 7 - i } else { i }] = palette[colour];
+            }
+        }
+        dst
+    }
+
+    fn naive_8bpp(low: u32, high: u32, palette: &[u16; 256], hflip: bool) -> [u16; 8] {
+        let mut dst = [0xAAAA; 8];
+        let bytes = [low.to_le_bytes(), high.to_le_bytes()].concat();
+        for (i, &colour) in bytes.iter().enumerate() {
+            if colour != 0 {
+                dst[if hflip { 7 - i } else { i }] = palette[colour as usize];
+            }
+        }
+        dst
+    }
+
+    #[test]
+    fn tile_rows_match_the_simple_version() {
+        let palette4: [u16; 16] = core::array::from_fn(|i| 0x100 + i as u16);
+        let palette8: [u16; 256] = core::array::from_fn(|i| 0x100 + i as u16);
+        let mut seed = 12345u32;
+        let mut next = || {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            seed
+        };
+        for round in 0..20000 {
+            // mix fully opaque, sparse and random rows
+            let mut a = next();
+            let mut b = next();
+            match round % 3 {
+                0 => {
+                    a |= 0x1111_1111;
+                    b |= 0x0101_0101;
+                }
+                1 => {
+                    a &= next();
+                    b &= next() & next();
+                }
+                _ => {}
+            }
+            for hflip in [false, true] {
+                let mut dst = [0xAAAA; 8];
+                draw_tile_row_4bpp(&mut dst, a, &palette4, hflip);
+                assert_eq!(dst, naive_4bpp(a, &palette4, hflip), "4bpp {a:#x} {hflip}");
+                let mut dst = [0xAAAA; 8];
+                draw_tile_row_8bpp(&mut dst, a, b, &palette8, hflip);
+                assert_eq!(
+                    dst,
+                    naive_8bpp(a, b, &palette8, hflip),
+                    "8bpp {a:#x} {b:#x}"
+                );
+            }
         }
     }
 }

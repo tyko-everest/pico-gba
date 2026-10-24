@@ -7,11 +7,32 @@ use embedded_hal::digital::OutputPin;
 
 // SPI1 runs at clk_peri / (2 * (1 + SCR)), see controls.rs
 const INIT_SCR: u8 = 156; // 398 kHz, card initialisation must stay at or below 400 kHz
-const FAST_SCR: u8 = 2; // 20.8 MHz, the SPI mode limit of a card is 25 MHz
+const FAST_SCR: u8 = 1; // 31.25 MHz, above the 25 MHz of a card in default speed mode: CRC checked, retried
 
 pub const BLOCK_SIZE: usize = 512;
 
 // how many reads had to be tried again, and why the last one failed (for the status report)
+// microseconds in the three parts of a single block read, summed: the command, waiting for the
+// card to start the data, and the data
+pub static US_PARTS: [core::sync::atomic::AtomicU32; 3] = [
+    core::sync::atomic::AtomicU32::new(0),
+    core::sync::atomic::AtomicU32::new(0),
+    core::sync::atomic::AtomicU32::new(0),
+];
+
+fn add_time(part: usize, from: u32) {
+    let now = unsafe { (*crate::pac::TIMER::ptr()).timerawl().read().bits() };
+    let o = core::sync::atomic::Ordering::Relaxed;
+    US_PARTS[part].store(
+        US_PARTS[part].load(o).wrapping_add(now.wrapping_sub(from)),
+        o,
+    );
+}
+
+fn now() -> u32 {
+    unsafe { (*crate::pac::TIMER::ptr()).timerawl().read().bits() }
+}
+
 pub static RETRIES: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 pub static LAST_ERROR: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
@@ -85,19 +106,49 @@ impl Spi1Bus {
     fn transfer(byte: u8) -> u8 {
         controls::spi1_transfer(byte)
     }
+
+    // Clock in a buffer of bytes with the transmit FIFO kept full, which is what it takes for the
+    // bus to run at full speed (a byte at a time leaves gaps)
+    fn read_into(buf: &mut [u8]) {
+        let spi = unsafe { &*crate::pac::SPI1::PTR };
+        let (mut sent, mut got) = (0, 0);
+        while got < buf.len() {
+            // the FIFOs hold 8 entries: never more than that in flight
+            while sent < buf.len() && sent - got < 8 && spi.sspsr().read().tnf().bit_is_set() {
+                spi.sspdr().write(|w| unsafe { w.data().bits(0xFF) });
+                sent += 1;
+            }
+            while got < sent && spi.sspsr().read().rne().bit_is_set() {
+                buf[got] = spi.sspdr().read().data().bits() as u8;
+                got += 1;
+            }
+        }
+    }
 }
 
 // CRC-16/XMODEM, what the card sends after every block of data
-fn crc16_update(mut crc: u16, byte: u8) -> u16 {
-    crc ^= (byte as u16) << 8;
-    for _ in 0..8 {
-        crc = if crc & 0x8000 != 0 {
-            crc << 1 ^ 0x1021
-        } else {
-            crc << 1
-        };
+const CRC_TABLE: [u16; 256] = {
+    let mut t = [0u16; 256];
+    let mut i = 0;
+    while i < 256 {
+        let mut crc = (i as u16) << 8;
+        let mut bit = 0;
+        while bit < 8 {
+            crc = if crc & 0x8000 != 0 {
+                crc << 1 ^ 0x1021
+            } else {
+                crc << 1
+            };
+            bit += 1;
+        }
+        t[i] = crc;
+        i += 1;
     }
-    crc
+    t
+};
+
+fn crc16_update(crc: u16, byte: u8) -> u16 {
+    crc << 8 ^ CRC_TABLE[(crc >> 8 ^ byte as u16) as usize]
 }
 
 pub struct SdCard<Cs> {
@@ -281,6 +332,7 @@ impl<Cs: OutputPin> SdCard<Cs> {
 
     // Receive a data block after a read command: wait for the start token, then the data and CRC
     fn receive(&mut self, buf: &mut [u8]) -> Result<(), Error> {
+        let t1 = now();
         let mut started = false;
         for _ in 0..0xFFFF {
             if Spi1Bus::transfer(0xFF) == TOKEN_READ_START {
@@ -291,12 +343,15 @@ impl<Cs: OutputPin> SdCard<Cs> {
         if !started {
             return Err(Error::Timeout);
         }
+        add_time(1, t1);
+        let t2 = now();
+        Spi1Bus::read_into(buf);
         let mut crc = 0u16;
-        for byte in buf {
-            *byte = Spi1Bus::transfer(0xFF);
-            crc = crc16_update(crc, *byte);
+        for &byte in buf.iter() {
+            crc = crc16_update(crc, byte);
         }
         let sent = (Spi1Bus::transfer(0xFF) as u16) << 8 | Spi1Bus::transfer(0xFF) as u16;
+        add_time(2, t2);
         if sent != crc {
             return Err(Error::Crc);
         }
@@ -334,9 +389,18 @@ impl<Cs: OutputPin> SdCard<Cs> {
         block: u32,
         dst: &mut [u8; BLOCK_SIZE],
     ) -> Result<(), Error> {
+        self.read_blocks_with_retries(block, core::slice::from_mut(dst))
+    }
+
+    // Consecutive blocks in one command: the card's wait for the first one is paid once
+    pub fn read_blocks_with_retries(
+        &mut self,
+        block: u32,
+        dst: &mut [[u8; BLOCK_SIZE]],
+    ) -> Result<(), Error> {
         let mut result = Ok(());
         for attempt in 0..4 {
-            result = self.read_blocks(block, core::slice::from_mut(dst));
+            result = self.read_blocks(block, dst);
             if result.is_ok() {
                 return result;
             }
@@ -362,10 +426,15 @@ impl<Cs: OutputPin> SdCard<Cs> {
         let address = self.address(start);
         match buf {
             [] => Ok(()),
-            [block] => match self.command(CMD17, address, 0x01) {
-                0 => self.receive(block),
-                r1 => Err(Error::Command(r1)),
-            },
+            [block] => {
+                let t0 = now();
+                let r1 = self.command(CMD17, address, 0x01);
+                add_time(0, t0);
+                match r1 {
+                    0 => self.receive(block),
+                    r1 => Err(Error::Command(r1)),
+                }
+            }
             blocks => {
                 match self.command(CMD18, address, 0x01) {
                     0 => {}
@@ -529,6 +598,22 @@ impl<Cs: OutputPin> embedded_sdmmc::BlockDevice for SdDevice<Cs> {
         blocks: &mut [embedded_sdmmc::Block],
         start: embedded_sdmmc::BlockIdx,
     ) -> Result<(), Error> {
+        // a run that does not include the fake MBR is one multi-block read
+        if blocks.len() > 1 && (!self.superfloppy || start.0 > 0) {
+            let at = if self.superfloppy {
+                start.0 - 1
+            } else {
+                start.0
+            };
+            // Safety: a Block is one array of 512 bytes
+            let runs = unsafe {
+                core::slice::from_raw_parts_mut(
+                    blocks.as_mut_ptr() as *mut [u8; BLOCK_SIZE],
+                    blocks.len(),
+                )
+            };
+            return self.card.borrow_mut().read_blocks_with_retries(at, runs);
+        }
         for (i, block) in blocks.iter_mut().enumerate() {
             let idx = start.0 + i as u32;
             if self.superfloppy && idx == 0 {

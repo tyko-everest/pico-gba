@@ -63,6 +63,22 @@ pub const DISPATCH_BYTES: usize = DISPATCH_ENTRIES * 8 + 4;
 // UDF #0xFD, where a dispatch that missed ends up
 pub const STUB_TRAP: u16 = 0xDEFD;
 
+// The cache can be divided in regions that are thrown away one at a time, oldest first, instead of
+// all at once. A direct jump from one region into another is written down, so that it can be
+// turned back into an exit slot when its target goes.
+pub const MAX_REGIONS: usize = 16;
+const MAX_LINKS: usize = 160;
+
+#[derive(Clone, Copy)]
+struct Link {
+    // the halfword of the slot that was patched
+    slot: u16,
+    // the region the jump goes to
+    to: u8,
+    // where the slot went to, to put back in it
+    guest: u32,
+}
+
 pub struct Jit<'a> {
     code: &'a mut [u16],
     // address code[0] runs at
@@ -85,6 +101,13 @@ pub struct Jit<'a> {
     reserved: usize,
     // the address of the UDF a dispatch that missed runs
     stub: u32,
+    // regions: how many (0 for the cache to be used as a whole), how many halfwords each, the
+    // one being filled
+    nregions: usize,
+    region_hw: usize,
+    cur: usize,
+    links: [Link; MAX_LINKS],
+    nlinks: usize,
     // the ARM address after the last block translated
     pub last_arm_end: u32,
 }
@@ -124,6 +147,15 @@ impl<'a> Jit<'a> {
             dispatch,
             reserved: 0,
             stub: 0,
+            nregions: 0,
+            region_hw: 0,
+            cur: 0,
+            links: [Link {
+                slot: 0,
+                to: 0,
+                guest: 0,
+            }; MAX_LINKS],
+            nlinks: 0,
             last_arm_end: 0,
         };
         jit.reset();
@@ -140,12 +172,16 @@ impl<'a> Jit<'a> {
         self.used = 0;
         self.emergency = false;
         self.limit = self.code.len() - self.reserve;
+        self.nlinks = 0;
         if self.dispatch != 0 {
             let mut e = Emit::new(&mut self.code[..self.limit], self.base, 0);
             let stub_hw = translate::emit_dispatcher(&mut e, self.dispatch);
             self.used = e.pos();
             self.reserved = self.used;
             self.stub = self.base + 2 * stub_hw as u32;
+        }
+        if self.nregions != 0 {
+            self.set_regions(self.nregions);
         }
     }
 
@@ -207,12 +243,137 @@ impl<'a> Jit<'a> {
 
     // is addr inside the translated code
     pub fn contains(&self, addr: u32) -> bool {
-        addr >= self.base && addr < self.base + 2 * self.used as u32
+        let end = if self.nregions != 0 {
+            self.code.len()
+        } else {
+            self.used
+        };
+        addr >= self.base && addr < self.base + 2 * end as u32
     }
 
     // the halfword at an address inside the cache
     pub fn halfword(&self, addr: u32) -> u16 {
         self.code[((addr - self.base) / 2) as usize]
+    }
+
+    // Divide the cache after the dispatcher into this many regions, which are used in turn and
+    // thrown away one by one with evict_region. Starts empty.
+    pub fn set_regions(&mut self, count: usize) {
+        self.nregions = count.min(MAX_REGIONS);
+        let space = self.code.len() - self.used_by_dispatcher();
+        self.region_hw = space / self.nregions & !1;
+        self.cur = 0;
+        self.nlinks = 0;
+        for m in self.map.iter_mut() {
+            m.arm = 0;
+        }
+        self.blocks = 0;
+        self.used = self.region_start(0);
+    }
+
+    fn used_by_dispatcher(&self) -> usize {
+        (self.reserved + 1) & !1
+    }
+
+    fn region_start(&self, r: usize) -> usize {
+        self.used_by_dispatcher() + r * self.region_hw
+    }
+
+    fn region_end(&self, r: usize) -> usize {
+        if r + 1 == self.nregions {
+            self.code.len()
+        } else {
+            self.region_start(r + 1)
+        }
+    }
+
+    // the region a halfword of the cache is in
+    fn region_of_hw(&self, hw: usize) -> Option<usize> {
+        let first = self.used_by_dispatcher();
+        (hw >= first && self.region_hw != 0).then(|| ((hw - first) / self.region_hw).min(self.nregions - 1))
+    }
+
+    // The region a native address is in, for the embedder to keep the regions that code is running
+    // in. None for an address that is not in a region.
+    pub fn region_of(&self, addr: u32) -> Option<usize> {
+        if self.nregions == 0 || addr < self.base {
+            return None;
+        }
+        let hw = ((addr - self.base) / 2) as usize;
+        if hw >= self.code.len() {
+            return None;
+        }
+        self.region_of_hw(hw)
+    }
+
+    // Throw away a region to make room: the oldest one that is not in the set `keep` (a bit for
+    // each region the code that is running, or going to be returned to, is in). The jumps into
+    // it become exit slots again, and the blocks in it are forgotten. Returns the native
+    // addresses it covered, for the embedder to remove from its dispatch table, or None when
+    // there is nothing it may throw away.
+    pub fn evict_region(&mut self, keep: u32) -> Option<(u32, u32)> {
+        let n = self.nregions;
+        let r = (1..=n)
+            .map(|k| (self.cur + k) % n)
+            .find(|&r| keep & (1 << r) == 0)?;
+        let (lo_hw, hi_hw) = (self.region_start(r), self.region_end(r));
+        let (lo, hi) = (self.base + 2 * lo_hw as u32, self.base + 2 * hi_hw as u32);
+        // the blocks
+        let mask = self.map.len() - 1;
+        let mut i = 0;
+        while i < self.map.len() {
+            let m = self.map[i];
+            if m.arm != 0 && (m.thumb & !1) >= lo && (m.thumb & !1) < hi {
+                self.remove_at(i, mask);
+                self.blocks -= 1;
+            } else {
+                i += 1;
+            }
+        }
+        // the jumps
+        let mut kept = 0;
+        for j in 0..self.nlinks {
+            let l = self.links[j];
+            let from = self.region_of_hw(l.slot as usize);
+            if from == Some(r) {
+                continue;
+            }
+            if l.to as usize == r {
+                let at = l.slot as usize;
+                self.code[at] = thumb::TRAP;
+                self.code[at + 1] = thumb::NOP;
+                self.code[at + 2] = l.guest as u16;
+                self.code[at + 3] = (l.guest >> 16) as u16;
+                self.code[at + 4] = thumb::NOP;
+                self.code[at + 5] = thumb::NOP;
+                continue;
+            }
+            self.links[kept] = l;
+            kept += 1;
+        }
+        self.nlinks = kept;
+        self.cur = r;
+        self.used = lo_hw;
+        Some((lo, hi))
+    }
+
+    // delete an entry of the map, moving the ones after it that belong further back
+    fn remove_at(&mut self, mut i: usize, mask: usize) {
+        let mut j = i;
+        loop {
+            j = (j + 1) & mask;
+            if self.map[j].arm == 0 {
+                break;
+            }
+            let k = self.slot_index(self.map[j].arm);
+            let between = if i <= j { i < k && k <= j } else { i < k || k <= j };
+            if between {
+                continue;
+            }
+            self.map[i] = self.map[j];
+            i = j;
+        }
+        self.map[i].arm = 0;
     }
 
     // the address Thumb code jumps to to dispatch through the table
@@ -276,7 +437,12 @@ impl<'a> Jit<'a> {
         let mut long_skips = false;
         let routine = self.dispatch_routine();
         let (end, len) = loop {
-            let e = Emit::new(&mut self.code[..self.limit], self.base, start);
+            let end_hw = if self.nregions != 0 {
+                self.region_end(self.cur)
+            } else {
+                self.limit
+            };
+            let e = Emit::new(&mut self.code[..end_hw], self.base, start);
             let mut tr = translate::Tr::new(e, mem, self.regions, long_skips, routine);
             let end = if arm & 1 != 0 {
                 tr.thumb_block(arm & !1)
@@ -284,6 +450,9 @@ impl<'a> Jit<'a> {
                 tr.block(arm)
             };
             if tr.e.overflowed() {
+                if self.nregions != 0 && start <= self.region_start(self.cur) + 1 {
+                    return Err(JitError::Internal("a block is bigger than a region"));
+                }
                 return Err(JitError::CacheFull);
             }
             match tr.e.err {
@@ -314,6 +483,21 @@ impl<'a> Jit<'a> {
     }
 
     fn patch_slot(&mut self, i: usize, thumb: u32) {
+        if self.nregions != 0 {
+            let to = self.region_of(thumb & !1);
+            if to != self.region_of_hw(i) {
+                if self.nlinks == MAX_LINKS {
+                    // no way to take this jump back later: leave the slot
+                    return;
+                }
+                self.links[self.nlinks] = Link {
+                    slot: i as u16,
+                    to: to.unwrap_or(0) as u8,
+                    guest: self.code[i + 2] as u32 | (self.code[i + 3] as u32) << 16,
+                };
+                self.nlinks += 1;
+            }
+        }
         let slot_addr = self.base + 2 * i as u32;
         // a direct branch reaches +-2 KiB from the slot's pc
         let delta = (thumb & !1) as i32 - (slot_addr as i32 + 4);

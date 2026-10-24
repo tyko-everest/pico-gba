@@ -19,3 +19,5 @@ rtt-target = { version = "0.6.2" }
 [features]
 # press A now and then, for running without anyone to touch the screen
 autopress = []
+# no frame pacing, to measure how fast the emulation runs
+unpaced = []

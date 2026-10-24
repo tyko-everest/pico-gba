@@ -360,7 +360,8 @@ fn translate_bench(m: &Machine) {
 // (the IO registers from 0x04000000) in a directory
 fn render_dump(dir: &str, png_path: &str) {
     let read = |name: &str, size: usize| {
-        let mut b = std::fs::read(format!("{dir}/{name}")).unwrap_or_else(|e| panic!("{name}: {e}"));
+        let mut b =
+            std::fs::read(format!("{dir}/{name}")).unwrap_or_else(|e| panic!("{name}: {e}"));
         b.resize(size, 0);
         // the video code reads these through structs, which want the alignment of a word
         let mut words = vec![0u32; size / 4];
@@ -390,6 +391,63 @@ fn render_dump(dir: &str, png_path: &str) {
         }
     }
     std::fs::write(png_path, png::encode(SCREEN_WIDTH, SCREEN_HEIGHT, &pixels)).unwrap();
+}
+
+// How much of the EWRAM the game really uses, and what paging the cold part to the SD card costs
+fn ewram_report(m: &machine::Machine) {
+    let e = &m.sys.stats.ewram;
+    let now = m.frames_done();
+    let bytes = m.sys.mem.ewram.bytes();
+    let nonzero = |p: usize| bytes[p * 512..(p + 1) * 512].iter().any(|&b| b != 0);
+    let resident = (0..machine::EWRAM_PAGES).filter(|&p| nonzero(p)).count();
+    let ever = e.backed.iter().filter(|&&b| b).count();
+    println!(
+        "\nEWRAM (512 B pages): {resident} non-zero at the end ({} KB), {ever} ever written non-zero ({} KB)",
+        resident / 2,
+        ever / 2
+    );
+    let tail = &e.touched_by_frame[e.touched_by_frame.len() / 2..];
+    println!(
+        "  distinct pages touched per frame in the 2nd half: avg {:.1}, max {}",
+        tail.iter().sum::<u32>() as f64 / tail.len().max(1) as f64,
+        tail.iter().max().copied().unwrap_or(0)
+    );
+    for w in [1, 10, 60, 300, 1000] {
+        let n = (0..machine::EWRAM_PAGES)
+            .filter(|&p| e.backed[p] && now - e.last_access[p] < w)
+            .count();
+        let wr = (0..machine::EWRAM_PAGES)
+            .filter(|&p| e.backed[p] && now - e.last_write[p] < w)
+            .count();
+        println!(
+            "  touched in the last {w:4} frames: {n:3} pages ({:3} KB), written {wr:3}",
+            n / 2
+        );
+    }
+    let never_read = (0..machine::EWRAM_PAGES)
+        .filter(|&p| e.backed[p] && e.reads[p] == 0)
+        .count();
+    println!("  backed pages never read: {never_read}");
+    println!("  LRU pool swapping to the card, 2nd half of the run, per frame:");
+    println!("   page   pool  slots   reads/frame (worst)  writebacks/frame (worst)  table");
+    for s in &e.sims {
+        let half = |v: &Vec<u32>| {
+            let t = &v[(v.len() / 2).min(v.len())..];
+            (
+                t.iter().sum::<u32>() as f64 / t.len().max(1) as f64,
+                t.iter().max().copied().unwrap_or(0),
+            )
+        };
+        let (r, rmax) = half(&s.reads_by_frame);
+        let (w, wmax) = half(&s.writebacks_by_frame);
+        println!(
+            "  {:5} B {:3} KB {:5}   {r:8.2} ({rmax:3})        {w:8.2} ({wmax:3})        {} B",
+            1 << s.shift,
+            s.slots << s.shift >> 10,
+            s.slots,
+            (256 << 10 >> s.shift) * 4
+        );
+    }
 }
 
 fn main() {
@@ -482,6 +540,7 @@ fn main() {
             );
         }
     }
+    ewram_report(&m);
     if let Ok(list) = std::env::var("JITBENCH_PEEK") {
         // comma separated GBA IWRAM addresses to print as words
         for a in list.split(',') {

@@ -42,7 +42,7 @@ fn ewram_load(addr: u32, size: u32) -> u32 {
             // nothing but zero has been stored there
             return 0;
         }
-        match ewram_native(addr) {
+        match ewram_native(addr, false) {
             Some(native) => read_native(native, size),
             None => 0,
         }
@@ -55,7 +55,7 @@ fn ewram_store(addr: u32, size: u32, value: u32) {
     if ewram_page_empty(addr) && value & mask == 0 {
         return;
     }
-    if let Some(native) = ewram_native(addr) {
+    if let Some(native) = ewram_native(addr, true) {
         unsafe { write_native(native, size, value) };
     }
 }

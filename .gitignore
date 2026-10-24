@@ -1,4 +1,5 @@
 /target
+/docs/trace
 *_dumps/
 *.gba
 *.sav
@@ -6,4 +7,5 @@
 *.o
 *.objdump
 *.txt
-profile.json.gz
+*.gz
+*.pyc
