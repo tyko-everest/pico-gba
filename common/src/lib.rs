@@ -1,4 +1,5 @@
 #![no_std]
+pub mod audio;
 pub mod bios;
 pub mod dma;
 pub mod eeprom;

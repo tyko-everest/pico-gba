@@ -55,6 +55,8 @@ pub const CPU_SET_UNIT_CYCLES: u64 = 20;
 pub const TRAMPOLINE_CYCLES: u64 = 60;
 // a frame longer than this is cut off and counted as a warning
 pub const FRAME_CAP: u64 = 20_000_000;
+// a GBA frame in GBA cycles (2^24 Hz): 228 lines of 1232
+pub const GBA_FRAME_CYCLES: u64 = 228 * 1232;
 
 const IE: usize = 0x200;
 const IF: usize = 0x202;
@@ -579,6 +581,22 @@ pub struct Sys {
     total_cycles: u64,
     timers: common::timers::Timers,
     flash: common::flash::FlashChip,
+    // the save EEPROM at 0x0D000000, as in the firmware
+    eeprom: common::eeprom::Eeprom,
+    // The GBA cycle the current frame started at (at VBlank). Every frame is exactly a GBA frame
+    // long, the sound needs that to play at the speed the game mixes it, and the time inside the
+    // frame is the Cortex-M0+ cycles turned into GBA cycles.
+    frame_start_gba: u64,
+    // the sound hardware and what it has played (left, right), when it is on
+    apu: Option<Box<common::audio::Apu>>,
+    pub audio: Vec<i16>,
+    // where the sound is streamed as it is made (raw 16 bit stereo), and how much of it went
+    pub audio_out: Option<Box<dyn std::io::Write>>,
+    // the buttons held (KEYINPUT, a bit clear for a button down), instead of the input script
+    pub keys: Option<u16>,
+    // the V-count match interrupt of this frame has been raised
+    vcount_irq_done: bool,
+    audio_sent: usize,
 }
 
 // The ROM as the SD card holds it, pages are copied out of it on a miss
@@ -723,6 +741,9 @@ impl Sys {
     // Memory as the BIOS and DMA see it: GBA addresses, or native ones for the stack
     fn raw_read(&mut self, addr: u32, size: u32) -> u32 {
         self.note_ewram(addr, size, false, 0);
+        if addr >> 24 == 0xD {
+            return self.eeprom.read_bit();
+        }
         if let Some(v) = self.mem_read(addr, size) {
             return v;
         }
@@ -735,6 +756,14 @@ impl Sys {
 
     fn raw_write(&mut self, addr: u32, size: u32, value: u32) {
         self.note_ewram(addr, size, true, value);
+        if addr >> 24 == 0xD {
+            self.eeprom.write_bit(value);
+            return;
+        }
+        // a DMA filling a sound FIFO
+        if let (Some(apu), 0x0400_00A0..0x0400_00A8) = (self.apu.as_mut(), addr) {
+            apu.write(addr & 0xFF, size, value);
+        }
         if !self.mem.write(addr, size, value) {
             if let Some(off) = Self::native_off(addr, size) {
                 for i in 0..size {
@@ -744,31 +773,112 @@ impl Sys {
         }
     }
 
-    // writes to IO registers with side effects: timers and DMA
-    fn io_write(&mut self, io: u32, size: u32, value: u32) {
-        if std::env::var_os("JITBENCH_LOG_IO").is_some() && self.frame_no < 3 {
+    // the GBA cycle it is now, see frame_start_gba
+    pub fn gba_now(&self) -> u64 {
+        let within = self.frame_cycles * (1 << 24) / 125_000_000;
+        self.frame_start_gba + within.min(GBA_FRAME_CYCLES - 1)
+    }
+
+    // Bring the sound up to now
+    fn audio_sync(&mut self) {
+        let Some(mut apu) = self.apu.take() else {
+            return;
+        };
+        let now = self.gba_now();
+        let timers = self.timers;
+        let mut out = std::mem::take(&mut self.audio);
+        let fx = apu.run(now, &timers, &mut GbaMem(self), &mut |l, r| {
+            out.push(l);
+            out.push(r);
+        });
+        self.audio = out;
+        self.apu = Some(apu);
+        if fx.irq != 0 {
+            let f = self.mem.io16(IF);
+            self.mem.set_io16(IF, f | fx.irq);
+        }
+        for ch in 0..4 {
+            if fx.dma_stopped & (1 << ch) != 0 {
+                let off = 0xB0 + 12 * ch + 10;
+                let c = self.mem.io16(off);
+                self.mem.set_io16(off, c & 0x7FFF);
+            }
+        }
+    }
+
+    // Send what was played since the last time to audio_out. A player that is behind blocks the
+    // write, which keeps the run at the speed of the sound. A player that went away stops it.
+    fn stream_audio(&mut self) {
+        let Some(out) = self.audio_out.as_mut() else {
+            return;
+        };
+        let new = &self.audio[self.audio_sent..];
+        let bytes: Vec<u8> = new.iter().flat_map(|s| s.to_le_bytes()).collect();
+        if let Err(e) = out.write_all(&bytes) {
+            eprintln!("the sound player went away ({e}), no more sound");
+            self.audio_out = None;
+        }
+        self.audio_sent = self.audio.len();
+    }
+
+    // writes to IO registers with side effects: timers, DMA and sound
+    // dma_was_on: the DMA enable bits (bit n for channel n) before the write
+    fn io_write(&mut self, io: u32, size: u32, value: u32, dma_was_on: u8) {
+        if self.frame_no < log_io_frames() {
             eprintln!(
                 "io write {io:#x} size {size} value {value:#x} at pc {:#x}",
                 self.cur_pc
             );
         }
+        // what played up to now played with the registers as they were
+        if self.apu.is_some() && common::audio::syncs_audio(io, size) {
+            self.audio_sync();
+        }
         match io {
             0x100..=0x10F => {
-                let now = self.total_cycles;
+                let now = self.timer_now();
                 self.timers.write(io, size, value, now);
             }
             0xB0..=0xDF => {
                 if let Some(ch) = common::dma::Dma::started_by(io, size) {
-                    self.dma_start(ch);
+                    if let Some(apu) = self.apu.as_mut() {
+                        let base = 0xB0 + 12 * ch;
+                        let r = |i: usize| {
+                            let b = &self.mem.io.bytes()[base + 4 * i..base + 4 * i + 4];
+                            u32::from_le_bytes(b.try_into().unwrap())
+                        };
+                        apu.dma_control(ch, r(0), r(1), r(2));
+                    }
+                    if dma_was_on & (1 << ch) == 0 {
+                        self.dma_start(ch);
+                    }
+                }
+            }
+            common::audio::SOUND_BASE..common::audio::SOUND_END => {
+                if let Some(apu) = self.apu.as_mut() {
+                    apu.write(io, size, value);
                 }
             }
             _ => {}
         }
     }
 
+    // The clock of the timers. With the sound on it is the GBA clock the sound runs on; without,
+    // the Cortex-M0+ cycles as before, which keeps the state hashes of runs without sound.
+    fn timer_now(&self) -> u64 {
+        if self.apu.is_some() {
+            self.gba_now()
+        } else {
+            self.total_cycles
+        }
+    }
+
     fn io_read(&self, io: u32, size: u32, value: u32) -> u32 {
         if (0x100..=0x10F).contains(&io) {
-            return self.timers.read(io, size, value, self.total_cycles);
+            return self.timers.read(io, size, value, self.timer_now());
+        }
+        if let (Some(apu), common::audio::SOUND_BASE..common::audio::SOUND_END) = (&self.apu, io) {
+            return apu.read(io, size, value);
         }
         value
     }
@@ -1124,13 +1234,14 @@ impl Bus for Sys {
         }
         let v = if addr >> 24 == 4 {
             self.io_read(addr & 0xFFFFFF, size, v)
+        } else if addr >> 24 == 0xD {
+            self.eeprom.read_bit()
         } else if addr >> 24 == 0xE {
             self.flash.read(addr & 0xFFFF).map_or(v, |b| b as u32)
         } else {
             v
         };
-        if std::env::var_os("JITBENCH_LOG_IO").is_some() && self.frame_no < 3 && addr == 0x0400_0004
-        {
+        if self.frame_no < log_io_frames() && addr == 0x0400_0004 {
             eprintln!(
                 "io read DISPSTAT size {size} -> {v:#x} at pc {:#x}",
                 self.cur_pc
@@ -1173,6 +1284,11 @@ impl Bus for Sys {
         }
         self.note_ewram(addr, size, true, value);
         let old_if = self.mem.io16(IF);
+        // only turning a DMA channel on starts it
+        let dma_was_on = (0..4).fold(0u8, |m, ch| {
+            let on = self.mem.io16(common::dma::Dma::control_offset(ch) as usize) & 0x8000 != 0;
+            m | (on as u8) << ch
+        });
         // a write to an unmapped address is ignored
         self.mem.write(addr, size, value);
         if addr >> 24 == 4 && addr & 0xFFFFFF < 0x400 {
@@ -1180,9 +1296,11 @@ impl Bus for Sys {
             if addr & 0xFFFFFE == 0x202 {
                 self.mem.set_io16(IF, old_if & !(value as u16));
             }
-            self.io_write(addr & 0xFFFFFF, size, value);
+            self.io_write(addr & 0xFFFFFF, size, value, dma_was_on);
         } else if addr >> 24 == 0xE {
             self.flash.write(addr & 0xFFFF, value as u8);
+        } else if addr >> 24 == 0xD {
+            self.eeprom.write_bit(value);
         }
     }
 }
@@ -1284,6 +1402,14 @@ impl Machine {
                 total_cycles: 0,
                 timers: common::timers::Timers::new(),
                 flash: common::flash::FlashChip::new(),
+                eeprom: common::eeprom::Eeprom::new(),
+                frame_start_gba: 0,
+                apu: None,
+                audio: Vec::new(),
+                audio_out: None,
+                keys: None,
+                vcount_irq_done: false,
+                audio_sent: 0,
             },
             in_irq: false,
             saved: None,
@@ -1313,6 +1439,17 @@ impl Machine {
             let at = (REGIONS_ADDR - NATIVE_BASE + 4 * top) as usize;
             self.sys.mem.native[at..at + 4].fill(0);
         }
+    }
+
+    // Turn the sound on. The patches that keep the game from mixing its music (the device has no
+    // sound) are dropped.
+    pub fn enable_audio(&mut self) {
+        self.sys.apu = Some(Box::new(common::audio::Apu::new(self.sys.gba_now())));
+        self.sys.game_code = [0; 4];
+    }
+
+    pub fn audio_stats(&self) -> Option<common::audio::Stats> {
+        self.sys.apu.as_ref().map(|a| a.stats)
     }
 
     pub fn frames_done(&self) -> u64 {
@@ -1355,6 +1492,9 @@ impl Machine {
             self.sys.charge_instr(pc, step.cycles);
             if let Some(ev) = step.event {
                 self.event(pc, ev);
+            }
+            if self.sys.apu.is_some() {
+                self.timer_irqs(pc);
             }
             if self.sys.vblank_polled {
                 self.sys.vblank_polled = false;
@@ -1475,6 +1615,7 @@ impl Machine {
             0x11 | 0x12 => common::bios::lz77(&mut GbaMem(&mut self.sys), r0, r1, n == 0x12),
             0x13 => common::bios::huffman(&mut GbaMem(&mut self.sys), r0, r1),
             0x14 | 0x15 => common::bios::run_length(&mut GbaMem(&mut self.sys), r0, r1, n == 0x15),
+            0x01 => self.register_ram_reset(r0),
             0x0B => self.cpu_set(at, false),
             0x0C => self.cpu_set(at, true),
             // Halt
@@ -1484,6 +1625,52 @@ impl Machine {
             n => self.sys.die(&format!("unhandled BIOS call {n:#x}")),
         }
         self.try_inject(at);
+    }
+
+    // RegisterRamReset, as register_ram_reset in the firmware: r0 bit 0 EWRAM, 1 IWRAM (but its
+    // last 0x200 bytes), 2 palette, 3 VRAM, 4 OAM, 5 serial registers, 6 sound registers, 7 the
+    // other registers. KEYINPUT is left alone, it is the buttons.
+    fn register_ram_reset(&mut self, flags: u32) {
+        let sys = &mut self.sys;
+        if sys.apu.is_some() && flags & 0xC0 != 0 {
+            sys.audio_sync();
+        }
+        let mem = &mut sys.mem;
+        let iwram_keep = IWRAM_SIZE - 0x200;
+        for (bit, region) in [
+            (1, mem.ewram.bytes_mut()),
+            (2, &mut mem.iwram.bytes_mut()[..iwram_keep]),
+            (4, mem.palette.bytes_mut()),
+            (8, mem.vram.bytes_mut()),
+            (0x10, mem.oam.bytes_mut()),
+        ] {
+            if flags & bit != 0 {
+                region.fill(0);
+            }
+        }
+        let io = mem.io.bytes_mut();
+        if flags & 0x20 != 0 {
+            io[0x120..0x12C].fill(0);
+            io[0x134..0x15C].fill(0);
+        }
+        if flags & 0x40 != 0 {
+            io[0x60..0xB0].fill(0);
+            if let Some(apu) = sys.apu.as_mut() {
+                apu.reset();
+            }
+        }
+        if flags & 0x80 != 0 {
+            io[..0x60].fill(0);
+            io[0xB0..0x110].fill(0);
+            io[0x200..0x20C].fill(0);
+            io[0] = 0x80;
+            sys.timers = common::timers::Timers::new();
+            if let Some(apu) = sys.apu.as_mut() {
+                for ch in 1..=2 {
+                    apu.dma_control(ch, 0, 0, 0);
+                }
+            }
+        }
     }
 
     fn charge_svc(&mut self, pc: u32, c: u64) {
@@ -1559,7 +1746,14 @@ impl Machine {
     // Record the frame and start the next one. With vblank the game is waiting for it, which
     // sets the DISPSTAT flag, VCOUNT = 160 and raises the interrupt as raise_vblank_irq does.
     fn end_frame(&mut self, vblank: bool) {
+        if self.sys.apu.is_some() {
+            self.vcount_irq(true);
+        }
         let sys = &mut self.sys;
+        sys.vcount_irq_done = false;
+        sys.audio_sync();
+        sys.stream_audio();
+        sys.frame_start_gba += GBA_FRAME_CYCLES;
         sys.stats.frames.push(sys.frame_cycles);
         if let Some(p) = &sys.paging {
             let total = p.cache.misses;
@@ -1599,7 +1793,9 @@ impl Machine {
                 unsafe { LAST = now };
             }
         }
-        let keys = if sys.input.pressed(sys.frame_no) {
+        let keys = if let Some(k) = sys.keys {
+            k
+        } else if sys.input.pressed(sys.frame_no) {
             0x03FE
         } else {
             0x03FF
@@ -1611,6 +1807,47 @@ impl Machine {
                 let f = sys.mem.io16(IF);
                 sys.mem.set_io16(IF, f | 1);
             }
+        }
+    }
+
+    // Timer interrupts, on the GBA clock (so only with the sound on, which keeps the runs without
+    // it as they were): raise the flags of the timers that overflowed, and run the handler for a
+    // timer interrupt that is pending, as soon as it can
+    fn timer_irqs(&mut self, at: u32) {
+        self.vcount_irq(false);
+        let sys = &mut self.sys;
+        if let Some(due) = sys.timers.next_irq() {
+            let now = sys.gba_now();
+            if due <= now {
+                let timers = sys.timers.take_due(now) as u16;
+                let f = sys.mem.io16(IF);
+                sys.mem.set_io16(IF, f | timers << 3);
+            }
+        }
+        if sys.mem.io16(IF) & sys.mem.io16(IE) & 0x7C != 0 {
+            self.try_inject(at);
+        }
+    }
+
+    // The V-count match interrupt (DISPSTAT bit 5, the line in bits 8-15), on the GBA clock: a frame
+    // starts at line 160, so line L comes ((L - 160) mod 228) lines in. A frame the game ends early
+    // by waiting for VBlank still has it, at its end. Some sound drivers (Pokémon's m4a) restart
+    // their DMA in it.
+    fn vcount_irq(&mut self, frame_end: bool) {
+        let sys = &mut self.sys;
+        let status = sys.mem.io16(DISPSTAT);
+        if sys.vcount_irq_done || status & (1 << 5) == 0 {
+            return;
+        }
+        let line = (status >> 8) as u64;
+        if line >= 228 {
+            return;
+        }
+        let at = sys.frame_start_gba + (line + 228 - 160) % 228 * 1232;
+        if frame_end || sys.gba_now() >= at {
+            sys.vcount_irq_done = true;
+            let f = sys.mem.io16(IF);
+            sys.mem.set_io16(IF, f | 1 << 2);
         }
     }
 
@@ -1668,5 +1905,13 @@ impl Machine {
         }
         let at = (self.sys.jit.miss_var() - NATIVE_BASE) as usize;
         self.sys.mem.native[at..at + 4].copy_from_slice(&value.to_le_bytes());
+    }
+}
+
+// JITBENCH_LOG_IO prints the IO register writes of the first frames: 3, or as many as it says
+fn log_io_frames() -> u64 {
+    match std::env::var("JITBENCH_LOG_IO") {
+        Ok(v) => v.parse().unwrap_or(3),
+        Err(_) => 0,
     }
 }

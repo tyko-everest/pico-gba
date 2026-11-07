@@ -2,10 +2,8 @@
 // Cortex-M0+ cycles go, to drive the ARM to Thumb JIT work.
 //
 //   jitbench [--frames N] [--png out.png] [--top K] [--rom file] [--translate-bench]
-//            [--press-start F] [--press-every F] [--press-len F]
-mod cpu;
-mod machine;
-mod png;
+//            [--press-start F] [--press-every F] [--press-len F] [--wav out.wav] [--play]
+use jitbench::{machine, player, png, render, wav};
 
 use common::jit::Jit;
 use common::registers::DisplayRegisters;
@@ -33,6 +31,10 @@ struct Args {
     // write the code cache and the cycles spent on every halfword of it
     dump_cache: Option<String>,
     input: InputScript,
+    // run the sound hardware and write what it played
+    wav: Option<String>,
+    // play the sound as it is made, through pw-play, at the speed of the sound
+    play: bool,
 }
 
 fn parse_args() -> Args {
@@ -54,6 +56,8 @@ fn parse_args() -> Args {
         rom_cache_kb: 0,
         intr: None,
         dump_cache: None,
+        wav: None,
+        play: false,
         // press A for 6 frames every 90 frames, starting at frame 60
         input: InputScript {
             start: 60,
@@ -81,6 +85,8 @@ fn parse_args() -> Args {
                 a.intr = Some(u32::from_str_radix(value().trim_start_matches("0x"), 16).unwrap())
             }
             "--dump-cache" => a.dump_cache = Some(value()),
+            "--wav" => a.wav = Some(value()),
+            "--play" => a.play = true,
             "--translate-bench" => a.translate_bench = true,
             "--press-start" => a.input.start = value().parse().unwrap(),
             "--press-every" => a.input.every = value().parse().unwrap(),
@@ -112,27 +118,6 @@ fn state_hash(m: &Machine) -> u64 {
         h = fnv(r.bytes(), h);
     }
     fnv(&m.frames_done().to_le_bytes(), h)
-}
-
-fn render(m: &mut Machine) -> Vec<u32> {
-    let mem = &mut m.sys.mem;
-    let (registers, palette, vram, oam) = unsafe {
-        (
-            &mut *(mem.io.bytes_mut().as_mut_ptr() as *mut DisplayRegisters),
-            &mut *(mem.palette.bytes_mut().as_mut_ptr() as *mut Palette),
-            &mut *(mem.vram.bytes_mut().as_mut_ptr() as *mut VRAM),
-            &mut *(mem.oam.bytes_mut().as_mut_ptr() as *mut OAM),
-        )
-    };
-    let mut video = Video::new(registers, palette, vram, oam);
-    video.begin_frame();
-    let mut pixels = Vec::with_capacity(SCREEN_WIDTH * SCREEN_HEIGHT);
-    for y in 0..SCREEN_HEIGHT {
-        for c in video.render_scanline(y) {
-            pixels.push(c.to_minifb_format());
-        }
-    }
-    pixels
 }
 
 fn pct(cycles: f64, frames: f64) -> f64 {
@@ -477,9 +462,19 @@ fn main() {
     if let Some(intr) = args.intr {
         m.sys.mem.set_irq_vector(intr);
     }
+    if args.wav.is_some() || args.play {
+        m.enable_audio();
+    }
+    // the player has to outlive the run, it is waited for at the end
+    let player = if args.play {
+        player::start(&mut m)
+    } else {
+        None
+    };
     let t0 = Instant::now();
     m.run(args.frames);
     let host = t0.elapsed();
+    player::finish(&mut m, player);
 
     report(&m, args.top);
     println!(
@@ -577,6 +572,26 @@ fn main() {
         let pixels = render(&mut m);
         std::fs::write(path, png::encode(SCREEN_WIDTH, SCREEN_HEIGHT, &pixels)).unwrap();
         println!("wrote {path}");
+    }
+    if let Some(st) = m.audio_stats() {
+        let audio = &m.sys.audio;
+        let peak = audio.iter().map(|s| s.unsigned_abs()).max().unwrap_or(0);
+        let rms = (audio.iter().map(|&s| (s as f64).powi(2)).sum::<f64>()
+            / audio.len().max(1) as f64)
+            .sqrt();
+        println!(
+            "sound: {} samples ({:.2} s), peak {peak}, rms {rms:.0}; FIFO A/B: {:?} played, {:?} underruns, {:?} overflows, {:?} refills",
+            st.samples,
+            st.samples as f64 / common::audio::SAMPLE_RATE as f64,
+            st.pops,
+            st.underruns,
+            st.overflows,
+            st.refills
+        );
+        if let Some(path) = &args.wav {
+            std::fs::write(path, wav::encode(common::audio::SAMPLE_RATE, audio)).unwrap();
+            println!("wrote {path}");
+        }
     }
     if args.translate_bench {
         translate_bench(&m);

@@ -114,6 +114,13 @@ impl Timers {
             .filter(|&at| at != NEVER)
     }
 
+    // The cycle of the first overflow of timer n after `now`, None when it is stopped. The sound
+    // FIFOs play a sample at every overflow of timer 0 or 1.
+    pub fn next_overflow(&self, n: usize, now: u64) -> Option<u64> {
+        let t = &self.0[n];
+        t.running.then(|| t.next_overflow(now.max(t.started)))
+    }
+
     // The timers (bit n for timer n) whose interrupt is due at `now`. Each one moves on to its
     // next overflow, so missed ones are not reported twice.
     pub fn take_due(&mut self, now: u64) -> u8 {
